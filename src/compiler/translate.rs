@@ -182,10 +182,13 @@ fn trans_gep_value(
     bctx: Option<&BlockInfo>,
 ) -> Result<Value, CompException> {
     let base = trans_value(base_ptr, ctx, bctx)?.into_single()?;
-    let index_vals: Vec<(Value, usize)> = indices.iter().map(|idx| {
-        let width = get_value_width(idx);
-        (trans_value(idx, ctx, bctx).unwrap().into_single().unwrap(), width)
-    }).collect();
+    let index_vals: Vec<(Value, usize)> = indices
+        .iter()
+        .map(|idx| {
+            let width = get_value_width(idx);
+            Ok((trans_value(idx, ctx, bctx)?.into_single()?, width))
+        })
+        .collect::<Result<Vec<_>, CompException>>()?;
     let gep_result = memory::get_gep_offsets(base_ptr_type, &index_vals, ctx.cfg.accurate_byte_spacing)?;
     let val = memory::apply_gep_offsets(
         base,

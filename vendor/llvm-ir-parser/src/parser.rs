@@ -199,6 +199,7 @@ impl<'src> Parser<'src> {
                 self.ctx.define_struct_body(ty_id, fields.0, fields.1);
             }
         }
+        self.module.register_named_type(name, ty_id);
 
         Ok(())
     }
@@ -1933,37 +1934,7 @@ impl<'src> Parser<'src> {
                 | Token::LAngle
                 | Token::LBrace => break,
                 // Named struct type reference — stop skipping.
-                Token::LocalIdent(_) => {
-                    // Check if this is `range(...)`, `memory(...)`, etc.
-                    // These are function attrs with parenthesized arguments.
-                    let _name = self.lex.expect_local_ident()?;
-                    match self.lex.peek()? {
-                        Token::LParen => {
-                            // Skip the entire `word(...)` expression.
-                            self.lex.next()?; // consume '('
-                            let mut depth = 1u32;
-                            loop {
-                                match self.lex.next()? {
-                                    Token::LParen => depth += 1,
-                                    Token::RParen => {
-                                        depth -= 1;
-                                        if depth == 0 {
-                                            break;
-                                        }
-                                    }
-                                    Token::Eof => {
-                                        return Err(self.err("unterminated function attribute"))
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        _ => {
-                            // Bare word like `dso_local` that wasn't classified as a keyword.
-                            // Already consumed — just continue the loop.
-                        }
-                    }
-                }
+                Token::LocalIdent(_) => break,
                 // Attribute keywords (noundef, etc.) — skip.
                 Token::Kw(Keyword::Noundef)
                 | Token::Kw(Keyword::UnnamedAddr)
