@@ -1,6 +1,48 @@
 ![Scratch Cat Wyvern](assets/title.svg)
 
+# llvm2scratch.rs
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![Status](https://img.shields.io/badge/status-refactoring-green.svg)]()
+
 An LLVM backend to convert [LLVM IR](https://llvm.org/docs/LangRef.html) to [MIT Scratch](https://scratch.mit.edu), a block based coding language. This allows many programs written in languages which can compile to LLVM (C, C++, Rust, etc) to be ported into scratch.
+
+## Refactored Implementation
+
+This repository has been refactored to contain **two parallel implementations** of the same compiler pipeline:
+
+- **`llvm2scratch/`** — The original Python implementation and the authoritative reference for correct behavior.
+- **`src/`** — A Rust reimplementation that follows the same parse → generate → optimize → export pipeline and is validated against the Python output.
+
+The Rust compiler (`target/debug/llvm2scratch`) is intended to produce byte-identical Scratch projects for supported inputs. Differential tests between the Python and Rust outputs are used to maintain parity.
+
+## Building & Testing
+
+The Python package is still installed and used exactly as before (see [Installation](#installation) and [Usage](#usage)).
+
+To build the Rust implementation:
+
+```bash
+cargo build
+```
+
+To run the Rust compiler directly:
+
+```bash
+./target/debug/llvm2scratch input.ll -o output.sb3
+```
+
+The Rust CLI mirrors the Python CLI and accepts the same core options, including `-f/--format`, `-T/--targets`, `-U/--opt-target`, `-O/--optimizations`, `-M/--minify`, `--memory-size`, `--local-stack-size`, `--max-branch-recursion`, `--no-accurate-byte-spacing`, `--entrypoint`, `--replace-hacked-blocks`, `--hide-blocks`, and `--no-optimize`. Run `--help` for the full list.
+
+Testing:
+
+```bash
+python3 -m pytest llvm2scratch/tests/   # Python unit tests
+cargo test --lib                         # Rust unit tests
+python3 tests/diff_test.py examples/input/  # Python vs Rust differential tests
+```
 
 ## Progress
 

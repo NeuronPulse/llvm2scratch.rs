@@ -340,7 +340,7 @@ def decodeInstr(instr: llvm.ValueRef, structs: dict[str, StructTy], func_names: 
       cond = None
       while not cond_found:
         cond_str, rest = rest.split(" ", 1)
-        if cond_str in FCmpCond:
+        if cond_str in FCmpCond._value2member_map_:
           cond_found = True
           cond = FCmpCond(cond_str)
       assert cond is not None

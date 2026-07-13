@@ -1,11 +1,32 @@
-**/.DS_Store
-**/.vscode
-**/.zed
-**/.ropeproject
-**/__pycache__
-**/.venv
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
 
-examples/output
+# Python
+**/__pycache__/
+**/.venv/
+**/.ropeproject/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE / Editor
+**/.vscode/
+**/.idea/
+**/.zed/
+**/*.swp
+**/*.swo
+*~
+
+# OS
+**/.DS_Store
+Thumbs.db
+
+# Project-specific outputs
+examples/output/
 examples/profile.out
 examples/input/main
 examples/input/main.ll
@@ -15,9 +36,23 @@ examples/input/local_stack_64.ll
 examples/input/large.ll
 examples/debug_branch_info.txt
 
+# Profiling / Debug
 flamegraph.sh
 flamegraph.svg
+perf.data
+perf.data.old
 
+# Project planning / AI agent files
+AGENTS.md
+PLAN.md
+PROGRESS.md
+docs/
+
+# Temporary debug / build artifacts
+examples/debug_parse_crate/
+examples/input/*.ll
+
+# Tool config
 poetry.lock
 pyrightconfig.json
 pyrefly.toml

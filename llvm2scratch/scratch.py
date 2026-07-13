@@ -946,6 +946,10 @@ class DaysSince2000(Value):
 # Operators
 OperatorsCodes = Literal["add", "sub", "mul", "div", "mod", "rand", "join", "letter_of", "length_of", "round", "bool_to_float", "str_to_float",
                          "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"]
+# Operators which only take a single operand (must stay constant; do not mutate based on serialization state)
+ONE_OPERAND_OPS = frozenset({"length_of", "round", "bool_to_float", "str_to_float",
+                             "abs", "floor", "ceiling", "sqrt", "sin", "cos", "tan",
+                             "asin", "acos", "atan", "ln", "log", "e ^", "10 ^"})
 @dataclass
 class Op(Value):
   op: OperatorsCodes
@@ -953,7 +957,7 @@ class Op(Value):
   right: Value | None = None
 
   def __post_init__(self):
-    takes_one_op = self.op in ["length_of", "round", "bool_to_float", "str_to_float"] or self.op not in SHORT_OP_TO_OPCODE # if op is length_of, round or is a general op
+    takes_one_op = self.op in ONE_OPERAND_OPS
     given_one_op = self.right is None
 
     if takes_one_op != given_one_op:

@@ -4,9 +4,16 @@ from copy import deepcopy
 from typing import Any
 from enum import Enum
 
-from importlib.resources.abc import Traversable
-from importlib.resources import files
-import tomllib
+try:
+  from importlib.resources.abc import Traversable
+  from importlib.resources import files
+except (ImportError, ModuleNotFoundError):
+  from importlib_resources.abc import Traversable
+  from importlib_resources import files
+try:
+  import tomllib
+except ModuleNotFoundError:
+  import tomli as tomllib
 import dacite
 
 DEFAULT_TARGETS = ["scratch3", "turbowarp3"]
