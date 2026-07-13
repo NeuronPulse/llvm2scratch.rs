@@ -263,44 +263,6 @@ fn assign_parameters(
     Ok(blocks)
 }
 
-/// Find the instruction in `func` whose result is named `var_name`.
-fn find_local_def<'a>(func: &'a ir::Function, var_name: &str) -> Option<&'a ir::Instr> {
-    for (_label, block) in &func.blocks {
-        for instr in &block.instrs {
-            if let Some(res) = ir::Instr::result(instr) {
-                if res.name == var_name {
-                    return Some(instr);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Collect possible function names a value may refer to, following select
-/// instructions and simple local variable definitions.
-fn collect_function_targets(value: &ir::Value, func: &ir::Function) -> Vec<String> {
-    match value {
-        ir::Value::Function(fv) => vec![fv.name.clone()],
-        ir::Value::LocalVar(lv) => {
-            if let Some(instr) = find_local_def(func, &lv.name) {
-                match instr {
-                    ir::Instr::Select(sel) => {
-                        let mut targets = collect_function_targets(&sel.true_value, func);
-                        targets.extend(collect_function_targets(&sel.false_value, func));
-                        targets
-                    }
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            }
-        }
-        ir::Value::Argument(_) => Vec::new(),
-        _ => Vec::new(),
-    }
-}
-
 fn localize_func_ptr_sig(signature_id: usize) -> String {
     format!("!fn pointer signature:{}", signature_id)
 }
@@ -1731,6 +1693,11 @@ fn get_fn_info(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
             branches_to_first: inter.branches_to_first,
             phi_info: inter.phi_info,
         };
+
+        if ["factorial_recurse", "sum_to_one_digit", "numberize", "main"].contains(&info.name.as_str()) {
+            eprintln!("DEBUG {}: first_label={} branches_to_first={} returns_to_address={} takes_return_address={} return_addrs={:?} checked={:?}",
+                info.name, inter.first_label, info.branches_to_first, info.returns_to_address, info.takes_return_address, info.return_addresses, info.checked_blocks);
+        }
 
         ctx.fn_info.insert(inter.name, info);
     }

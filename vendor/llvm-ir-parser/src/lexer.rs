@@ -1,0 +1,1109 @@
+//! Hand-rolled LLVM IR lexer.
+
+use std::fmt;
+
+// ---------------------------------------------------------------------------
+// Keyword enum
+// ---------------------------------------------------------------------------
+
+/// Public API for `Keyword`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Keyword {
+    // Directives
+    /// `Source` variant.
+    Source,     // source_filename
+    /// `Target` variant.
+    Target,     // target
+    /// `Triple` variant.
+    Triple,     // triple
+    /// `Datalayout` variant.
+    Datalayout, // datalayout
+    /// `Define` variant.
+    Define,
+    /// `Declare` variant.
+    Declare,
+    /// `Type` variant.
+    Type, // "type" keyword after %Foo =
+
+    // Linkage
+    /// `Private` variant.
+    Private,
+    /// `Internal` variant.
+    Internal,
+    /// `External` variant.
+    External,
+    /// `Weak` variant.
+    Weak,
+    /// `WeakOdr` variant.
+    WeakOdr,
+    /// `Linkonce` variant.
+    Linkonce,
+    /// `LinkonceOdr` variant.
+    LinkonceOdr,
+    /// `Common` variant.
+    Common,
+    /// `AvailableExternally` variant.
+    AvailableExternally,
+
+    // Type keywords
+    /// `Void` variant.
+    Void,
+    /// `Half` variant.
+    Half,
+    /// `Bfloat` variant.
+    Bfloat,
+    /// `Float` variant.
+    Float,
+    /// `Double` variant.
+    Double,
+    /// `Fp128` variant.
+    Fp128,
+    /// `X86Fp80` variant.
+    X86Fp80,
+    /// `Label` variant.
+    Label,
+    /// `Metadata` variant.
+    Metadata,
+    /// `Ptr` variant.
+    Ptr,
+
+    // Storage
+    /// `Global` variant.
+    Global,
+    /// `Constant` variant.
+    Constant,
+
+    // Modifiers
+    /// `Inbounds` variant.
+    Inbounds,
+    /// `Exact` variant.
+    Exact,
+    /// `Nuw` variant.
+    Nuw,
+    /// `Nsw` variant.
+    Nsw,
+    /// `Volatile` variant.
+    Volatile,
+    /// `Tail` variant.
+    Tail,
+    /// `Musttail` variant.
+    Musttail,
+    /// `Notail` variant.
+    Notail,
+    /// `Fast` variant.
+    Fast,
+    /// `Nnan` variant.
+    Nnan,
+    /// `Ninf` variant.
+    Ninf,
+    /// `Nsz` variant.
+    Nsz,
+    /// `Arcp` variant.
+    Arcp,
+    /// `Contract` variant.
+    Contract,
+    /// `Afn` variant.
+    Afn,
+    /// `Reassoc` variant.
+    Reassoc,
+
+    // Opcodes
+    /// `Add` variant.
+    Add,
+    /// `Sub` variant.
+    Sub,
+    /// `Mul` variant.
+    Mul,
+    /// `Udiv` variant.
+    Udiv,
+    /// `Sdiv` variant.
+    Sdiv,
+    /// `Urem` variant.
+    Urem,
+    /// `Srem` variant.
+    Srem,
+    /// `And` variant.
+    And,
+    /// `Or` variant.
+    Or,
+    /// `Xor` variant.
+    Xor,
+    /// `Shl` variant.
+    Shl,
+    /// `Lshr` variant.
+    Lshr,
+    /// `Ashr` variant.
+    Ashr,
+    /// `Fadd` variant.
+    Fadd,
+    /// `Fsub` variant.
+    Fsub,
+    /// `Fmul` variant.
+    Fmul,
+    /// `Fdiv` variant.
+    Fdiv,
+    /// `Frem` variant.
+    Frem,
+    /// `Fneg` variant.
+    Fneg,
+    /// `Icmp` variant.
+    Icmp,
+    /// `Fcmp` variant.
+    Fcmp,
+    /// `Alloca` variant.
+    Alloca,
+    /// `Load` variant.
+    Load,
+    /// `Store` variant.
+    Store,
+    /// `Getelementptr` variant.
+    Getelementptr,
+    /// `Trunc` variant.
+    Trunc,
+    /// `Zext` variant.
+    Zext,
+    /// `Sext` variant.
+    Sext,
+    /// `Fptrunc` variant.
+    Fptrunc,
+    /// `Fpext` variant.
+    Fpext,
+    /// `Fptoui` variant.
+    Fptoui,
+    /// `Fptosi` variant.
+    Fptosi,
+    /// `Uitofp` variant.
+    Uitofp,
+    /// `Sitofp` variant.
+    Sitofp,
+    /// `Ptrtoint` variant.
+    Ptrtoint,
+    /// `Inttoptr` variant.
+    Inttoptr,
+    /// `Bitcast` variant.
+    Bitcast,
+    /// `Addrspacecast` variant.
+    Addrspacecast,
+    /// `Freeze` variant.
+    Freeze,
+    /// `Select` variant.
+    Select,
+    /// `Phi` variant.
+    Phi,
+    /// `Extractvalue` variant.
+    Extractvalue,
+    /// `Insertvalue` variant.
+    Insertvalue,
+    /// `Extractelement` variant.
+    Extractelement,
+    /// `Insertelement` variant.
+    Insertelement,
+    /// `Shufflevector` variant.
+    Shufflevector,
+    /// `Call` variant.
+    Call,
+    /// `Ret` variant.
+    Ret,
+    /// `Br` variant.
+    Br,
+    /// `Switch` variant.
+    Switch,
+    /// `Unreachable` variant.
+    Unreachable,
+
+    // ICmp predicates
+    /// `Eq` variant.
+    Eq,
+    /// `Ne` variant.
+    Ne,
+    /// `Ugt` variant.
+    Ugt,
+    /// `Uge` variant.
+    Uge,
+    /// `Ult` variant.
+    Ult,
+    /// `Ule` variant.
+    Ule,
+    /// `Sgt` variant.
+    Sgt,
+    /// `Sge` variant.
+    Sge,
+    /// `Slt` variant.
+    Slt,
+    /// `Sle` variant.
+    Sle,
+    // FCmp predicates
+    /// `False` variant.
+    False,
+    /// `Oeq` variant.
+    Oeq,
+    /// `Ogt` variant.
+    Ogt,
+    /// `Oge` variant.
+    Oge,
+    /// `Olt` variant.
+    Olt,
+    /// `Ole` variant.
+    Ole,
+    /// `One` variant.
+    One,
+    /// `Ord` variant.
+    Ord,
+    /// `Uno` variant.
+    Uno,
+    /// `Ueq` variant.
+    Ueq,
+    /// `Une` variant.
+    Une,
+    /// `True` variant.
+    True,
+
+    // Aggregate/misc constants
+    /// `Zeroinitializer` variant.
+    Zeroinitializer,
+    /// `Undef` variant.
+    Undef,
+    /// `Poison` variant.
+    Poison,
+    /// `Null` variant.
+    Null,
+    /// `Align` variant.
+    Align,
+    /// `Noundef` variant.
+    Noundef,
+    /// `UnnamedAddr` variant.
+    UnnamedAddr,
+    /// `DsoLocal` variant.
+    DsoLocal,
+    /// `To` variant.
+    To,
+    /// `X` variant.
+    X,      // "x" in vector / array size
+    /// `Vscale` variant.
+    Vscale, // "vscale" before "x" in scalable vector
+    /// `Attributes` variant.
+    Attributes,
+}
+
+// ---------------------------------------------------------------------------
+// Token
+// ---------------------------------------------------------------------------
+
+/// Public API for `Token`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Token {
+    /// %name  (local identifier)
+    LocalIdent(String),
+    /// @name  (global identifier)
+    GlobalIdent(String),
+    /// iNN   (integer type, dynamic width)
+    IntType(u32),
+    /// Integer literal (signed)
+    IntLit(i64),
+    /// Unsigned integer literal (when value doesn't fit i64)
+    UIntLit(u64),
+    /// Big integer literal (doesn't fit u64), stored as decimal string
+    BigIntLit(String),
+    /// Float literal
+    FloatLit(f64),
+    /// String literal (inside double quotes)
+    StringLit(String),
+    /// Keyword
+    Kw(Keyword),
+    /// `=`
+    Equal,
+    /// `,`
+    Comma,
+    /// `:`
+    Colon,
+    /// `*`
+    Star,
+    /// `(`
+    LParen,
+    /// `)`
+    RParen,
+    /// `[`
+    LBracket,
+    /// `]`
+    RBracket,
+    /// `{`
+    LBrace,
+    /// `}`
+    RBrace,
+    /// `<`
+    LAngle,
+    /// `>`
+    RAngle,
+    /// `...`
+    Ellipsis,
+    /// `!`
+    Bang,
+    /// `#`
+    Hash,
+    /// End of input
+    Eof,
+}
+
+// ---------------------------------------------------------------------------
+// Lex error
+// ---------------------------------------------------------------------------
+
+/// Public API for `LexError`.
+#[derive(Clone, Debug)]
+pub struct LexError {
+    /// Public API for `line`.
+    pub line: usize,
+    /// Public API for `col`.
+    pub col: usize,
+    /// Public API for `message`.
+    pub message: String,
+}
+
+impl fmt::Display for LexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "lex error at {}:{}: {}",
+            self.line, self.col, self.message
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lexer
+// ---------------------------------------------------------------------------
+
+/// Public API for `Lexer`.
+pub struct Lexer<'src> {
+    // `src` field.
+    src: &'src [u8],
+    // `pos` field.
+    pub(crate) pos: usize,
+    // `line` field.
+    line: usize,
+    // `col` field.
+    col: usize,
+    /// One-token lookahead.
+    pub(crate) peeked: Option<Result<Token, LexError>>,
+    /// Put-back token stash.
+    pub(crate) putback: Vec<Result<Token, LexError>>,
+}
+
+impl<'src> Lexer<'src> {
+    /// Public API for `new`.
+    pub fn new(src: &'src str) -> Self {
+        Lexer {
+            src: src.as_bytes(),
+            pos: 0,
+            line: 1,
+            col: 1,
+            peeked: None,
+            putback: Vec::new(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Character-level helpers
+    // -----------------------------------------------------------------------
+
+    fn peek_ch(&self) -> Option<u8> {
+        self.src.get(self.pos).copied()
+    }
+
+    fn peek_ch2(&self) -> Option<u8> {
+        self.src.get(self.pos + 1).copied()
+    }
+
+    fn advance(&mut self) -> Option<u8> {
+        let ch = self.src.get(self.pos).copied()?;
+        self.pos += 1;
+        if ch == b'\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(ch)
+    }
+
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            while matches!(self.peek_ch(), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+                self.advance();
+            }
+            if self.peek_ch() == Some(b';') {
+                while !matches!(self.peek_ch(), None | Some(b'\n')) {
+                    self.advance();
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn make_err(&self, msg: impl Into<String>) -> LexError {
+        LexError {
+            line: self.line,
+            col: self.col,
+            message: msg.into(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Public interface
+    // -----------------------------------------------------------------------
+
+    /// Peek at the next token without consuming it.
+    pub fn peek(&mut self) -> Result<&Token, &LexError> {
+        if self.peeked.is_none() {
+            if let Some(t) = self.putback.pop() {
+                self.peeked = Some(t);
+            } else {
+                self.peeked = Some(self.next_token());
+            }
+        }
+        match self.peeked.as_ref().unwrap() {
+            Ok(t) => Ok(t),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Consume and return the next token.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Token, LexError> {
+        // Check peeked first (populated by peek() from putback or next_token).
+        if let Some(t) = self.peeked.take() {
+            return t;
+        }
+        // Then check putback stack (pushed by put_back()).
+        if let Some(t) = self.putback.pop() {
+            return t;
+        }
+        self.next_token()
+    }
+
+    /// Put back a token, to be returned by the next call to `next()`.
+    pub fn put_back(&mut self, tok: Result<Token, LexError>) {
+        self.putback.push(tok);
+    }
+
+    /// Consume if next token matches; otherwise leave it in the peek buffer.
+    pub fn eat(&mut self, expected: &Token) -> bool {
+        match self.peek() {
+            Ok(t) if t == expected => {
+                let _ = self.next();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Public API for `eat_kw`.
+    pub fn eat_kw(&mut self, kw: Keyword) -> bool {
+        self.eat(&Token::Kw(kw))
+    }
+
+    /// Consume a token and verify it matches expected; return an error otherwise.
+    pub fn expect(&mut self, expected: &Token) -> Result<(), LexError> {
+        let tok = self.next()?;
+        if tok == *expected {
+            Ok(())
+        } else {
+            Err(self.make_err(format!("expected {:?}, got {:?}", expected, tok)))
+        }
+    }
+
+    /// Public API for `expect_kw`.
+    pub fn expect_kw(&mut self, kw: &Keyword) -> Result<(), LexError> {
+        let tok = self.next()?;
+        if tok == Token::Kw(kw.clone()) {
+            Ok(())
+        } else {
+            Err(self.make_err(format!("expected keyword {:?}, got {:?}", kw, tok)))
+        }
+    }
+
+    /// Public API for `expect_local_ident`.
+    pub fn expect_local_ident(&mut self) -> Result<String, LexError> {
+        match self.next()? {
+            Token::LocalIdent(s) => Ok(s),
+            t => Err(self.make_err(format!("expected local ident, got {:?}", t))),
+        }
+    }
+
+    /// Public API for `expect_global_ident`.
+    pub fn expect_global_ident(&mut self) -> Result<String, LexError> {
+        match self.next()? {
+            Token::GlobalIdent(s) => Ok(s),
+            t => Err(self.make_err(format!("expected global ident, got {:?}", t))),
+        }
+    }
+
+    /// Public API for `expect_int_lit`.
+    pub fn expect_int_lit(&mut self) -> Result<i64, LexError> {
+        match self.next()? {
+            Token::IntLit(n) => Ok(n),
+            Token::UIntLit(n) => Ok(n as i64),
+            t => Err(self.make_err(format!("expected integer literal, got {:?}", t))),
+        }
+    }
+
+    /// Public API for `expect_uint_lit`.
+    pub fn expect_uint_lit(&mut self) -> Result<u64, LexError> {
+        match self.next()? {
+            Token::IntLit(n) => Ok(n as u64),
+            Token::UIntLit(n) => Ok(n),
+            t => Err(self.make_err(format!("expected integer literal, got {:?}", t))),
+        }
+    }
+
+    /// Public API for `expect_string_lit`.
+    pub fn expect_string_lit(&mut self) -> Result<String, LexError> {
+        match self.next()? {
+            Token::StringLit(s) => Ok(s),
+            t => Err(self.make_err(format!("expected string literal, got {:?}", t))),
+        }
+    }
+
+    /// Public API for `current_line`.
+    pub fn current_line(&self) -> usize {
+        self.line
+    }
+    /// Public API for `current_col`.
+    pub fn current_col(&self) -> usize {
+        self.col
+    }
+
+    // -----------------------------------------------------------------------
+    // Core tokenizer
+    // -----------------------------------------------------------------------
+
+    fn next_token(&mut self) -> Result<Token, LexError> {
+        self.skip_whitespace_and_comments();
+
+        let start_line = self.line;
+        let start_col = self.col;
+
+        let ch = match self.peek_ch() {
+            None => return Ok(Token::Eof),
+            Some(c) => c,
+        };
+
+        match ch {
+            b'%' => {
+                self.advance();
+                let name = self.read_ident_or_int()?;
+                Ok(Token::LocalIdent(name))
+            }
+            b'@' => {
+                self.advance();
+                let name = self.read_ident_or_int()?;
+                Ok(Token::GlobalIdent(name))
+            }
+            b'"' => {
+                self.advance();
+                let s = self.read_string_literal()?;
+                Ok(Token::StringLit(s))
+            }
+            b'c' | b'C' => {
+                // Check for c"..." string literal prefix.
+                if self.peek_ch2() == Some(b'"') {
+                    self.advance(); // consume 'c' or 'C'
+                    self.advance(); // consume '"'
+                    let s = self.read_string_literal()?;
+                    Ok(Token::StringLit(s))
+                } else {
+                    let word = self.read_word();
+                    Ok(self.classify_word(&word))
+                }
+            }
+            b'-' | b'0'..=b'9' => self.lex_number(),
+            b'=' => {
+                self.advance();
+                Ok(Token::Equal)
+            }
+            b',' => {
+                self.advance();
+                Ok(Token::Comma)
+            }
+            b':' => {
+                self.advance();
+                Ok(Token::Colon)
+            }
+            b'*' => {
+                self.advance();
+                Ok(Token::Star)
+            }
+            b'(' => {
+                self.advance();
+                Ok(Token::LParen)
+            }
+            b')' => {
+                self.advance();
+                Ok(Token::RParen)
+            }
+            b'[' => {
+                self.advance();
+                Ok(Token::LBracket)
+            }
+            b']' => {
+                self.advance();
+                Ok(Token::RBracket)
+            }
+            b'{' => {
+                self.advance();
+                Ok(Token::LBrace)
+            }
+            b'}' => {
+                self.advance();
+                Ok(Token::RBrace)
+            }
+            b'<' => {
+                self.advance();
+                Ok(Token::LAngle)
+            }
+            b'>' => {
+                self.advance();
+                Ok(Token::RAngle)
+            }
+            b'!' => {
+                self.advance();
+                Ok(Token::Bang)
+            }
+            b'#' => {
+                self.advance();
+                Ok(Token::Hash)
+            }
+            b'.' => {
+                if self.src.get(self.pos + 1) == Some(&b'.')
+                    && self.src.get(self.pos + 2) == Some(&b'.')
+                {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    Ok(Token::Ellipsis)
+                } else {
+                    Err(LexError {
+                        line: start_line,
+                        col: start_col,
+                        message: "unexpected '.'".into(),
+                    })
+                }
+            }
+            _ if ch.is_ascii_alphabetic() || ch == b'_' || ch == b'$' => {
+                let word = self.read_word();
+                Ok(self.classify_word(&word))
+            }
+            _ => {
+                self.advance();
+                Err(LexError {
+                    line: start_line,
+                    col: start_col,
+                    message: format!("unexpected character {:?}", ch as char),
+                })
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Identifier / keyword scanning
+    // -----------------------------------------------------------------------
+
+    fn read_word(&mut self) -> String {
+        let mut s = String::new();
+        while let Some(c) = self.peek_ch() {
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$' {
+                self.advance();
+                s.push(c as char);
+            } else {
+                break;
+            }
+        }
+        s
+    }
+
+    /// After `%` or `@`, read an identifier (possibly quoted or numeric).
+    fn read_ident_or_int(&mut self) -> Result<String, LexError> {
+        if self.peek_ch() == Some(b'"') {
+            self.advance();
+            self.read_string_literal()
+        } else if self.peek_ch().map_or(false, |c| c.is_ascii_digit()) {
+            let mut s = String::new();
+            while let Some(c) = self.peek_ch() {
+                if c.is_ascii_digit() {
+                    self.advance();
+                    s.push(c as char);
+                } else {
+                    break;
+                }
+            }
+            Ok(s)
+        } else {
+            let mut s = String::new();
+            while let Some(c) = self.peek_ch() {
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$' || c == b'-' {
+                    self.advance();
+                    s.push(c as char);
+                } else {
+                    break;
+                }
+            }
+            Ok(s)
+        }
+    }
+
+    fn read_string_literal(&mut self) -> Result<String, LexError> {
+        let mut s = String::new();
+        loop {
+            match self.peek_ch() {
+                None => return Err(self.make_err("unterminated string")),
+                Some(b'"') => {
+                    self.advance();
+                    break;
+                }
+                Some(b'\\') => {
+                    self.advance();
+                    let h1 = self.advance().ok_or_else(|| self.make_err("bad escape"))?;
+                    let h2 = self.advance().ok_or_else(|| self.make_err("bad escape"))?;
+                    let hex_str = format!("{}{}", h1 as char, h2 as char);
+                    let byte = u8::from_str_radix(&hex_str, 16)
+                        .map_err(|_| self.make_err(format!("invalid hex escape \\{}", hex_str)))?;
+                    s.push(byte as char);
+                }
+                Some(c) => {
+                    self.advance();
+                    s.push(c as char);
+                }
+            }
+        }
+        Ok(s)
+    }
+
+    // -----------------------------------------------------------------------
+    // Number lexing
+    // -----------------------------------------------------------------------
+
+    fn lex_number(&mut self) -> Result<Token, LexError> {
+        let negative = self.peek_ch() == Some(b'-');
+        if negative {
+            self.advance();
+        }
+
+        // Hex float "0x..."
+        if self.peek_ch() == Some(b'0') && matches!(self.peek_ch2(), Some(b'x') | Some(b'X')) {
+            self.advance(); // '0'
+            self.advance(); // 'x'
+            let mut hex = String::new();
+            while let Some(c) = self.peek_ch() {
+                if c.is_ascii_hexdigit() {
+                    self.advance();
+                    hex.push(c as char);
+                } else {
+                    break;
+                }
+            }
+            let bits = u64::from_str_radix(&hex, 16).map_err(|_| self.make_err("bad hex float"))?;
+            let f = f64::from_bits(bits);
+            return Ok(Token::FloatLit(if negative { -f } else { f }));
+        }
+
+        // Read digits.
+        let mut digits = String::new();
+        while let Some(c) = self.peek_ch() {
+            if c.is_ascii_digit() {
+                self.advance();
+                digits.push(c as char);
+            } else {
+                break;
+            }
+        }
+
+        // Float if decimal point or exponent follows.
+        let is_float = matches!(self.peek_ch(), Some(b'.') | Some(b'e') | Some(b'E'));
+        if is_float {
+            let mut s = if negative {
+                format!("-{}", digits)
+            } else {
+                digits
+            };
+            if self.peek_ch() == Some(b'.') {
+                self.advance();
+                s.push('.');
+                while let Some(c) = self.peek_ch() {
+                    if c.is_ascii_digit() {
+                        self.advance();
+                        s.push(c as char);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if matches!(self.peek_ch(), Some(b'e') | Some(b'E')) {
+                self.advance();
+                s.push('e');
+                if matches!(self.peek_ch(), Some(b'+') | Some(b'-')) {
+                    let sign = self.advance().unwrap();
+                    s.push(sign as char);
+                }
+                while let Some(c) = self.peek_ch() {
+                    if c.is_ascii_digit() {
+                        self.advance();
+                        s.push(c as char);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let f: f64 = s
+                .parse()
+                .map_err(|_| self.make_err(format!("bad float: {}", s)))?;
+            Ok(Token::FloatLit(f))
+        } else {
+            // Integer.
+            match digits.parse::<u64>() {
+                Ok(n) => {
+                    if negative {
+                        if n > (i64::MAX as u64) + 1 {
+                            return Err(self.make_err(format!("integer -{} out of i64 range", n)));
+                        }
+                        Ok(Token::IntLit((n as i64).wrapping_neg()))
+                    } else if n <= i64::MAX as u64 {
+                        Ok(Token::IntLit(n as i64))
+                    } else {
+                        Ok(Token::UIntLit(n))
+                    }
+                }
+                Err(_) => {
+                    // Too large for u64 — store as big integer string.
+                    if negative {
+                        Ok(Token::BigIntLit(format!("-{}", digits)))
+                    } else {
+                        Ok(Token::BigIntLit(digits))
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Keyword classification
+    // -----------------------------------------------------------------------
+
+    fn classify_word(&self, word: &str) -> Token {
+        // iNN integer type?
+        if let Some(bits_str) = word.strip_prefix('i') {
+            if !bits_str.is_empty() && bits_str.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(bits) = bits_str.parse::<u32>() {
+                    return Token::IntType(bits);
+                }
+            }
+        }
+
+        let kw = match word {
+            "source_filename" => Keyword::Source,
+            "target" => Keyword::Target,
+            "triple" => Keyword::Triple,
+            "datalayout" => Keyword::Datalayout,
+            "define" => Keyword::Define,
+            "declare" => Keyword::Declare,
+            "type" => Keyword::Type,
+            "private" => Keyword::Private,
+            "internal" => Keyword::Internal,
+            "external" => Keyword::External,
+            "weak" => Keyword::Weak,
+            "weak_odr" => Keyword::WeakOdr,
+            "linkonce" => Keyword::Linkonce,
+            "linkonce_odr" => Keyword::LinkonceOdr,
+            "common" => Keyword::Common,
+            "available_externally" => Keyword::AvailableExternally,
+            "void" => Keyword::Void,
+            "half" => Keyword::Half,
+            "bfloat" => Keyword::Bfloat,
+            "float" => Keyword::Float,
+            "double" => Keyword::Double,
+            "fp128" => Keyword::Fp128,
+            "x86_fp80" => Keyword::X86Fp80,
+            "label" => Keyword::Label,
+            "metadata" => Keyword::Metadata,
+            "ptr" => Keyword::Ptr,
+            "global" => Keyword::Global,
+            "constant" => Keyword::Constant,
+            "inbounds" => Keyword::Inbounds,
+            "exact" => Keyword::Exact,
+            "nuw" => Keyword::Nuw,
+            "nsw" => Keyword::Nsw,
+            "volatile" => Keyword::Volatile,
+            "tail" => Keyword::Tail,
+            "musttail" => Keyword::Musttail,
+            "notail" => Keyword::Notail,
+            "fast" => Keyword::Fast,
+            "nnan" => Keyword::Nnan,
+            "ninf" => Keyword::Ninf,
+            "nsz" => Keyword::Nsz,
+            "arcp" => Keyword::Arcp,
+            "contract" => Keyword::Contract,
+            "afn" => Keyword::Afn,
+            "reassoc" => Keyword::Reassoc,
+            "add" => Keyword::Add,
+            "sub" => Keyword::Sub,
+            "mul" => Keyword::Mul,
+            "udiv" => Keyword::Udiv,
+            "sdiv" => Keyword::Sdiv,
+            "urem" => Keyword::Urem,
+            "srem" => Keyword::Srem,
+            "and" => Keyword::And,
+            "or" => Keyword::Or,
+            "xor" => Keyword::Xor,
+            "shl" => Keyword::Shl,
+            "lshr" => Keyword::Lshr,
+            "ashr" => Keyword::Ashr,
+            "fadd" => Keyword::Fadd,
+            "fsub" => Keyword::Fsub,
+            "fmul" => Keyword::Fmul,
+            "fdiv" => Keyword::Fdiv,
+            "frem" => Keyword::Frem,
+            "fneg" => Keyword::Fneg,
+            "icmp" => Keyword::Icmp,
+            "fcmp" => Keyword::Fcmp,
+            "alloca" => Keyword::Alloca,
+            "load" => Keyword::Load,
+            "store" => Keyword::Store,
+            "getelementptr" => Keyword::Getelementptr,
+            "trunc" => Keyword::Trunc,
+            "zext" => Keyword::Zext,
+            "sext" => Keyword::Sext,
+            "fptrunc" => Keyword::Fptrunc,
+            "fpext" => Keyword::Fpext,
+            "fptoui" => Keyword::Fptoui,
+            "fptosi" => Keyword::Fptosi,
+            "uitofp" => Keyword::Uitofp,
+            "sitofp" => Keyword::Sitofp,
+            "ptrtoint" => Keyword::Ptrtoint,
+            "inttoptr" => Keyword::Inttoptr,
+            "bitcast" => Keyword::Bitcast,
+            "addrspacecast" => Keyword::Addrspacecast,
+            "freeze" => Keyword::Freeze,
+            "select" => Keyword::Select,
+            "phi" => Keyword::Phi,
+            "extractvalue" => Keyword::Extractvalue,
+            "insertvalue" => Keyword::Insertvalue,
+            "extractelement" => Keyword::Extractelement,
+            "insertelement" => Keyword::Insertelement,
+            "shufflevector" => Keyword::Shufflevector,
+            "call" => Keyword::Call,
+            "ret" => Keyword::Ret,
+            "br" => Keyword::Br,
+            "switch" => Keyword::Switch,
+            "unreachable" => Keyword::Unreachable,
+            "eq" => Keyword::Eq,
+            "ne" => Keyword::Ne,
+            "ugt" => Keyword::Ugt,
+            "uge" => Keyword::Uge,
+            "ult" => Keyword::Ult,
+            "ule" => Keyword::Ule,
+            "sgt" => Keyword::Sgt,
+            "sge" => Keyword::Sge,
+            "slt" => Keyword::Slt,
+            "sle" => Keyword::Sle,
+            "false" => Keyword::False,
+            "oeq" => Keyword::Oeq,
+            "ogt" => Keyword::Ogt,
+            "oge" => Keyword::Oge,
+            "olt" => Keyword::Olt,
+            "ole" => Keyword::Ole,
+            "one" => Keyword::One,
+            "ord" => Keyword::Ord,
+            "uno" => Keyword::Uno,
+            "ueq" => Keyword::Ueq,
+            "une" => Keyword::Une,
+            "true" => Keyword::True,
+            "zeroinitializer" => Keyword::Zeroinitializer,
+            "undef" => Keyword::Undef,
+            "poison" => Keyword::Poison,
+            "null" => Keyword::Null,
+            "align" => Keyword::Align,
+            "noundef" => Keyword::Noundef,
+            "unnamed_addr" => Keyword::UnnamedAddr,
+            "dso_local" => Keyword::DsoLocal,
+            "to" => Keyword::To,
+            "x" => Keyword::X,
+            "vscale" => Keyword::Vscale,
+            "attributes" => Keyword::Attributes,
+            // Unknown words become bare local identifiers (shouldn't normally happen at module level).
+            other => return Token::LocalIdent(other.to_string()),
+        };
+        Token::Kw(kw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lex_all(src: &str) -> Vec<Token> {
+        let mut lex = Lexer::new(src);
+        let mut toks = Vec::new();
+        loop {
+            let t = lex.next().unwrap();
+            if t == Token::Eof {
+                break;
+            }
+            toks.push(t);
+        }
+        toks
+    }
+
+    #[test]
+    fn lex_basic_tokens() {
+        let toks = lex_all("define i32 @foo(i32 %x) {");
+        assert_eq!(toks[0], Token::Kw(Keyword::Define));
+        assert_eq!(toks[1], Token::IntType(32));
+        assert_eq!(toks[2], Token::GlobalIdent("foo".to_string()));
+        assert_eq!(toks[3], Token::LParen);
+        assert_eq!(toks[4], Token::IntType(32));
+        assert_eq!(toks[5], Token::LocalIdent("x".to_string()));
+        assert_eq!(toks[6], Token::RParen);
+        assert_eq!(toks[7], Token::LBrace);
+    }
+
+    #[test]
+    fn lex_integer_literals() {
+        let toks = lex_all("42 -7 0");
+        assert_eq!(toks[0], Token::IntLit(42));
+        assert_eq!(toks[1], Token::IntLit(-7));
+        assert_eq!(toks[2], Token::IntLit(0));
+    }
+
+    #[test]
+    fn lex_hex_float() {
+        let toks = lex_all("0x4000000000000000");
+        assert_eq!(toks[0], Token::FloatLit(2.0));
+    }
+
+    #[test]
+    fn lex_comment_skipped() {
+        let toks = lex_all("; this is a comment\ni32");
+        assert_eq!(toks[0], Token::IntType(32));
+    }
+
+    #[test]
+    fn lex_string_literal() {
+        let toks = lex_all("\"hello\"");
+        assert_eq!(toks[0], Token::StringLit("hello".to_string()));
+    }
+
+    #[test]
+    fn lex_ellipsis() {
+        let toks = lex_all("...");
+        assert_eq!(toks[0], Token::Ellipsis);
+    }
+
+    #[test]
+    fn lex_keywords() {
+        let toks = lex_all("ret void add nsw");
+        assert_eq!(toks[0], Token::Kw(Keyword::Ret));
+        assert_eq!(toks[1], Token::Kw(Keyword::Void));
+        assert_eq!(toks[2], Token::Kw(Keyword::Add));
+        assert_eq!(toks[3], Token::Kw(Keyword::Nsw));
+    }
+}

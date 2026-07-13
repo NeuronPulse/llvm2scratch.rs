@@ -330,7 +330,7 @@ pub fn assignment_elision(
     let mut new_proj = proj.clone();
     let mut any_changed = false;
 
-    for (code_idx, code) in new_proj.code.iter_mut().enumerate() {
+    for (_code_idx, code) in new_proj.code.iter_mut().enumerate() {
         let var_use = get_blocklist_var_use(code, None);
         let mut to_elide: HashMap<String, Value> = HashMap::new();
 
@@ -369,7 +369,7 @@ pub fn assignment_elision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scratch::ast::{KnownVal, Op, VarOp};
+    use crate::scratch::ast::{KnownVal, Op};
     use crate::target::{Target, TargetPerf, TargetInfo, TargetExec, BranchMethod};
 
     fn test_perf() -> TargetPerf {
