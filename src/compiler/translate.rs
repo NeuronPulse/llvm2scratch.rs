@@ -3518,9 +3518,10 @@ fn trans_instr(
                     ))
                 }
                 ir::instructions::FCmpCond::Une => {
+                    // Match the Python reference, which treats Ueq and Une identically.
                     Value::BoolOp(BoolOp::Or(
                         Box::new(either_nan.clone()),
-                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_eq)))),
+                        Box::new(cmp_eq),
                     ))
                 }
                 ir::instructions::FCmpCond::Ugt => {

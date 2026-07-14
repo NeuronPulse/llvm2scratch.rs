@@ -1714,16 +1714,39 @@ impl<'src> Parser<'src> {
                         "nocapture",
                         "noalias",
                         "immarg",
+                        "nofree",
+                        "nest",
+                        "returned",
                         "dereferenceable",
                         "dereferenceable_or_null",
+                        "allocalign",
+                        "preallocated",
+                        "dead_on_unwind",
+                        "writable",
                     ];
                     if KNOWN_ATTRS.contains(&name.as_str()) {
                         self.lex.next()?;
                         // Some attributes carry a parenthesized operand.
-                        if name == "dereferenceable" || name == "dereferenceable_or_null" {
+                        if name == "dereferenceable"
+                            || name == "dereferenceable_or_null"
+                            || name == "byval"
+                            || name == "byref"
+                            || name == "preallocated"
+                            || name == "sret"
+                        {
                             if self.lex.eat(&Token::LParen) {
-                                self.lex.next()?; // size
-                                self.lex.expect(&Token::RParen)?;
+                                // Consume everything up to the matching ')'.
+                                let mut depth = 1;
+                                while depth > 0 {
+                                    match self.lex.next()? {
+                                        Token::LParen => depth += 1,
+                                        Token::RParen => depth -= 1,
+                                        Token::Eof => {
+                                            return Err(self.err("unterminated attribute operand"))
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -2361,6 +2384,8 @@ impl<'src> Parser<'src> {
             "dereferenceable_or_null",
             "allocalign",
             "preallocated",
+            "dead_on_unwind",
+            "writable",
         ];
         loop {
             match self.lex.peek()? {
