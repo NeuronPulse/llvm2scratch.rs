@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod export;
+pub mod stringify;
 pub mod uid;
 
 pub use ast::*;

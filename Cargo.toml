@@ -7,7 +7,8 @@ license = "MIT"
 edition = "2024"
 
 [dependencies]
-inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", features = ["llvm19-1-force-dynamic"] }
+llvm-ir = { package = "llvm-in-rust-ir", version = "0.1" }
+llvm-ir-parser = { package = "llvm-in-rust-ir-parser", version = "0.1" }
 nom = "7"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,6 +21,7 @@ md-5 = "0.10"
 thiserror = "2"
 rand = "0.9"
 num-traits = "0.2"
+num-bigint = "0.4"
 hex = "0.4"
 
 [dev-dependencies]
@@ -32,3 +34,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "llvm2scratch"
 path = "src/main.rs"
+
+[patch.crates-io]
+llvm-in-rust-ir-parser = { path = "vendor/llvm-ir-parser" }
+llvm-in-rust-ir = { path = "vendor/llvm-ir" }

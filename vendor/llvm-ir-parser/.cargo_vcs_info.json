@@ -1,0 +1,7 @@
+{
+  "git": {
+    "sha1": "a0d12ee0bb7fe0963da26fb67437a035a3df0a2c",
+    "dirty": true
+  },
+  "path_in_vcs": "src/llvm-ir-parser"
+}

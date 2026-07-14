@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::ir;
 use super::config::BlockVarUse;
+use super::memory;
 
 /// Collect the values used by an instruction.
 fn instr_values(instr: &ir::Instr, include_called_funcs: bool) -> Vec<ir::Value> {
@@ -44,7 +45,7 @@ fn instr_values(instr: &ir::Instr, include_called_funcs: bool) -> Vec<ir::Value>
 }
 
 /// Labels a terminator may branch to. Ret branches to the special "ret" label.
-fn terminator_branch_labels(instr: &ir::Instr) -> HashSet<String> {
+pub fn terminator_branch_labels(instr: &ir::Instr) -> HashSet<String> {
     let mut labels = HashSet::new();
     match instr {
         ir::Instr::Ret(_) => {
@@ -143,18 +144,26 @@ pub fn analyze_function_block_var_use(
             }
 
             let mut instr_depends = HashSet::new();
+            let mut instr_depends_var_sizes = HashMap::new();
             for val in vals {
                 match val {
                     ir::Value::Argument(arg) => {
                         instr_depends.insert(arg.name.clone());
+                        if let Ok(size) = memory::get_size_of(&arg.type_, false) {
+                            instr_depends_var_sizes.insert(arg.name.clone(), size);
+                        }
                     }
                     ir::Value::LocalVar(lv) => {
                         instr_depends.insert(lv.name.clone());
+                        if let Ok(size) = memory::get_size_of(&lv.type_, false) {
+                            instr_depends_var_sizes.insert(lv.name.clone(), size);
+                        }
                     }
                     _ => {}
                 }
             }
             res.depends.extend(&instr_depends - &res.modifies);
+            res.depends_var_sizes.extend(instr_depends_var_sizes);
 
             if let Some(result) = instr.result() {
                 res.modifies.insert(result.name.clone());
@@ -166,6 +175,12 @@ pub fn analyze_function_block_var_use(
         }
 
         direct.insert(label.clone(), res);
+    }
+
+    // Merge all direct depends_var_sizes to match Python's total_depends_var_sizes.
+    let mut total_depends_var_sizes: HashMap<String, usize> = HashMap::new();
+    for var_use in direct.values() {
+        total_depends_var_sizes.extend(var_use.depends_var_sizes.clone());
     }
 
     let entrypoint = func.blocks.keys().next().cloned().unwrap_or_default();
@@ -194,7 +209,7 @@ pub fn analyze_function_block_var_use(
                     depends: node_info.depends,
                     modifies: node_info.modifies,
                     branches: direct_branches,
-                    depends_var_sizes: HashMap::new(),
+                    depends_var_sizes: total_depends_var_sizes.clone(),
                 },
             )
         })
@@ -202,6 +217,18 @@ pub fn analyze_function_block_var_use(
 }
 
 pub fn find_nodes_with_cycle(graph: &HashMap<String, Vec<String>>) -> HashSet<String> {
+    // Sort nodes and edges for deterministic behaviour across builds.
+    let mut sorted_graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (k, v) in graph {
+        let mut edges = v.clone();
+        edges.sort();
+        edges.dedup();
+        sorted_graph.insert(k.clone(), edges);
+    }
+    find_nodes_with_cycle_sorted(&sorted_graph)
+}
+
+fn find_nodes_with_cycle_sorted(graph: &BTreeMap<String, Vec<String>>) -> HashSet<String> {
     let nodes: Vec<String> = graph.keys().cloned().collect();
     let mut in_cycle = HashSet::new();
 
@@ -220,7 +247,7 @@ pub fn find_nodes_with_cycle(graph: &HashMap<String, Vec<String>>) -> HashSet<St
 
     fn strongconnect(
         node: &str,
-        graph: &HashMap<String, Vec<String>>,
+        graph: &BTreeMap<String, Vec<String>>,
         index: &mut usize,
         stack: &mut Vec<String>,
         on_stack: &mut HashSet<String>,
@@ -278,7 +305,7 @@ pub fn find_nodes_with_cycle(graph: &HashMap<String, Vec<String>>) -> HashSet<St
     in_cycle
 }
 
-fn find_all_simple_cycles(graph: &HashMap<String, Vec<String>>) -> Vec<Vec<String>> {
+fn find_all_simple_cycles(graph: &BTreeMap<String, Vec<String>>) -> Vec<Vec<String>> {
     let nodes: Vec<String> = graph.keys().cloned().collect();
     let mut cycles = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -287,7 +314,7 @@ fn find_all_simple_cycles(graph: &HashMap<String, Vec<String>>) -> Vec<Vec<Strin
     fn dfs(
         current: &str,
         start: &str,
-        graph: &HashMap<String, Vec<String>>,
+        graph: &BTreeMap<String, Vec<String>>,
         visited: &mut HashSet<String>,
         path: &mut Vec<String>,
         cycles: &mut Vec<Vec<String>>,
@@ -319,9 +346,26 @@ fn find_all_simple_cycles(graph: &HashMap<String, Vec<String>>) -> Vec<Vec<Strin
 }
 
 pub fn select_cycle_checks(graph: &HashMap<String, Vec<String>>) -> Vec<String> {
-    let cycles = find_all_simple_cycles(graph);
+    // Sort nodes and edges so the result does not depend on HashMap/HashSet iteration order.
+    let mut sorted_graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (k, v) in graph {
+        let mut edges = v.clone();
+        edges.sort();
+        edges.dedup();
+        sorted_graph.insert(k.clone(), edges);
+    }
+    let cycles = find_all_simple_cycles(&sorted_graph);
     if cycles.is_empty() {
-        return Vec::new();
+        // Match Python's igraph fallback: if simple_cycles() reports no cycles
+        // but the graph still contains non-trivial SCCs, return every node that
+        // is part of a cycle.
+        let cyclic = find_nodes_with_cycle_sorted(&sorted_graph);
+        if cyclic.is_empty() {
+            return Vec::new();
+        }
+        let mut result: Vec<String> = cyclic.into_iter().collect();
+        result.sort();
+        return result;
     }
 
     let mut self_loop_nodes: HashSet<String> = HashSet::new();
@@ -439,52 +483,99 @@ pub fn unavoidable_nodes(
         return result;
     }
 
-    let mut reachable_from_source = HashSet::new();
-    reachable_from_source.insert(source.to_string());
-    let mut stack = vec![source.to_string()];
-    while let Some(node) = stack.pop() {
-        if let Some(neighbors) = graph.get(&node) {
-            for neighbor in neighbors {
-                if reachable_from_source.insert(neighbor.clone()) {
-                    stack.push(neighbor.clone());
-                }
+    // Compute dominator sets using the iterative dataflow algorithm.
+    // D(source) = {source}; D(n) = {n} ∪ (∩ D(p) for p ∈ pred(n)).
+    let mut preds: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut all_nodes: HashSet<String> = HashSet::new();
+    all_nodes.insert(source.to_string());
+    all_nodes.insert(target.to_string());
+    for (node, succs) in graph {
+        all_nodes.insert(node.clone());
+        for succ in succs {
+            all_nodes.insert(succ.clone());
+            preds.entry(succ.clone()).or_default().insert(node.clone());
+        }
+    }
+
+    let mut dom: HashMap<String, HashSet<String>> = HashMap::new();
+    for node in &all_nodes {
+        if node == source {
+            let mut s = HashSet::new();
+            s.insert(source.to_string());
+            dom.insert(node.clone(), s);
+        } else {
+            dom.insert(node.clone(), all_nodes.clone());
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for node in &all_nodes {
+            if node == source {
+                continue;
+            }
+            let pred_sets: Vec<&HashSet<String>> = preds
+                .get(node)
+                .map(|ps| ps.iter().filter_map(|p| dom.get(p)).collect())
+                .unwrap_or_default();
+            let mut new_dom: HashSet<String> = match pred_sets.first() {
+                Some(first) => (*first).clone(),
+                None => HashSet::new(),
+            };
+            for s in pred_sets.iter().skip(1) {
+                new_dom.retain(|x| s.contains(x));
+            }
+            new_dom.insert(node.clone());
+            let old_dom = dom.get(node).cloned().unwrap_or_default();
+            if new_dom != old_dom {
+                dom.insert(node.clone(), new_dom);
+                changed = true;
             }
         }
     }
 
-    if !reachable_from_source.contains(target) {
+    // If target is unreachable from source, only source is unavoidable.
+    if !dom.get(target).map_or(false, |d| d.contains(source)) {
         return result;
     }
 
-    let nodes: Vec<String> = reachable_from_source.into_iter().collect();
-    for candidate in &nodes {
-        if candidate == source || candidate == target {
+    // Compute immediate dominators to match igraph's dominator(mode="OUT").
+    // idom(n) is the unique node in D(n) - {n} that dominates every other
+    // node in D(n) - {n}.
+    let mut idom: HashMap<String, String> = HashMap::new();
+    for node in &all_nodes {
+        if node == source {
             continue;
         }
-        let mut visited = HashSet::new();
-        visited.insert(source.to_string());
-        let mut stack = vec![source.to_string()];
-        let mut can_avoid = false;
-        while let Some(node) = stack.pop() {
-            if node == *target {
-                can_avoid = true;
-                break;
-            }
-            if let Some(neighbors) = graph.get(&node) {
-                for neighbor in neighbors {
-                    if neighbor == candidate || visited.contains(neighbor) {
-                        continue;
-                    }
-                    visited.insert(neighbor.clone());
-                    stack.push(neighbor.clone());
+        let dset = dom.get(node).cloned().unwrap_or_default();
+        let strict: Vec<String> = dset.iter().filter(|&n| n != node).cloned().collect();
+        if strict.len() == 1 {
+            idom.insert(node.clone(), strict[0].clone());
+        } else {
+            for candidate in &strict {
+                let candidate_dom = dom.get(candidate).cloned().unwrap_or_default();
+                if strict
+                    .iter()
+                    .filter(|&n| n != candidate)
+                    .all(|n| candidate_dom.contains(n))
+                {
+                    idom.insert(node.clone(), candidate.clone());
+                    break;
                 }
             }
         }
-        if !can_avoid {
-            result.insert(candidate.clone());
-        }
     }
 
-    result.insert(target.to_string());
+    // Walk from target up the dominator tree to source.
+    let mut current = target.to_string();
+    while current != source {
+        result.insert(current.clone());
+        match idom.get(&current) {
+            Some(next) => current = next.clone(),
+            None => break,
+        }
+    }
+    result.insert(source.to_string());
     result
 }

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Python package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Build Rust release binary
+        run: cargo build --release
+
+      - name: Run Rust unit tests
+        run: cargo test --release
+
+      - name: Run sb3 diff tests
+        run: python3 tests/diff_test.py
+
+      - name: Generate complex programs
+        run: bash scripts/generate_complex_programs.sh
+
+      - name: Run scratchblocks diff tests
+        run: python3 tests/scratchblocks_diff_test.py
+
+      - name: Run scratchblocks stress diff tests
+        run: python3 tests/scratchblocks_stress_diff_test.py
+
+      - name: Run parser fixtures comparison
+        run: bash scripts/compare_py_rs_fixtures.sh

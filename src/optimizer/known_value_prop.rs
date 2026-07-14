@@ -84,7 +84,11 @@ fn simplify_op(op: &Op, lookup_func: &dyn Fn(&Value) -> Option<Value>) -> (Value
             }
             Op::Mod(_, _) => {
                 if *b != 0.0 {
-                    Value::Known(KnownVal::Num(a % b))
+                    // Scratch's modulo uses floor division, matching Python's % operator,
+                    // not Rust's truncated-division % operator.
+                    let div = (a / b).floor();
+                    let rem = a - b * div;
+                    Value::Known(KnownVal::Num(rem))
                 } else {
                     return (Value::Op(op.with_values(left, right)), changed);
                 }

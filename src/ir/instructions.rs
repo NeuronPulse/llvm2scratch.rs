@@ -715,8 +715,8 @@ mod tests {
         let binop = Instr::BinaryOp(BinaryOp {
             result: ResultLocalVar::new("tmp"),
             opcode: BinaryOpcode::Add,
-            left: Value::KnownInt(KnownIntVal::new(Type::integer(32), 1, 32)),
-            right: Value::KnownInt(KnownIntVal::new(Type::integer(32), 2, 32)),
+            left: Value::KnownInt(KnownIntVal::new(Type::integer(32), 1u32, 32)),
+            right: Value::KnownInt(KnownIntVal::new(Type::integer(32), 2u32, 32)),
             is_nuw: false,
             is_nsw: false,
             is_exact: false,
@@ -731,8 +731,8 @@ mod tests {
         let binop = Instr::BinaryOp(BinaryOp {
             result: ResultLocalVar::new("tmp"),
             opcode: BinaryOpcode::Add,
-            left: Value::KnownInt(KnownIntVal::new(Type::integer(32), 1, 32)),
-            right: Value::KnownInt(KnownIntVal::new(Type::integer(32), 2, 32)),
+            left: Value::KnownInt(KnownIntVal::new(Type::integer(32), 1u32, 32)),
+            right: Value::KnownInt(KnownIntVal::new(Type::integer(32), 2u32, 32)),
             is_nuw: false,
             is_nsw: false,
             is_exact: false,
@@ -741,8 +741,8 @@ mod tests {
         assert_eq!(binop.result().unwrap().name, "tmp");
 
         let store = Instr::Store(Store {
-            value: Value::KnownInt(KnownIntVal::new(Type::integer(32), 0, 32)),
-            address: Value::KnownInt(KnownIntVal::new(Type::integer(32), 0, 32)),
+            value: Value::KnownInt(KnownIntVal::new(Type::integer(32), 0u32, 32)),
+            address: Value::KnownInt(KnownIntVal::new(Type::integer(32), 0u32, 32)),
         });
         assert!(store.result().is_none());
     }

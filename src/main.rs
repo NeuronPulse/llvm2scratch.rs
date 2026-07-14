@@ -7,9 +7,10 @@ use clap::builder::PossibleValuesParser;
 
 use llvm2scratch::compiler::config::CompilerConfig;
 use llvm2scratch::compiler::translate;
+use llvm2scratch::target::BranchMethod;
 use llvm2scratch::optimizer::Optimization;
 use llvm2scratch::scratch::ast::{Format, ScratchConfig};
-use llvm2scratch::scratch::export::{export_data, export_scratch_file};
+use llvm2scratch::scratch::export::export_scratch_file;
 use llvm2scratch::scratch::{Project, ScratchContext};
 use llvm2scratch::target::loader::get_target;
 use llvm2scratch::target::{DEFAULT_OPT_TARGET, DEFAULT_TARGETS};
@@ -387,10 +388,11 @@ fn main() {
     cfg.max_branch_recursion = max_branch_recursion;
     cfg.accurate_byte_spacing = !no_accurate_byte_spacing;
     cfg.targets = targets.clone();
-    cfg.opt_target = opt_target;
+    cfg.opt_target = opt_target.clone();
     cfg.compiler_opt = compiler_opt;
     cfg.compiler_minify = compiler_minify;
     cfg.opt_passes = opt_passes;
+    cfg.use_branch_jump_table = opt_target.exec.preferred_branch_method == BranchMethod::JumpTable;
     cfg.gen_lut_runtime = gen_lut_runtime;
     cfg.scratch_config = ScratchConfig {
         minify,
@@ -423,8 +425,7 @@ fn main() {
     }
 
     if let Some(path) = matches.get_one::<String>("debug-scratch-text") {
-        let mut ctx = project_to_context(&proj);
-        let text = export_data(&mut ctx, format);
+        let text = proj.stringify(false);
         if let Err(e) = fs::write(path, text) {
             eprintln!("Error writing debug scratch text '{}': {}", path, e);
             process::exit(1);
@@ -432,8 +433,7 @@ fn main() {
     }
 
     if let Some(path) = matches.get_one::<String>("debug-scratchblocks") {
-        let mut ctx = project_to_context(&proj);
-        let text = export_data(&mut ctx, format);
+        let text = proj.stringify(true);
         if let Err(e) = fs::write(path, text) {
             eprintln!("Error writing debug scratchblocks '{}': {}", path, e);
             process::exit(1);

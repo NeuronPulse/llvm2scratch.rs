@@ -127,54 +127,66 @@ def compare_structures(py_struct: dict, rs_struct: dict) -> list:
     py_targets = [t for t in py_struct["targets"] if not t["isStage"]]
     rs_targets = [t for t in rs_struct["targets"] if not t["isStage"]]
 
-    if len(py_targets) != len(rs_targets):
-        diffs.append(f"Target count: Python={len(py_targets)}, Rust={len(rs_targets)}")
+    # The real compiled sprite is typically named "DONT OPEN"; fall back to the
+    # non-stage target with the most blocks so we don't compare the empty sprite.
+    def pick_target(targets):
+        named = [t for t in targets if t.get("name") == "DONT OPEN"]
+        if named:
+            return named[0]
+        if not targets:
+            return None
+        return max(targets, key=lambda t: t["blocks_count"])
+
+    pt = pick_target(py_targets)
+    rt = pick_target(rs_targets)
+
+    if pt is None or rt is None:
+        diffs.append(f"No comparable sprite target found: Python={pt is not None}, Rust={rt is not None}")
         return diffs
 
-    for i, (pt, rt) in enumerate(zip(py_targets, rs_targets)):
-        prefix = f"Target[{i}]"
+    prefix = "Target[DONT OPEN]"
 
-        if pt["name"] != rt["name"]:
-            diffs.append(f"{prefix} name: Python={pt['name']}, Rust={rt['name']}")
+    if pt["name"] != rt["name"]:
+        diffs.append(f"{prefix} name: Python={pt['name']}, Rust={rt['name']}")
 
-        if pt["blocks_count"] != rt["blocks_count"]:
-            diffs.append(f"{prefix} blocks_count: Python={pt['blocks_count']}, Rust={rt['blocks_count']}")
+    if pt["blocks_count"] != rt["blocks_count"]:
+        diffs.append(f"{prefix} blocks_count: Python={pt['blocks_count']}, Rust={rt['blocks_count']}")
 
-        py_ops = pt["blocks_opcodes"]
-        rs_ops = rt["blocks_opcodes"]
-        if py_ops != rs_ops:
-            py_op_counts = {}
-            rs_op_counts = {}
-            for op in py_ops:
-                py_op_counts[op] = py_op_counts.get(op, 0) + 1
-            for op in rs_ops:
-                rs_op_counts[op] = rs_op_counts.get(op, 0) + 1
-            all_ops = sorted(set(list(py_op_counts.keys()) + list(rs_op_counts.keys())))
-            for op in all_ops:
-                pc = py_op_counts.get(op, 0)
-                rc = rs_op_counts.get(op, 0)
-                if pc != rc:
-                    diffs.append(f"{prefix} opcode '{op}' count: Python={pc}, Rust={rc}")
+    py_ops = pt["blocks_opcodes"]
+    rs_ops = rt["blocks_opcodes"]
+    if py_ops != rs_ops:
+        py_op_counts = {}
+        rs_op_counts = {}
+        for op in py_ops:
+            py_op_counts[op] = py_op_counts.get(op, 0) + 1
+        for op in rs_ops:
+            rs_op_counts[op] = rs_op_counts.get(op, 0) + 1
+        all_ops = sorted(set(list(py_op_counts.keys()) + list(rs_op_counts.keys())))
+        for op in all_ops:
+            pc = py_op_counts.get(op, 0)
+            rc = rs_op_counts.get(op, 0)
+            if pc != rc:
+                diffs.append(f"{prefix} opcode '{op}' count: Python={pc}, Rust={rc}")
 
-        py_vars = set(pt["variables"].keys())
-        rs_vars = set(rt["variables"].keys())
-        if py_vars != rs_vars:
-            only_py = py_vars - rs_vars
-            only_rs = rs_vars - py_vars
-            if only_py:
-                diffs.append(f"{prefix} variables only in Python: {sorted(only_py)}")
-            if only_rs:
-                diffs.append(f"{prefix} variables only in Rust: {sorted(only_rs)}")
+    py_vars = set(pt["variables"].keys())
+    rs_vars = set(rt["variables"].keys())
+    if py_vars != rs_vars:
+        only_py = py_vars - rs_vars
+        only_rs = rs_vars - py_vars
+        if only_py:
+            diffs.append(f"{prefix} variables only in Python: {sorted(only_py)}")
+        if only_rs:
+            diffs.append(f"{prefix} variables only in Rust: {sorted(only_rs)}")
 
-        py_lists = set(pt["lists"].keys())
-        rs_lists = set(rt["lists"].keys())
-        if py_lists != rs_lists:
-            only_py = py_lists - rs_lists
-            only_rs = rs_lists - py_lists
-            if only_py:
-                diffs.append(f"{prefix} lists only in Python: {sorted(only_py)}")
-            if only_rs:
-                diffs.append(f"{prefix} lists only in Rust: {sorted(only_rs)}")
+    py_lists = set(pt["lists"].keys())
+    rs_lists = set(rt["lists"].keys())
+    if py_lists != rs_lists:
+        only_py = py_lists - rs_lists
+        only_rs = rs_lists - py_lists
+        if only_py:
+            diffs.append(f"{prefix} lists only in Python: {sorted(only_py)}")
+        if only_rs:
+            diffs.append(f"{prefix} lists only in Rust: {sorted(only_rs)}")
 
     return diffs
 
@@ -186,13 +198,16 @@ def compile_python(ll_path: str, out_path: str, memory_size: int = 4096) -> tupl
         if str(ROOT) not in sys.path:
             sys.path.insert(0, str(ROOT))
         from llvm2scratch.compiler import compile as py_compile, Config
-        from llvm2scratch import scratch
+        from llvm2scratch import scratch, target
 
+        opt_target = target.getTarget(target.DEFAULT_OPT_TARGET)
         cfg = Config(
             memory_size=memory_size,
             compiler_opt=False,
             compiler_minify=False,
             opt_passes=set(),
+            opt_target=opt_target,
+            use_branch_jump_table=opt_target.exec.preferred_branch_method == target.BranchMethod.JumpTable,
         )
         with open(ll_path) as f:
             proj = py_compile(f.read(), cfg)

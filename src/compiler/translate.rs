@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use indexmap::IndexMap;
+use num_traits::ToPrimitive;
+
 use crate::ir;
 use crate::ir::instructions::BinaryOpcode;
 use crate::ir::values::LocalVarVal;
@@ -11,7 +14,7 @@ use crate::scratch::ast::{GetOfList, EditListData, EditVarData, ProcedureDefData
 
 use super::config::{
     CompException, CompilerConfig, FuncInfo, FuncPtrSigInfo, BlockInfo,
-    Variable, VarType, IdxbleValue, ReturnAddrInfo,
+    Variable, VarType, IdxbleValue, ReturnAddrInfo, BlockVarUse,
 };
 use super::variable::{get_value_cost, InferredValue};
 use super::binop::{self, BinopKind};
@@ -68,15 +71,16 @@ pub fn trans_value(
     match val {
         ir::Value::KnownInt(ki) => {
             if ki.width as usize <= super::config::VARIABLE_MAX_BITS {
-                let val = twos_complement::comptime_undo_twos_complement(ki.value as f64, ki.width as usize);
-                Ok(InferredValue::Single(Value::Known(KnownVal::Num(val))))
+                // Keep the raw unsigned value to match Python's KnownIntVal handling.
+                Ok(InferredValue::Single(Value::Known(KnownVal::Num(ki.value.to_u64().unwrap_or(0) as f64))))
             } else {
-                let mut num = ki.value as u128;
+                let mut num = ki.value.clone();
                 let mut width = ki.width as usize;
                 let mut values = Vec::new();
-                let part_mask: u128 = (1u128 << super::config::VARIABLE_MAX_BITS) - 1;
+                let part_mask = num_bigint::BigUint::from(1u32) << super::config::VARIABLE_MAX_BITS;
                 while width > 0 {
-                    values.push(Value::Known(KnownVal::Num((num & part_mask) as f64)));
+                    let part = &num % &part_mask;
+                    values.push(Value::Known(KnownVal::Num(part.to_u64().unwrap_or(0) as f64)));
                     num >>= super::config::VARIABLE_MAX_BITS;
                     width = width.saturating_sub(super::config::VARIABLE_MAX_BITS);
                 }
@@ -133,7 +137,18 @@ pub fn trans_value(
         }
         ir::Value::GlobalPtr(gp) => {
             if let Some(&ptr) = ctx.globvar_to_ptr.get(&gp.name) {
-                Ok(InferredValue::Single(Value::Known(KnownVal::Num(ptr as f64))))
+                if ctx.cfg.compiler_opt {
+                    Ok(InferredValue::Single(Value::Known(KnownVal::Num(ptr as f64))))
+                } else {
+                    let var = Variable {
+                        var_name: gp.name.clone(),
+                        var_type: VarType::Global,
+                        fn_name: None,
+                    };
+                    Ok(InferredValue::Single(Value::GetVar {
+                        name: var.get_unidxed_raw_var_name(),
+                    }))
+                }
             } else {
                 Err(CompException(format!("Global variable not found: {}", gp.name)))
             }
@@ -164,7 +179,15 @@ pub fn trans_value(
         ir::Value::ConstExpr(ce) => match &ce.expr {
             ir::values::ConstExpr::Conversion(c) => trans_value(&c.value, ctx, bctx),
             ir::values::ConstExpr::GetElementPtr(gep) => {
-                let val = trans_gep_value(&gep.base_ptr, &gep.base_ptr_type, &gep.indices, gep.is_nuw, ctx, bctx)?;
+                let val = trans_gep_value(
+                    &gep.base_ptr,
+                    &gep.base_ptr_type,
+                    &gep.indices,
+                    gep.is_nuw,
+                    ctx,
+                    bctx,
+                    true,
+                )?;
                 Ok(InferredValue::Single(val))
             }
             _ => Err(CompException(format!("Cannot translate const expr: {:?}", ce))),
@@ -180,12 +203,31 @@ fn trans_gep_value(
     is_nuw: bool,
     ctx: &mut Context,
     bctx: Option<&BlockInfo>,
+    force_numeric_global: bool,
 ) -> Result<Value, CompException> {
-    let base = trans_value(base_ptr, ctx, bctx)?.into_single()?;
-    let index_vals: Vec<(Value, usize)> = indices.iter().map(|idx| {
-        let width = get_value_width(idx);
-        (trans_value(idx, ctx, bctx).unwrap().into_single().unwrap(), width)
-    }).collect();
+    let base = if force_numeric_global {
+        if let ir::Value::GlobalPtr(gp) = base_ptr {
+            if let Some(&ptr) = ctx.globvar_to_ptr.get(&gp.name) {
+                Value::Known(KnownVal::Num(ptr as f64))
+            } else {
+                return Err(CompException(format!(
+                    "Global variable not found: {}",
+                    gp.name
+                )));
+            }
+        } else {
+            trans_value(base_ptr, ctx, bctx)?.into_single()?
+        }
+    } else {
+        trans_value(base_ptr, ctx, bctx)?.into_single()?
+    };
+    let index_vals: Vec<(Value, usize)> = indices
+        .iter()
+        .map(|idx| {
+            let width = get_value_width(idx);
+            Ok((trans_value(idx, ctx, bctx)?.into_single()?, width))
+        })
+        .collect::<Result<Vec<_>, CompException>>()?;
     let gep_result = memory::get_gep_offsets(base_ptr_type, &index_vals, ctx.cfg.accurate_byte_spacing)?;
     let val = memory::apply_gep_offsets(
         base,
@@ -247,7 +289,13 @@ fn assign_parameters(
     params: &[Variable],
     param_sizes: &[usize],
     depends: &HashSet<String>,
+    use_branch_jump_table: bool,
 ) -> Result<BlockList, CompException> {
+    // With branch jump tables, all code lives in a single procedure so
+    // parameters are already in scope and never need to be reassigned.
+    if use_branch_jump_table {
+        return Ok(BlockList::new());
+    }
     let mut blocks = BlockList::new();
     for (param, size) in params.iter().zip(param_sizes.iter()) {
         let mut var = param.clone();
@@ -261,44 +309,6 @@ fn assign_parameters(
         }
     }
     Ok(blocks)
-}
-
-/// Find the instruction in `func` whose result is named `var_name`.
-fn find_local_def<'a>(func: &'a ir::Function, var_name: &str) -> Option<&'a ir::Instr> {
-    for (_label, block) in &func.blocks {
-        for instr in &block.instrs {
-            if let Some(res) = ir::Instr::result(instr) {
-                if res.name == var_name {
-                    return Some(instr);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Collect possible function names a value may refer to, following select
-/// instructions and simple local variable definitions.
-fn collect_function_targets(value: &ir::Value, func: &ir::Function) -> Vec<String> {
-    match value {
-        ir::Value::Function(fv) => vec![fv.name.clone()],
-        ir::Value::LocalVar(lv) => {
-            if let Some(instr) = find_local_def(func, &lv.name) {
-                match instr {
-                    ir::Instr::Select(sel) => {
-                        let mut targets = collect_function_targets(&sel.true_value, func);
-                        targets.extend(collect_function_targets(&sel.false_value, func));
-                        targets
-                    }
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            }
-        }
-        ir::Value::Argument(_) => Vec::new(),
-        _ => Vec::new(),
-    }
 }
 
 fn localize_func_ptr_sig(signature_id: usize) -> String {
@@ -508,6 +518,27 @@ fn collect_fn_ptr_sigs(mod_: &DecodedModule) -> Vec<(FuncTy, Vec<String>)> {
         }
     }
 
+    // Also register signatures used by indirect call sites that do not refer
+    // to a specific function (e.g. calling a function-pointer argument).
+    for (_, func) in &mod_.functions {
+        for (_, block) in &func.blocks {
+            for instr in &block.instrs {
+                if let ir::Instr::Call(call) = instr {
+                    if !matches!(call.func, ir::Value::Function(_)) {
+                        let signature = FuncTy::new(
+                            call.return_type.clone(),
+                            call.params.clone(),
+                            call.variadic,
+                        );
+                        if !func_ptrs.iter().any(|(sig, _)| *sig == signature) {
+                            func_ptrs.push((signature, Vec::new()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func_ptrs
 }
 
@@ -523,7 +554,7 @@ fn get_func_ptr_signature_info<'a>(signature: &FuncTy, ctx: &'a Context) -> Opti
 pub fn gen_temp_var(ctx: &mut Context) -> String {
     let id = ctx.uid_counter;
     ctx.uid_counter += 1;
-    format!("tmp!{}", id)
+    format!("{}{}", ctx.cfg.tmp_prefix, id)
 }
 
 pub fn trans_load(
@@ -601,16 +632,26 @@ pub fn trans_store(
 pub fn store_on_stack(
     stack_var: &str,
     stack_size_var: &str,
-    offset: usize,
+    offset: i64,
     size: usize,
     value: &Value,
 ) -> BlockList {
     let mut blocks = BlockList::new();
     for i in 0..size {
-        let addr = Value::Op(Op::Add(
-            Box::new(Value::GetVar { name: stack_size_var.to_string() }),
-            Box::new(Value::Known(KnownVal::Num((offset + i) as f64))),
-        ));
+        let item_offset = offset + i as i64;
+        let addr = if item_offset == 0 {
+            Value::GetVar { name: stack_size_var.to_string() }
+        } else if item_offset > 0 {
+            Value::Op(Op::Add(
+                Box::new(Value::GetVar { name: stack_size_var.to_string() }),
+                Box::new(Value::Known(KnownVal::Num(item_offset as f64))),
+            ))
+        } else {
+            Value::Op(Op::Sub(
+                Box::new(Value::GetVar { name: stack_size_var.to_string() }),
+                Box::new(Value::Known(KnownVal::Num((-item_offset) as f64))),
+            ))
+        };
         blocks.add_block(Block::EditList(scratch::ast::EditListData {
             op: scratch::ast::ListEditOp::ReplaceAt,
             name: stack_var.to_string(),
@@ -628,12 +669,21 @@ pub fn store_on_stack(
 pub fn load_from_stack(
     stack_var: &str,
     stack_size_var: &str,
-    offset: usize,
+    offset: i64,
 ) -> Value {
-    let addr = Value::Op(Op::Add(
-        Box::new(Value::GetVar { name: stack_size_var.to_string() }),
-        Box::new(Value::Known(KnownVal::Num(offset as f64))),
-    ));
+    let addr = if offset == 0 {
+        Value::GetVar { name: stack_size_var.to_string() }
+    } else if offset > 0 {
+        Value::Op(Op::Add(
+            Box::new(Value::GetVar { name: stack_size_var.to_string() }),
+            Box::new(Value::Known(KnownVal::Num(offset as f64))),
+        ))
+    } else {
+        Value::Op(Op::Sub(
+            Box::new(Value::GetVar { name: stack_size_var.to_string() }),
+            Box::new(Value::Known(KnownVal::Num((-offset) as f64))),
+        ))
+    };
     scratch::Value::GetOfList(scratch::ast::GetOfList {
         op: scratch::ast::ListOp::AtIndex,
         name: stack_var.to_string(),
@@ -685,7 +735,7 @@ pub fn init_memory(
 
         match &gv.init {
             ir::Value::KnownInt(ki) => {
-                let val = twos_complement::comptime_undo_twos_complement(ki.value as f64, ki.width as usize);
+                let val = ki.value.to_u64().unwrap_or(0) as f64;
                 init_mem.push(KnownVal::Num(val));
             }
             ir::Value::KnownFloat(kf) => {
@@ -884,6 +934,8 @@ pub fn compile(
     let start_blocks = trans_entrypoint_call(&mut ctx)?;
     init_blocks.add(start_blocks);
 
+    post_opt_transform(&mod_, &mut ctx);
+
     ctx.proj.code.push(init_blocks);
 
     Ok(ctx.proj)
@@ -972,213 +1024,6 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
                 Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::Div(Box::new(Value::Known(KnownVal::Num(1.0))), Box::new(Value::GetVar { name: rv.clone() }))) }),
             ])),
             else_body: None,
-        }),
-    ]), &mut ctx);
-
-    add_func("SB3_render", vec![], BlockList::from_blocks(vec![
-        Block::EditVolume { op: VolumeOp::Change, value: Value::Known(KnownVal::Num(0.0)) },
-    ]), &mut ctx);
-
-    add_func("SB3_say_str", vec!["input"], BlockList::from_blocks(vec![
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
-        Block::Say { value: Value::GetVar { name: rv.clone() } },
-    ]), &mut ctx);
-
-    add_func("SB3_say_char", vec!["input"], BlockList::from_blocks(vec![
-        Block::Say { value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetParam { name: "input".into() }) }) },
-    ]), &mut ctx);
-
-    add_func("SB3_say_dbl", vec!["input"], BlockList::from_blocks(vec![
-        Block::Say { value: Value::GetParam { name: "input".into() } },
-    ]), &mut ctx);
-
-    add_func("SB3_wait", vec!["duration"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "end".into(), value: Value::Op(Op::Add(Box::new(Value::DaysSince2000), Box::new(Value::Op(Op::Div(Box::new(Value::GetParam { name: "duration".into() }), Box::new(Value::Known(KnownVal::Num(86400.0)))))))) }),
-        Block::ProcedureCall(ProcedureCallData { name: "SB3_render".into(), args: vec![], run_without_refresh: false }),
-        Block::ControlFlow(ControlFlow {
-            op: ControlOp::Until,
-            condition: Some(Value::BoolOp(BoolOp::Gt(Box::new(Value::DaysSince2000), Box::new(Value::GetVar { name: "end".into() })))),
-            var: None,
-            body: Some(BlockList::from_blocks(vec![
-                Block::ProcedureCall(ProcedureCallData { name: "SB3_render".into(), args: vec![], run_without_refresh: false }),
-            ])),
-            else_body: None,
-        }),
-    ]), &mut ctx);
-
-    add_func("SB3_wait_no_render", vec!["duration"], BlockList::from_blocks(vec![
-        Block::Wait { value: Value::GetParam { name: "duration".into() } },
-    ]), &mut ctx);
-
-    add_func("SB3_ask_str", vec!["output", "input", "count"], BlockList::from_blocks(vec![
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
-        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::GetParam { name: "count".into() }], run_without_refresh: false }),
-    ]), &mut ctx);
-
-    add_func("SB3_ask_str_unsafe", vec!["output", "input"], BlockList::from_blocks(vec![
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
-        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::Known(KnownVal::Num(f64::INFINITY))], run_without_refresh: false }),
-    ]), &mut ctx);
-
-    add_func("SB3_ask_dbl", vec!["output", "input"], BlockList::from_blocks(vec![
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
-        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::StrToFloat(Box::new(Value::GetAnswer))) }),
-        Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::GetParam { name: "output".into() }), value: Some(Value::GetVar { name: "char".into() }) }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetAnswer), Box::new(Value::GetVar { name: "char".into() })))))) }),
-    ]), &mut ctx);
-
-    add_func("SB3_days_since_2000", vec![], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::DaysSince2000 }),
-    ]), &mut ctx);
-
-    add_func("_exit", vec!["status"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Op(Op::Join(Box::new(Value::Known(KnownVal::Str("exit called with status ".into()))), Box::new(Value::GetParam { name: "status".into() }))), var_name: None },
-        Block::StopScript(StopOption::All),
-    ]), &mut ctx);
-
-    add_func("close", vec!["a"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("close called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("fstat", vec!["a", "b"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("fstat called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("isatty", vec!["a"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("isatty called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("lseek", vec!["a", "b", "c"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("lseek called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("read", vec!["a", "b", "c"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("read called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("sbrk", vec!["incr"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::GetVar { name: heap_pointer_var.clone() } }),
-        Block::EditVar(EditVarData { op: VarOp::Change, name: heap_pointer_var.clone(), value: Value::GetParam { name: "incr".into() } }),
-    ]), &mut ctx);
-
-    add_func("write", vec!["file", "buf", "len"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("write called".into())), var_name: None },
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "buf".into() }], run_without_refresh: false }),
-        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-    ]), &mut ctx);
-
-    add_func("!helper_str2scratch", vec!["input"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Known(KnownVal::Str("".into())) }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::GetParam { name: "input".into() } }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
-        Block::ControlFlow(ControlFlow {
-            op: ControlOp::Until,
-            condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(0.0)))))),
-            var: None,
-            body: Some(BlockList::from_blocks(vec![
-                Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::Join(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetVar { name: "char".into() }) })))) }),
-                Block::EditVar(EditVarData { op: VarOp::Change, name: "ptr".into(), value: Value::Known(KnownVal::Num(1.0)) }),
-                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
-            ])),
-            else_body: None,
-        }),
-    ]), &mut ctx);
-
-    let enough_space = Value::BoolOp(BoolOp::Lt(
-        Box::new(Value::Op(Op::LengthOf(Box::new(Value::GetParam { name: "input".into() })))),
-        Box::new(Value::GetParam { name: "count".into() }),
-    ));
-
-    add_func("!helper_scratch2str", vec!["input", "str", "count"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::Op(Op::Sub(Box::new(Value::GetParam { name: "str".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "cost".into(), value: Value::CostumeInfo { op: CostumeInfoOp::Number } }),
-        Block::ControlFlow(ControlFlow {
-            op: ControlOp::IfElse,
-            condition: Some(enough_space.clone()),
-            var: None,
-            body: Some(BlockList::from_blocks(vec![
-                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::LengthOf(Box::new(Value::GetParam { name: "input".into() }))) }),
-            ])),
-            else_body: Some(BlockList::from_blocks(vec![
-                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::Sub(Box::new(Value::GetParam { name: "count".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
-            ])),
-        }),
-        Block::ControlFlow(ControlFlow {
-            op: ControlOp::RepTimes,
-            condition: Some(Value::GetVar { name: "char".into() }),
-            var: None,
-            body: Some(BlockList::from_blocks(vec![
-                Block::EditVar(EditVarData { op: VarOp::Set, name: "ascii".into(), value: Value::GetOfList(GetOfList { op: ListOp::IndexOf, name: ascii_lookup.clone(), value: Box::new(Value::Op(Op::LetterOf(Box::new(Value::GetVar { name: "i".into() }), Box::new(Value::GetParam { name: "input".into() })))) }) }),
-                Block::ControlFlow(ControlFlow {
-                    op: ControlOp::If,
-                    condition: Some(Value::BoolOp(BoolOp::And(
-                        Box::new(Value::BoolOp(BoolOp::Gt(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(64.0)))))),
-                        Box::new(Value::BoolOp(BoolOp::Lt(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(91.0)))))),
-                    ))),
-                    var: None,
-                    body: Some(BlockList::from_blocks(vec![
-                        Block::ProcedureCall(ProcedureCallData { name: "!helper_is_lowercase".into(), args: vec![
-                            Value::Op(Op::LetterOf(Box::new(Value::GetVar { name: "i".into() }), Box::new(Value::GetParam { name: "input".into() }))),
-                            Value::Op(Op::Sub(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(64.0))))),
-                        ], run_without_refresh: false }),
-                        Block::ControlFlow(ControlFlow {
-                            op: ControlOp::If,
-                            condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::Known(KnownVal::Num(1.0)))))),
-                            var: None,
-                            body: Some(BlockList::from_blocks(vec![
-                                Block::EditVar(EditVarData { op: VarOp::Change, name: "ascii".into(), value: Value::Known(KnownVal::Num(32.0)) }),
-                            ])),
-                            else_body: None,
-                        }),
-                    ])),
-                    else_body: None,
-                }),
-                Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ptr".into() }), Box::new(Value::GetVar { name: "i".into() })))), value: Some(Value::GetVar { name: "ascii".into() }) }),
-                Block::EditVar(EditVarData { op: VarOp::Change, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
-            ])),
-            else_body: None,
-        }),
-        Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ptr".into() }), Box::new(Value::GetVar { name: "i".into() })))), value: Some(Value::Known(KnownVal::Num(0.0))) }),
-        Block::SwitchCostume { value: Value::GetVar { name: "cost".into() } },
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::BoolToFloat(Box::new(enough_space.clone()))) }),
-    ]), &mut ctx);
-
-    let lowercase_var = ctx.cfg.lowercase_var.clone();
-    add_func("!helper_is_lowercase", vec!["char", "alphabet_pos"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData {
-            op: VarOp::Set,
-            name: "original".into(),
-            value: Value::GetOfList(GetOfList {
-                op: ListOp::AtIndex,
-                name: lowercase_var.clone(),
-                value: Box::new(Value::GetParam { name: "alphabet_pos".into() }),
-            }),
-        }),
-        Block::EditList(EditListData {
-            op: ListEditOp::ReplaceAt,
-            name: lowercase_var.clone(),
-            index: Some(Value::GetParam { name: "alphabet_pos".into() }),
-            value: Some(Value::GetParam { name: "char".into() }),
-        }),
-        Block::SwitchCostume { value: Value::Known(KnownVal::Str(uppercase_costume_name.to_string())) },
-        Block::SwitchCostume { value: Value::GetList { name: lowercase_var.clone() } },
-        Block::EditList(EditListData {
-            op: ListEditOp::ReplaceAt,
-            name: lowercase_var.clone(),
-            index: Some(Value::GetParam { name: "alphabet_pos".into() }),
-            value: Some(Value::GetVar { name: "original".into() }),
-        }),
-        Block::EditVar(EditVarData {
-            op: VarOp::Set,
-            name: rv.clone(),
-            value: Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Eq(
-                Box::new(Value::CostumeInfo { op: CostumeInfoOp::Number }),
-                Box::new(Value::Known(KnownVal::Num(lc_costume_num as f64))),
-            ))))),
         }),
     ]), &mut ctx);
 
@@ -1366,6 +1211,213 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
                 Box::new(Value::GetParam { name: "max_exp".into() }),
             )),
         }),
+    ]), &mut ctx);
+
+    let lowercase_var = ctx.cfg.lowercase_var.clone();
+    add_func("!helper_is_lowercase", vec!["char", "alphabet_pos"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: "original".into(),
+            value: Value::GetOfList(GetOfList {
+                op: ListOp::AtIndex,
+                name: lowercase_var.clone(),
+                value: Box::new(Value::GetParam { name: "alphabet_pos".into() }),
+            }),
+        }),
+        Block::EditList(EditListData {
+            op: ListEditOp::ReplaceAt,
+            name: lowercase_var.clone(),
+            index: Some(Value::GetParam { name: "alphabet_pos".into() }),
+            value: Some(Value::GetParam { name: "char".into() }),
+        }),
+        Block::SwitchCostume { value: Value::Known(KnownVal::Str(uppercase_costume_name.to_string())) },
+        Block::SwitchCostume { value: Value::GetList { name: lowercase_var.clone() } },
+        Block::EditList(EditListData {
+            op: ListEditOp::ReplaceAt,
+            name: lowercase_var.clone(),
+            index: Some(Value::GetParam { name: "alphabet_pos".into() }),
+            value: Some(Value::GetVar { name: "original".into() }),
+        }),
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: rv.clone(),
+            value: Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Eq(
+                Box::new(Value::CostumeInfo { op: CostumeInfoOp::Number }),
+                Box::new(Value::Known(KnownVal::Num(lc_costume_num as f64))),
+            ))))),
+        }),
+    ]), &mut ctx);
+
+    add_func("!helper_str2scratch", vec!["input"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Known(KnownVal::Str("".into())) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::GetParam { name: "input".into() } }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::Until,
+            condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(0.0)))))),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::Join(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetVar { name: "char".into() }) })))) }),
+                Block::EditVar(EditVarData { op: VarOp::Change, name: "ptr".into(), value: Value::Known(KnownVal::Num(1.0)) }),
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
+            ])),
+            else_body: None,
+        }),
+    ]), &mut ctx);
+
+    let enough_space = Value::BoolOp(BoolOp::Lt(
+        Box::new(Value::Op(Op::LengthOf(Box::new(Value::GetParam { name: "input".into() })))),
+        Box::new(Value::GetParam { name: "count".into() }),
+    ));
+
+    add_func("!helper_scratch2str", vec!["input", "str", "count"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::Op(Op::Sub(Box::new(Value::GetParam { name: "str".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "cost".into(), value: Value::CostumeInfo { op: CostumeInfoOp::Number } }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::IfElse,
+            condition: Some(enough_space.clone()),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::LengthOf(Box::new(Value::GetParam { name: "input".into() }))) }),
+            ])),
+            else_body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::Sub(Box::new(Value::GetParam { name: "count".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
+            ])),
+        }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::RepTimes,
+            condition: Some(Value::GetVar { name: "char".into() }),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "ascii".into(), value: Value::GetOfList(GetOfList { op: ListOp::IndexOf, name: ascii_lookup.clone(), value: Box::new(Value::Op(Op::LetterOf(Box::new(Value::GetVar { name: "i".into() }), Box::new(Value::GetParam { name: "input".into() })))) }) }),
+                Block::ControlFlow(ControlFlow {
+                    op: ControlOp::If,
+                    condition: Some(Value::BoolOp(BoolOp::And(
+                        Box::new(Value::BoolOp(BoolOp::Gt(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(64.0)))))),
+                        Box::new(Value::BoolOp(BoolOp::Lt(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(91.0)))))),
+                    ))),
+                    var: None,
+                    body: Some(BlockList::from_blocks(vec![
+                        Block::ProcedureCall(ProcedureCallData { name: "!helper_is_lowercase".into(), args: vec![
+                            Value::Op(Op::LetterOf(Box::new(Value::GetVar { name: "i".into() }), Box::new(Value::GetParam { name: "input".into() }))),
+                            Value::Op(Op::Sub(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(64.0))))),
+                        ], run_without_refresh: false }),
+                        Block::ControlFlow(ControlFlow {
+                            op: ControlOp::If,
+                            condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::Known(KnownVal::Num(1.0)))))),
+                            var: None,
+                            body: Some(BlockList::from_blocks(vec![
+                                Block::EditVar(EditVarData { op: VarOp::Change, name: "ascii".into(), value: Value::Known(KnownVal::Num(32.0)) }),
+                            ])),
+                            else_body: None,
+                        }),
+                    ])),
+                    else_body: None,
+                }),
+                Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ptr".into() }), Box::new(Value::GetVar { name: "i".into() })))), value: Some(Value::GetVar { name: "ascii".into() }) }),
+                Block::EditVar(EditVarData { op: VarOp::Change, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
+            ])),
+            else_body: None,
+        }),
+        Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ptr".into() }), Box::new(Value::GetVar { name: "i".into() })))), value: Some(Value::Known(KnownVal::Num(0.0))) }),
+        Block::SwitchCostume { value: Value::GetVar { name: "cost".into() } },
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::BoolToFloat(Box::new(enough_space.clone()))) }),
+    ]), &mut ctx);
+
+    add_func("SB3_render", vec![], BlockList::from_blocks(vec![
+        Block::EditVolume { op: VolumeOp::Change, value: Value::Known(KnownVal::Num(0.0)) },
+    ]), &mut ctx);
+
+    add_func("SB3_say_str", vec!["input"], BlockList::from_blocks(vec![
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
+        Block::Say { value: Value::GetVar { name: rv.clone() } },
+    ]), &mut ctx);
+
+    add_func("SB3_say_char", vec!["input"], BlockList::from_blocks(vec![
+        Block::Say { value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetParam { name: "input".into() }) }) },
+    ]), &mut ctx);
+
+    add_func("SB3_say_dbl", vec!["input"], BlockList::from_blocks(vec![
+        Block::Say { value: Value::GetParam { name: "input".into() } },
+    ]), &mut ctx);
+
+    add_func("SB3_wait", vec!["duration"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "end".into(), value: Value::Op(Op::Add(Box::new(Value::DaysSince2000), Box::new(Value::Op(Op::Div(Box::new(Value::GetParam { name: "duration".into() }), Box::new(Value::Known(KnownVal::Num(86400.0)))))))) }),
+        Block::ProcedureCall(ProcedureCallData { name: "SB3_render".into(), args: vec![], run_without_refresh: false }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::Until,
+            condition: Some(Value::BoolOp(BoolOp::Gt(Box::new(Value::DaysSince2000), Box::new(Value::GetVar { name: "end".into() })))),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::ProcedureCall(ProcedureCallData { name: "SB3_render".into(), args: vec![], run_without_refresh: false }),
+            ])),
+            else_body: None,
+        }),
+    ]), &mut ctx);
+
+    add_func("SB3_wait_no_render", vec!["duration"], BlockList::from_blocks(vec![
+        Block::Wait { value: Value::GetParam { name: "duration".into() } },
+    ]), &mut ctx);
+
+    add_func("SB3_ask_str", vec!["output", "input", "count"], BlockList::from_blocks(vec![
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
+        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::GetParam { name: "count".into() }], run_without_refresh: false }),
+    ]), &mut ctx);
+
+    add_func("SB3_ask_str_unsafe", vec!["output", "input"], BlockList::from_blocks(vec![
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
+        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::Known(KnownVal::Num(f64::INFINITY))], run_without_refresh: false }),
+    ]), &mut ctx);
+
+    add_func("SB3_ask_dbl", vec!["output", "input"], BlockList::from_blocks(vec![
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
+        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::StrToFloat(Box::new(Value::GetAnswer))) }),
+        Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::GetParam { name: "output".into() }), value: Some(Value::GetVar { name: "char".into() }) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetAnswer), Box::new(Value::GetVar { name: "char".into() })))))) }),
+    ]), &mut ctx);
+
+    add_func("SB3_days_since_2000", vec![], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::DaysSince2000 }),
+    ]), &mut ctx);
+
+    add_func("_exit", vec!["status"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Op(Op::Join(Box::new(Value::Known(KnownVal::Str("exit called with status ".into()))), Box::new(Value::GetParam { name: "status".into() }))), var_name: None },
+        Block::StopScript(StopOption::All),
+    ]), &mut ctx);
+
+    add_func("close", vec!["a"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("close called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("fstat", vec!["a", "b"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("fstat called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("isatty", vec!["a"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("isatty called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("lseek", vec!["a", "b", "c"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("lseek called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("read", vec!["a", "b", "c"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("read called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("sbrk", vec!["incr"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::GetVar { name: heap_pointer_var.clone() } }),
+        Block::EditVar(EditVarData { op: VarOp::Change, name: heap_pointer_var.clone(), value: Value::GetParam { name: "incr".into() } }),
+    ]), &mut ctx);
+
+    add_func("write", vec!["file", "buf", "len"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("write called".into())), var_name: None },
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "buf".into() }], run_without_refresh: false }),
+        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
     ]), &mut ctx);
 
     ctx
@@ -2287,6 +2339,298 @@ fn optimise_value_use(value: Value, times_used: f64, ctx: &mut Context) -> (Valu
     }
 }
 
+fn signed_div_blocks(
+    res_var: &Variable,
+    lft: Value,
+    rgt: Value,
+    width: usize,
+    is_exact: bool,
+    ctx: &mut Context,
+) -> Result<BlockList, CompException> {
+    if width > super::config::VARIABLE_MAX_BITS {
+        return Err(CompException(format!(
+            "Signed division of {}-bit integers is not supported",
+            width
+        )));
+    }
+
+    let mut blocks = BlockList::new();
+    if is_exact {
+        let signed_lft = twos_complement::undo_twos_complement(lft, width);
+        let signed_rgt = twos_complement::undo_twos_complement(rgt, width);
+        let div = Value::Op(Op::Div(Box::new(signed_lft), Box::new(signed_rgt)));
+        let res = twos_complement::apply_twos_complement(div, width);
+        blocks.add_block(res_var.set_value(res, VarOp::Set, None)?);
+        return Ok(blocks);
+    }
+
+    let (lft, lblocks) = optimise_value_use(lft, 2.0, ctx);
+    let (rgt, rblocks) = optimise_value_use(rgt, 2.0, ctx);
+    blocks.add(lblocks);
+    blocks.add(rblocks);
+
+    let point_of_neg = 2f64.powi(width as i32) / 2.0;
+    let change = 2f64.powi(width as i32);
+    let known_point = Value::Known(KnownVal::Num(point_of_neg));
+    let known_change = Value::Known(KnownVal::Num(change));
+
+    let rgt_minus_change = Value::Op(Op::Sub(
+        Box::new(rgt.clone()),
+        Box::new(known_change.clone()),
+    ));
+    let lft_minus_change = Value::Op(Op::Sub(
+        Box::new(lft.clone()),
+        Box::new(known_change.clone()),
+    ));
+
+    let set_pos_pos = BlockList::from_blocks(vec![res_var.set_value(
+        Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+            Box::new(lft.clone()),
+            Box::new(rgt.clone()),
+        ))))),
+        VarOp::Set,
+        None,
+    )?]);
+
+    let set_pos_neg = BlockList::from_blocks(vec![res_var.set_value(
+        Value::Op(Op::Add(
+            Box::new(Value::Op(Op::Ceiling(Box::new(Value::Op(Op::Div(
+                Box::new(lft.clone()),
+                Box::new(rgt_minus_change.clone()),
+            )))))),
+            Box::new(known_change.clone()),
+        )),
+        VarOp::Set,
+        None,
+    )?]);
+
+    let cond_inner = Value::BoolOp(BoolOp::Lt(
+        Box::new(rgt.clone()),
+        Box::new(known_point.clone()),
+    ));
+    let inner_pos = BlockList::from_blocks(vec![Block::ControlFlow(ControlFlow {
+        op: ControlOp::IfElse,
+        condition: Some(cond_inner.clone()),
+        var: None,
+        body: Some(set_pos_pos),
+        else_body: Some(set_pos_neg),
+    })]);
+
+    let set_neg_pos = BlockList::from_blocks(vec![res_var.set_value(
+        Value::Op(Op::Add(
+            Box::new(Value::Op(Op::Ceiling(Box::new(Value::Op(Op::Div(
+                Box::new(lft_minus_change.clone()),
+                Box::new(rgt.clone()),
+            )))))),
+            Box::new(known_change.clone()),
+        )),
+        VarOp::Set,
+        None,
+    )?]);
+
+    let set_neg_neg = BlockList::from_blocks(vec![res_var.set_value(
+        Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+            Box::new(lft_minus_change.clone()),
+            Box::new(rgt_minus_change.clone()),
+        ))))),
+        VarOp::Set,
+        None,
+    )?]);
+
+    let inner_neg = BlockList::from_blocks(vec![Block::ControlFlow(ControlFlow {
+        op: ControlOp::IfElse,
+        condition: Some(cond_inner),
+        var: None,
+        body: Some(set_neg_pos),
+        else_body: Some(set_neg_neg),
+    })]);
+
+    let cond_outer = Value::BoolOp(BoolOp::Lt(Box::new(lft), Box::new(known_point)));
+    blocks.add_block(Block::ControlFlow(ControlFlow {
+        op: ControlOp::IfElse,
+        condition: Some(cond_outer),
+        var: None,
+        body: Some(inner_pos),
+        else_body: Some(inner_neg),
+    }));
+
+    Ok(blocks)
+}
+
+fn signed_rem_blocks(
+    res_var: &Variable,
+    lft: Value,
+    rgt: Value,
+    width: usize,
+    ctx: &mut Context,
+) -> Result<BlockList, CompException> {
+    if width > super::config::VARIABLE_MAX_BITS {
+        return Err(CompException(format!(
+            "Signed remainder of {}-bit integers is not supported",
+            width
+        )));
+    }
+
+    let mut blocks = BlockList::new();
+    let (lft, lblocks) = optimise_value_use(lft, 2.0, ctx);
+    let (rgt, rblocks) = optimise_value_use(rgt, 3.0, ctx);
+    blocks.add(lblocks);
+    blocks.add(rblocks);
+
+    let point_of_neg = 2f64.powi(width as i32) / 2.0;
+    let change = 2f64.powi(width as i32);
+    let known_point = Value::Known(KnownVal::Num(point_of_neg));
+    let known_change = Value::Known(KnownVal::Num(change));
+
+    let (right_sub_change, mut pos_neg_opt_blocks) = optimise_value_use(rgt.clone(), 2.0, ctx);
+    pos_neg_opt_blocks.add_block(res_var.set_value(
+        Value::Op(Op::Sub(
+            Box::new(Value::Op(Op::Mod(
+                Box::new(lft.clone()),
+                Box::new(right_sub_change.clone()),
+            ))),
+            Box::new(right_sub_change),
+        )),
+        VarOp::Set,
+        None,
+    )?);
+
+    let set_pos_pos = BlockList::from_blocks(vec![res_var.set_value(
+        Value::Op(Op::Mod(Box::new(lft.clone()), Box::new(rgt.clone()))),
+        VarOp::Set,
+        None,
+    )?]);
+
+    let cond_inner = Value::BoolOp(BoolOp::Lt(
+        Box::new(rgt.clone()),
+        Box::new(known_point.clone()),
+    ));
+    let inner_pos = BlockList::from_blocks(vec![Block::ControlFlow(ControlFlow {
+        op: ControlOp::IfElse,
+        condition: Some(cond_inner.clone()),
+        var: None,
+        body: Some(set_pos_pos),
+        else_body: Some(pos_neg_opt_blocks),
+    })]);
+
+    let lft_minus_change = Value::Op(Op::Sub(
+        Box::new(lft.clone()),
+        Box::new(known_change.clone()),
+    ));
+    let rgt_minus_change = Value::Op(Op::Sub(
+        Box::new(rgt.clone()),
+        Box::new(known_change.clone()),
+    ));
+
+    let set_neg_pos = BlockList::from_blocks(vec![res_var.set_value(
+        Value::Op(Op::Add(
+            Box::new(Value::Op(Op::Sub(
+                Box::new(Value::Op(Op::Mod(
+                    Box::new(lft_minus_change.clone()),
+                    Box::new(rgt.clone()),
+                ))),
+                Box::new(rgt.clone()),
+            ))),
+            Box::new(known_change.clone()),
+        )),
+        VarOp::Set,
+        None,
+    )?]);
+
+    let set_neg_neg = BlockList::from_blocks(vec![res_var.set_value(
+        Value::Op(Op::Add(
+            Box::new(Value::Op(Op::Mod(
+                Box::new(lft_minus_change),
+                Box::new(rgt_minus_change),
+            ))),
+            Box::new(known_change.clone()),
+        )),
+        VarOp::Set,
+        None,
+    )?]);
+
+    let inner_neg = BlockList::from_blocks(vec![Block::ControlFlow(ControlFlow {
+        op: ControlOp::IfElse,
+        condition: Some(cond_inner),
+        var: None,
+        body: Some(set_neg_pos),
+        else_body: Some(set_neg_neg),
+    })]);
+
+    let cond_outer = Value::BoolOp(BoolOp::Lt(Box::new(lft), Box::new(known_point)));
+    blocks.add_block(Block::ControlFlow(ControlFlow {
+        op: ControlOp::IfElse,
+        condition: Some(cond_outer),
+        var: None,
+        body: Some(inner_pos),
+        else_body: Some(inner_neg),
+    }));
+
+    Ok(blocks)
+}
+
+fn ashr_blocks(
+    res_var: &Variable,
+    lft: Value,
+    rgt: Value,
+    width: usize,
+    is_exact: bool,
+    ctx: &mut Context,
+) -> Result<BlockList, CompException> {
+    if width > super::config::VARIABLE_MAX_BITS {
+        return Err(CompException(format!(
+            "AShr of {}-bit integers is not supported",
+            width
+        )));
+    }
+
+    let mut blocks = BlockList::new();
+    let point_of_neg = 2f64.powi(width as i32) / 2.0;
+    let change = 2f64.powi(width as i32);
+    let right_mul = get_pow2_multiplier(ctx, &rgt, 0)?;
+
+    let unwrapped_pos = Value::Op(Op::Div(Box::new(lft.clone()), Box::new(right_mul.clone())));
+    let val_pos = if is_exact {
+        unwrapped_pos
+    } else {
+        Value::Op(Op::Floor(Box::new(unwrapped_pos)))
+    };
+
+    let lft_minus_change = Value::Op(Op::Sub(
+        Box::new(lft.clone()),
+        Box::new(Value::Known(KnownVal::Num(change))),
+    ));
+    let unwrapped_neg = Value::Op(Op::Div(
+        Box::new(lft_minus_change),
+        Box::new(right_mul),
+    ));
+    let val_neg_inner = if is_exact {
+        unwrapped_neg
+    } else {
+        Value::Op(Op::Ceiling(Box::new(unwrapped_neg)))
+    };
+    let val_neg = Value::Op(Op::Add(
+        Box::new(val_neg_inner),
+        Box::new(Value::Known(KnownVal::Num(change))),
+    ));
+
+    let set_pos = BlockList::from_blocks(vec![res_var.set_value(val_pos, VarOp::Set, None)?]);
+    let set_neg = BlockList::from_blocks(vec![res_var.set_value(val_neg, VarOp::Set, None)?]);
+    let cond = Value::BoolOp(BoolOp::Lt(
+        Box::new(lft),
+        Box::new(Value::Known(KnownVal::Num(point_of_neg))),
+    ));
+    blocks.add_block(Block::ControlFlow(ControlFlow {
+        op: ControlOp::IfElse,
+        condition: Some(cond),
+        var: None,
+        body: Some(set_pos),
+        else_body: Some(set_neg),
+    }));
+
+    Ok(blocks)
+}
+
 fn multiply_no_wrap(left: Value, right: Value, width: usize) -> Result<Value, CompException> {
     if width > super::config::VARIABLE_MAX_BITS {
         return Err(CompException(format!("Multipling {} bits is not supported", width)));
@@ -2598,15 +2942,6 @@ fn trans_call_instr(
         run_without_refresh: false,
     }));
 
-    // Deallocate vararg memory after the call.
-    if callee_is_variadic && vararg_alloc_size != 0 {
-        post_call.add_block(Block::EditVar(EditVarData {
-            op: VarOp::Change,
-            name: ctx.cfg.stack_pointer_var.clone(),
-            value: Value::Known(KnownVal::Num(vararg_alloc_size as f64)),
-        }));
-    }
-
     if let Some(result) = &call.result {
         let res_var = Variable {
             var_name: localize_var(&result.name, false, Some(&bctx.fn_info.name), false),
@@ -2627,7 +2962,135 @@ fn trans_call_instr(
         post_call.add(res_var.set_inferred_value(ret_val)?);
     }
 
+    // Deallocate vararg memory after reading the return value so that the
+    // scratchblocks output matches the Python reference order.
+    if callee_is_variadic && vararg_alloc_size != 0 {
+        post_call.add_block(Block::EditVar(EditVarData {
+            op: VarOp::Change,
+            name: ctx.cfg.stack_pointer_var.clone(),
+            value: Value::Known(KnownVal::Num(vararg_alloc_size as f64)),
+        }));
+    }
+
     Ok((pre_call, post_call, callee_returns_to_address))
+}
+
+/// Get the callee name for a direct call, or the single possible target for a
+/// function pointer call with exactly one candidate. Returns None otherwise.
+fn get_call_callee_name(call: &ir::instructions::Call, ctx: &Context) -> Option<String> {
+    match &call.func {
+        ir::Value::Function(fv) => Some(fv.name.clone()),
+        _ => {
+            let signature = FuncTy::new(
+                call.return_type.clone(),
+                call.params.clone(),
+                call.variadic,
+            );
+            get_func_ptr_signature_info(&signature, ctx).and_then(|(_, could_call)| {
+                if could_call.len() == 1 {
+                    Some(could_call[0].clone())
+                } else {
+                    None
+                }
+            })
+        }
+    }
+}
+
+/// Compute the set of live variables that must be saved around a recursive call.
+/// Matches Python's logic in `transComplexCall`.
+fn compute_must_store(
+    call: &ir::instructions::Call,
+    bctx: &BlockInfo,
+    following_instrs: &[ir::Instr],
+    ctx: &Context,
+) -> Result<(Vec<Variable>, Vec<usize>), CompException> {
+    let result_name = call.result.as_ref().map(|r| r.name.as_str());
+    let next_var_use = compute_next_var_use(
+        following_instrs,
+        bctx.label.as_deref().unwrap_or(""),
+        &bctx.fn_info.phi_info,
+        &bctx.fn_info.block_var_use,
+        result_name,
+    )?;
+
+    let mut must_store: Vec<Variable> = Vec::new();
+    let mut must_store_sizes: Vec<usize> = Vec::new();
+
+    for var_name in &next_var_use.depends {
+        if ctx.cfg.use_branch_jump_table && bctx.available_params.iter().any(|p| p.var_name == *var_name) {
+            continue;
+        }
+
+        let is_param = bctx.available_params.iter().any(|p| p.var_name == *var_name);
+        let var = Variable {
+            var_name: var_name.clone(),
+            var_type: if is_param { VarType::Param } else { VarType::Var },
+            fn_name: Some(bctx.fn_info.name.clone()),
+        };
+        let size = next_var_use.depends_var_sizes.get(var_name).copied().unwrap_or(1);
+        must_store.push(var);
+        must_store_sizes.push(size);
+    }
+
+    // Sort numeric names by numeric value first, then alphabetically, to match Python.
+    let mut indexed: Vec<(Variable, usize)> = must_store.into_iter().zip(must_store_sizes.into_iter()).collect();
+    indexed.sort_by(|(a, _), (b, _)| {
+        let a_is_digits = a.var_name.chars().all(|c| c.is_ascii_digit());
+        let b_is_digits = b.var_name.chars().all(|c| c.is_ascii_digit());
+        match (a_is_digits, b_is_digits) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => {
+                let a_num: i64 = a.var_name.parse().unwrap_or(0);
+                let b_num: i64 = b.var_name.parse().unwrap_or(0);
+                a_num.cmp(&b_num)
+            }
+            (false, false) => a.var_name.cmp(&b.var_name),
+        }
+    });
+    let mut sorted_must_store: Vec<Variable> = Vec::with_capacity(indexed.len());
+    let mut sorted_sizes: Vec<usize> = Vec::with_capacity(indexed.len());
+    for (var, size) in indexed {
+        sorted_must_store.push(var);
+        sorted_sizes.push(size);
+    }
+
+    // Add special locals that may be clobbered by recursion.
+    if bctx.fn_info.total_alloca_size.is_none() && !bctx.fn_info.skip_stack_size_change {
+        sorted_must_store.push(Variable {
+            var_name: ctx.cfg.previous_stack_size_local.clone(),
+            var_type: VarType::Var,
+            fn_name: Some(bctx.fn_info.name.clone()),
+        });
+        sorted_sizes.push(1);
+    }
+    if bctx.fn_info.takes_return_address {
+        sorted_must_store.push(Variable {
+            var_name: ctx.cfg.return_address_local.clone(),
+            var_type: VarType::Var,
+            fn_name: Some(bctx.fn_info.name.clone()),
+        });
+        sorted_sizes.push(1);
+    }
+    if bctx.fn_info.is_variadic {
+        sorted_must_store.push(Variable {
+            var_name: ctx.cfg.vararg_ptr_local.clone(),
+            var_type: VarType::Var,
+            fn_name: Some(bctx.fn_info.name.clone()),
+        });
+        sorted_sizes.push(1);
+    }
+    if ctx.cfg.use_branch_jump_table {
+        sorted_must_store.push(Variable {
+            var_name: ctx.cfg.branch_jump_table_addr_local.clone(),
+            var_type: VarType::Var,
+            fn_name: Some(bctx.fn_info.name.clone()),
+        });
+        sorted_sizes.push(1);
+    }
+
+    Ok((sorted_must_store, sorted_sizes))
 }
 
 /// Resolve return-address-related info for a call. Returns None for intrinsics.
@@ -2743,27 +3206,29 @@ fn trans_instr(
                 fn_name: None,
             };
 
-            let res_val = match bop.opcode {
+            let mut res_val: Option<InferredValue> = None;
+
+            match bop.opcode {
                 ir::instructions::BinaryOpcode::Add | ir::instructions::BinaryOpcode::Sub => {
                     let op_str = if bop.opcode == ir::instructions::BinaryOpcode::Add { "add" } else { "sub" };
                     let width = get_value_width(&bop.left);
                     let (val, extra_blocks) = calculate_sum_diff(op_str, lft_iv, rgt_iv, width, ctx, bop.is_nuw);
                     blocks.add(extra_blocks);
-                    val
+                    res_val = Some(val);
                 }
                 ir::instructions::BinaryOpcode::Shl => {
                     let width = get_value_width(&bop.left);
                     let can_shift_out = !(bop.is_nsw && bop.is_nuw);
                     let (val, extra_blocks) = bit_shift("left", width, lft_iv, rgt_iv, ctx, can_shift_out)?;
                     blocks.add(extra_blocks);
-                    val
+                    res_val = Some(val);
                 }
                 ir::instructions::BinaryOpcode::LShr => {
                     let width = get_value_width(&bop.left);
                     let can_shift_out = !bop.is_exact;
                     let (val, extra_blocks) = bit_shift("right", width, lft_iv, rgt_iv, ctx, can_shift_out)?;
                     blocks.add(extra_blocks);
-                    val
+                    res_val = Some(val);
                 }
                 _ => {
                     let lft = lft_iv.clone().into_single()?;
@@ -2772,90 +3237,113 @@ fn trans_instr(
                         ir::instructions::BinaryOpcode::Mul => {
                             let width = get_value_width(&bop.left);
                             if bop.is_nuw && bop.is_nsw {
-                                InferredValue::Single(multiply_no_wrap(lft, rgt, width)?)
+                                res_val = Some(InferredValue::Single(multiply_no_wrap(lft, rgt, width)?));
                             } else {
                                 let (val, extra_blocks) = multiply_wrap(lft, rgt, width, ctx)?;
                                 blocks.add(extra_blocks);
-                                InferredValue::Single(val)
+                                res_val = Some(InferredValue::Single(val));
                             }
                         }
                         ir::instructions::BinaryOpcode::And => {
                             let width = get_value_width(&bop.left);
-                            InferredValue::Single(binop::binop(
+                            res_val = Some(InferredValue::Single(binop::binop(
                                 BinopKind::And, lft, rgt, width, &ctx.cfg,
                                 &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
-                            )?)
+                            )?));
                         }
                         ir::instructions::BinaryOpcode::Or => {
                             let width = get_value_width(&bop.left);
-                            InferredValue::Single(binop::binop(
+                            res_val = Some(InferredValue::Single(binop::binop(
                                 BinopKind::Or, lft, rgt, width, &ctx.cfg,
                                 &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
-                            )?)
+                            )?));
                         }
                         ir::instructions::BinaryOpcode::Xor => {
                             let width = get_value_width(&bop.left);
-                            InferredValue::Single(binop::binop(
+                            res_val = Some(InferredValue::Single(binop::binop(
                                 BinopKind::Xor, lft, rgt, width, &ctx.cfg,
                                 &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
-                            )?)
+                            )?));
                         }
                         ir::instructions::BinaryOpcode::AShr => {
                             let width = get_value_width(&bop.left);
+                            blocks.add(ashr_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
+                        }
+                        ir::instructions::BinaryOpcode::UDiv => {
+                            let width = get_value_width(&bop.left);
                             if width > super::config::VARIABLE_MAX_BITS {
                                 return Err(CompException(format!(
-                                    "AShr of {}-bit integers is not supported",
+                                    "Unsigned division of {}-bit integers is not supported",
                                     width
                                 )));
                             }
-                            let shifted = Value::Op(Op::Div(Box::new(lft), Box::new(rgt.clone())));
-                            InferredValue::Single(twos_complement::apply_twos_complement(shifted, width))
-                        }
-                        ir::instructions::BinaryOpcode::UDiv | ir::instructions::BinaryOpcode::SDiv => {
-                            let width = get_value_width(&bop.left);
-                            if bop.opcode == ir::instructions::BinaryOpcode::SDiv {
-                                let signed_lft = twos_complement::undo_twos_complement(lft, width);
-                                let signed_rgt = twos_complement::undo_twos_complement(rgt, width);
-                                let div_result = Value::Op(Op::Div(Box::new(signed_lft), Box::new(signed_rgt)));
-                                InferredValue::Single(twos_complement::apply_twos_complement(div_result, width))
+                            let div = Value::Op(Op::Div(Box::new(lft), Box::new(rgt)));
+                            let res = if bop.is_exact {
+                                div
                             } else {
-                                InferredValue::Single(Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(Box::new(lft), Box::new(rgt)))))))
-                            }
+                                Value::Op(Op::Floor(Box::new(div)))
+                            };
+                            res_val = Some(InferredValue::Single(res));
                         }
-                        ir::instructions::BinaryOpcode::URem | ir::instructions::BinaryOpcode::SRem => {
+                        ir::instructions::BinaryOpcode::SDiv => {
                             let width = get_value_width(&bop.left);
-                            if bop.opcode == ir::instructions::BinaryOpcode::SRem {
-                                let signed_lft = twos_complement::undo_twos_complement(lft, width);
-                                let signed_rgt = twos_complement::undo_twos_complement(rgt, width);
-                                let rem_result = Value::Op(Op::Mod(Box::new(signed_lft), Box::new(signed_rgt)));
-                                InferredValue::Single(twos_complement::apply_twos_complement(rem_result, width))
-                            } else {
-                                InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt))))
-                            }
+                            blocks.add(signed_div_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
+                        }
+                        ir::instructions::BinaryOpcode::URem => {
+                            res_val = Some(InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt)))));
+                        }
+                        ir::instructions::BinaryOpcode::SRem => {
+                            let width = get_value_width(&bop.left);
+                            blocks.add(signed_rem_blocks(&res_var, lft, rgt, width, ctx)?);
                         }
                         ir::instructions::BinaryOpcode::FAdd => {
-                            InferredValue::Single(Value::Op(Op::Add(Box::new(lft), Box::new(rgt))))
+                            res_val = Some(InferredValue::Single(Value::Op(Op::Add(Box::new(lft), Box::new(rgt)))));
                         }
                         ir::instructions::BinaryOpcode::FSub => {
-                            InferredValue::Single(Value::Op(Op::Sub(Box::new(lft), Box::new(rgt))))
+                            res_val = Some(InferredValue::Single(Value::Op(Op::Sub(Box::new(lft), Box::new(rgt)))));
                         }
                         ir::instructions::BinaryOpcode::FMul => {
-                            InferredValue::Single(Value::Op(Op::Mul(Box::new(lft), Box::new(rgt))))
+                            res_val = Some(InferredValue::Single(Value::Op(Op::Mul(Box::new(lft), Box::new(rgt)))));
                         }
                         ir::instructions::BinaryOpcode::FDiv => {
-                            InferredValue::Single(Value::Op(Op::Div(Box::new(lft), Box::new(rgt))))
+                            res_val = Some(InferredValue::Single(Value::Op(Op::Div(Box::new(lft), Box::new(rgt)))));
                         }
                         ir::instructions::BinaryOpcode::FRem => {
-                            InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt))))
+                            res_val = Some(InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt)))));
                         }
                         _ => {
                             return Err(CompException(format!("Unsupported binary opcode: {:?}", bop.opcode)));
                         }
                     }
                 }
+            }
+
+            if let Some(rv) = res_val {
+                blocks.add(res_var.set_inferred_value(rv)?);
+            }
+        }
+
+        ir::Instr::UnaryOp(uop) => {
+            let operand_iv = trans_value(&uop.operand, ctx, Some(bctx))?;
+            let res_var = Variable {
+                var_name: localize_var(&uop.result.name, false, Some(&bctx.fn_info.name), false),
+                var_type: VarType::Var,
+                fn_name: None,
             };
 
-            blocks.add(res_var.set_inferred_value(res_val)?);
+            match uop.opcode {
+                ir::instructions::UnaryOpcode::FNeg => {
+                    let operand = operand_iv.into_single()?;
+                    blocks.add_block(res_var.set_value(
+                        Value::Op(Op::Sub(
+                            Box::new(Value::Known(KnownVal::Num(0.0))),
+                            Box::new(operand),
+                        )),
+                        VarOp::Set,
+                        None,
+                    )?);
+                }
+            }
         }
 
         ir::Instr::ICmp(icmp) => {
@@ -2956,16 +3444,27 @@ fn trans_instr(
                 fn_name: None,
             };
 
-            // NaN check matching Python's lexical comparison: val < "j".
+            // NaN checks matching Python's lexical comparison.
+            // In Scratch string comparison: "Infinity" < "j" < "NaN".
             let is_not_nan = |val: Value| {
                 Value::BoolOp(BoolOp::Lt(
                     Box::new(val),
                     Box::new(Value::Known(KnownVal::Str("j".to_string()))),
                 ))
             };
+            let is_nan = |val: Value| {
+                Value::BoolOp(BoolOp::Gt(
+                    Box::new(val),
+                    Box::new(Value::Known(KnownVal::Num(f64::INFINITY))),
+                ))
+            };
             let both_not_nan = Value::BoolOp(BoolOp::And(
                 Box::new(is_not_nan(lft.clone())),
                 Box::new(is_not_nan(rgt.clone())),
+            ));
+            let either_nan = Value::BoolOp(BoolOp::Or(
+                Box::new(is_nan(lft.clone())),
+                Box::new(is_nan(rgt.clone())),
             ));
             let cmp_eq = Value::BoolOp(BoolOp::Eq(Box::new(lft.clone()), Box::new(rgt.clone())));
             let cmp_gt = Value::BoolOp(BoolOp::Gt(Box::new(lft.clone()), Box::new(rgt.clone())));
@@ -2983,40 +3482,71 @@ fn trans_instr(
                 ir::instructions::FCmpCond::One => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_eq)))),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_eq.clone())))),
                     ))
                 }
                 ir::instructions::FCmpCond::Ogt => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(cmp_gt),
+                        Box::new(cmp_gt.clone()),
                     ))
                 }
                 ir::instructions::FCmpCond::Oge => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_lt)))),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_lt.clone())))),
                     ))
                 }
                 ir::instructions::FCmpCond::Olt => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(cmp_lt),
+                        Box::new(cmp_lt.clone()),
                     ))
                 }
                 ir::instructions::FCmpCond::Ole => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_gt)))),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_gt.clone())))),
                     ))
                 }
                 ir::instructions::FCmpCond::Ord => both_not_nan,
-                ir::instructions::FCmpCond::Uno => {
-                    // Matches Python (returns true when neither operand is NaN).
-                    both_not_nan
+                ir::instructions::FCmpCond::Uno => either_nan.clone(),
+                ir::instructions::FCmpCond::Ueq => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(cmp_eq),
+                    ))
                 }
-                _ => {
-                    return Err(CompException(format!("Unsupported fcmp condition: {:?}", fcmp.cond)));
+                ir::instructions::FCmpCond::Une => {
+                    // Match the Python reference, which treats Ueq and Une identically.
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(cmp_eq),
+                    ))
+                }
+                ir::instructions::FCmpCond::Ugt => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(cmp_gt),
+                    ))
+                }
+                ir::instructions::FCmpCond::Uge => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_lt)))),
+                    ))
+                }
+                ir::instructions::FCmpCond::Ult => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(cmp_lt),
+                    ))
+                }
+                ir::instructions::FCmpCond::Ule => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_gt)))),
+                    ))
                 }
             };
 
@@ -3040,7 +3570,23 @@ fn trans_instr(
                     let width = get_type_width(&conv.res_type);
                     twos_complement::apply_twos_complement(val, width)
                 }
-                ir::instructions::ConvOpcode::ZExt | ir::instructions::ConvOpcode::SExt => val,
+                ir::instructions::ConvOpcode::ZExt => val,
+                ir::instructions::ConvOpcode::SExt => {
+                    let from_bits = get_value_width(&conv.value);
+                    let to_bits = get_type_width(&conv.res_type);
+                    let limit = 2f64.powi(from_bits as i32 - 1) - 1.0;
+                    let diff = (2f64.powi(to_bits as i32) - 1.0) - (2f64.powi(from_bits as i32) - 1.0);
+                    Value::Op(Op::Add(
+                        Box::new(val.clone()),
+                        Box::new(Value::Op(Op::Mul(
+                            Box::new(Value::Known(KnownVal::Num(diff))),
+                            Box::new(Value::BoolOp(BoolOp::Gt(
+                                Box::new(val),
+                                Box::new(Value::Known(KnownVal::Num(limit))),
+                            ))),
+                        ))),
+                    ))
+                }
                 ir::instructions::ConvOpcode::IntToPtr | ir::instructions::ConvOpcode::PtrToInt => val,
                 ir::instructions::ConvOpcode::BitCast => val,
                 ir::instructions::ConvOpcode::SIToFP => {
@@ -3072,6 +3618,7 @@ fn trans_instr(
                     Value::Op(Op::Floor(Box::new(val)))
                 }
                 ir::instructions::ConvOpcode::UIToFP => val,
+                ir::instructions::ConvOpcode::FPTrunc | ir::instructions::ConvOpcode::FPExt => val,
                 _ => return Err(CompException(format!("Unsupported conversion opcode: {:?}", conv.opcode))),
             };
 
@@ -3079,7 +3626,15 @@ fn trans_instr(
         }
 
         ir::Instr::GetElementPtr(gep) => {
-            let final_val = trans_gep_value(&gep.base_ptr, &gep.base_ptr_type, &gep.indices, gep.is_nuw, ctx, Some(bctx))?;
+            let final_val = trans_gep_value(
+                &gep.base_ptr,
+                &gep.base_ptr_type,
+                &gep.indices,
+                gep.is_nuw,
+                ctx,
+                Some(bctx),
+                false,
+            )?;
             let res_var = Variable {
                 var_name: localize_var(&gep.result.name, false, Some(&bctx.fn_info.name), false),
                 var_type: VarType::Var,
@@ -3466,8 +4021,8 @@ fn assign_phi_nodes(
     // Track dependency cycles for local-var phi assignments, matching Python's
     // assignPhiNodes behavior.
     let mut end_assignments: Vec<(Variable, InferredValue)> = Vec::new();
-    let mut to_resolve: HashMap<String, String> = HashMap::new();
-    let mut set_by: HashMap<String, String> = HashMap::new();
+    let mut to_resolve: IndexMap<String, String> = IndexMap::new();
+    let mut set_by: IndexMap<String, String> = IndexMap::new();
     let mut resolved: Vec<(String, String)> = Vec::new();
     let mut var_lookup: HashMap<String, Variable> = HashMap::new();
     let mut val_lookup: HashMap<String, InferredValue> = HashMap::new();
@@ -3502,7 +4057,7 @@ fn assign_phi_nodes(
             let deps = to_resolve.get(&var_name).cloned().unwrap();
             set_by.insert(deps.clone(), var_name.clone());
             resolved.push((var_name.clone(), deps));
-            to_resolve.remove(&var_name);
+            to_resolve.shift_remove(&var_name);
         }
 
         if to_set_empty {
@@ -3539,10 +4094,10 @@ fn assign_phi_nodes(
 
             let deps = to_resolve.get(&to_make_temp).cloned().unwrap();
             resolved.push((to_make_temp.clone(), deps.clone()));
-            to_resolve.remove(&to_make_temp);
+            to_resolve.shift_remove(&to_make_temp);
 
             for deps_val in to_resolve.values_mut() {
-                if *deps_val == deps {
+                if *deps_val == to_make_temp {
                     *deps_val = temp_name.clone();
                 }
             }
@@ -3602,6 +4157,124 @@ fn trans_return_addr(
     }
     blocks.end = true;
     Ok(blocks)
+}
+
+/// Compute variable use for the instructions following a call, matching Python's
+/// `getBlockVarUse`. Used to decide which live variables must be saved around a
+/// recursive call.
+fn compute_next_var_use(
+    following_instrs: &[ir::Instr],
+    source_label: &str,
+    phi_info: &HashMap<String, HashMap<String, Vec<(Variable, ir::Value)>>>,
+    block_var_use: &HashMap<String, BlockVarUse>,
+    result_name: Option<&str>,
+) -> Result<BlockVarUse, CompException> {
+    let mut res = BlockVarUse::default();
+    if let Some(name) = result_name {
+        res.modifies.insert(name.to_string());
+    }
+
+    for instr in following_instrs {
+        let mut vals = Vec::new();
+        // Collect values used by the instruction.
+        match instr {
+            ir::Instr::Ret(r) => {
+                if let Some(v) = &r.value {
+                    vals.push(v.clone());
+                }
+            }
+            ir::Instr::Conversion(c) => vals.push(c.value.clone()),
+            ir::Instr::Freeze(f) => vals.push(f.value.clone()),
+            ir::Instr::Load(l) => vals.push(l.address.clone()),
+            ir::Instr::Store(s) => {
+                vals.push(s.address.clone());
+                vals.push(s.value.clone());
+            }
+            ir::Instr::Call(c) => vals.extend(c.args.clone()),
+            ir::Instr::UnaryOp(u) => vals.push(u.operand.clone()),
+            ir::Instr::BinaryOp(b) => {
+                vals.push(b.left.clone());
+                vals.push(b.right.clone());
+            }
+            ir::Instr::ICmp(c) => {
+                vals.push(c.left.clone());
+                vals.push(c.right.clone());
+            }
+            ir::Instr::FCmp(c) => {
+                vals.push(c.left.clone());
+                vals.push(c.right.clone());
+            }
+            ir::Instr::CondBr(c) => vals.push(c.cond.clone()),
+            ir::Instr::Switch(s) => vals.push(s.cond.clone()),
+            ir::Instr::Select(s) => {
+                vals.push(s.cond.clone());
+                vals.push(s.true_value.clone());
+                vals.push(s.false_value.clone());
+            }
+            ir::Instr::GetElementPtr(g) => {
+                vals.push(g.base_ptr.clone());
+                vals.extend(g.indices.clone());
+            }
+            ir::Instr::ExtractValue(e) => vals.push(e.agg.clone()),
+            ir::Instr::InsertValue(i) => {
+                vals.push(i.agg.clone());
+                vals.push(i.element.clone());
+            }
+            ir::Instr::VaArg(v) => vals.push(v.arglist.clone()),
+            _ => {}
+        }
+
+        // For terminators, also include phi values from outgoing edges.
+        if matches!(
+            instr,
+            ir::Instr::UncondBr(_) | ir::Instr::CondBr(_) | ir::Instr::Switch(_)
+        ) {
+            let targets = super::graph_util::terminator_branch_labels(instr);
+            for (target, phi_vals) in phi_info.get(source_label).unwrap_or(&HashMap::new()) {
+                if targets.contains(target) {
+                    vals.extend(phi_vals.iter().map(|(_, v)| v.clone()));
+                }
+            }
+        }
+
+        let mut instr_depends = HashSet::new();
+        let mut instr_depends_var_sizes = HashMap::new();
+        for val in vals {
+            match val {
+                ir::Value::Argument(arg) => {
+                    instr_depends.insert(arg.name.clone());
+                    instr_depends_var_sizes.insert(arg.name.clone(), memory::get_size_of(&arg.type_, false)?);
+                }
+                ir::Value::LocalVar(lv) => {
+                    instr_depends.insert(lv.name.clone());
+                    instr_depends_var_sizes.insert(lv.name.clone(), memory::get_size_of(&lv.type_, false)?);
+                }
+                _ => {}
+            }
+        }
+        res.depends.extend(&instr_depends - &res.modifies);
+        res.depends_var_sizes.extend(instr_depends_var_sizes);
+
+        if let Some(result) = instr.result() {
+            res.modifies.insert(result.name.clone());
+        }
+    }
+
+    // Merge dependencies from branch targets.
+    if let Some(last) = following_instrs.last() {
+        for label in super::graph_util::terminator_branch_labels(last) {
+            if label == "ret" {
+                continue;
+            }
+            if let Some(bvu) = block_var_use.get(&label) {
+                res.depends.extend((&bvu.depends - &res.modifies).iter().cloned());
+                res.modifies.extend(bvu.modifies.iter().cloned());
+                res.depends_var_sizes.extend(bvu.depends_var_sizes.clone());
+            }
+        }
+    }
+
+    Ok(res)
 }
 
 /// Collect variable names that future blocks may depend on, so parameters can
@@ -3701,6 +4374,7 @@ fn trans_terminator_instr(
                 &bctx.available_params,
                 &bctx.available_param_sizes,
                 &poss_depends,
+                ctx.cfg.use_branch_jump_table,
             )?);
 
             let source_label = bctx.label.clone().unwrap_or_default();
@@ -3724,6 +4398,7 @@ fn trans_terminator_instr(
                 &bctx.available_params,
                 &bctx.available_param_sizes,
                 &poss_depends,
+                ctx.cfg.use_branch_jump_table,
             )?);
 
             let cond = trans_value(&cbr.cond, ctx, Some(bctx))?.into_single()?;
@@ -3776,6 +4451,7 @@ fn trans_terminator_instr(
                 &bctx.available_params,
                 &bctx.available_param_sizes,
                 &poss_depends,
+                ctx.cfg.use_branch_jump_table,
             )?);
 
             let cond = trans_value(&switch.cond, ctx, Some(bctx))?.into_single()?;
@@ -3917,7 +4593,12 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                 .map(|bvu| bvu.depends.clone())
                 .unwrap_or_default();
             poss_depends.extend(ctx.cfg.special_locals.iter().cloned());
-            wrapper.add(assign_parameters(&info.params, &info.param_sizes, &poss_depends)?);
+            wrapper.add(assign_parameters(
+                &info.params,
+                &info.param_sizes,
+                &poss_depends,
+                ctx.cfg.use_branch_jump_table,
+            )?);
 
             let first_block_proc_name = localize_label(&first_label, fn_name);
             wrapper.add_block(Block::ProcedureCall(scratch::ast::ProcedureCallData {
@@ -4022,7 +4703,7 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                 }));
             }
 
-            let (available_params, available_param_sizes) = if is_first_block {
+            let (available_params, available_param_sizes) = if is_first_block || ctx.cfg.use_branch_jump_table {
                 (info.params.clone(), info.param_sizes.clone())
             } else {
                 (Vec::new(), Vec::new())
@@ -4051,42 +4732,185 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                     if let Some((returns_to_address, takes_return_address, return_addresses)) =
                         get_call_return_addr_info(call, &ctx)
                     {
-                        if returns_to_address {
-                            let return_proc_name = localize_call_id(bctx.next_call_id, &label, fn_name, false);
-                            let return_addr_id = if takes_return_address {
-                                Some(return_addresses.iter().position(|r| r == &return_proc_name).ok_or_else(|| {
-                                    CompException(format!(
-                                        "Could not find return address {} in callee return addresses",
-                                        return_proc_name
-                                    ))
-                                })?)
-                            } else {
-                                None
-                            };
+                        let callee_name = get_call_callee_name(call, &ctx);
+                        let poss_recursive = callee_name.as_ref().map_or(false, |name| {
+                            name == fn_name && bctx.fn_info.can_call.contains(name)
+                        });
 
-                            let (pre_call, post_call, _) = trans_call_instr(call, &mut ctx, &mut bctx, return_addr_id)?;
-                            bctx.code.add(pre_call);
+                        let following_instrs = &block.instrs[instr_idx + 1..];
+                        let (must_store, must_store_sizes) = if poss_recursive {
+                            compute_must_store(call, &bctx, following_instrs, &ctx)?
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        let do_recursive = poss_recursive && !must_store.is_empty();
 
-                            // Finish the current procedure; the callee will return to the new target.
+                        if do_recursive && !returns_to_address && !ctx.cfg.use_branch_jump_table {
+                            // Use Scratch's procedure parameters as a stack to save live variables.
+                            let recurse_proc_name = localize_call_id(bctx.next_call_id, &label, fn_name, true);
+
+                            let must_store_values: Vec<Value> = must_store
+                                .iter()
+                                .zip(&must_store_sizes)
+                                .map(|(var, size)| {
+                                    if *size == 1 {
+                                        var.get_value(None)
+                                    } else {
+                                        // Flatten indexed values into individual reporter arguments.
+                                        let indexed = var.get_all_values(*size);
+                                        indexed.vals.into_iter().next().unwrap_or(var.get_value(None))
+                                    }
+                                })
+                                .collect();
+                            bctx.code.add_block(Block::ProcedureCall(scratch::ast::ProcedureCallData {
+                                name: recurse_proc_name.clone(),
+                                args: must_store_values,
+                                run_without_refresh: false,
+                            }));
+
                             ctx.proj.code.push(bctx.code);
 
-                            // Start the return-address target procedure.
-                            let mut new_code = BlockList::from_blocks(vec![Block::ProcedureDef(
+                            let new_code = BlockList::from_blocks(vec![Block::ProcedureDef(
                                 scratch::ast::ProcedureDefData {
-                                    name: return_proc_name,
-                                    params: Vec::new(),
+                                    name: recurse_proc_name,
+                                    params: must_store
+                                        .iter()
+                                        .map(|var| var.get_raw_var_name(None))
+                                        .collect(),
                                     warp: true,
                                 },
                             )]);
-                            new_code.add_block(Block::EditCounter(CounterOp::Increment));
-                            new_code.add(post_call);
+
+                            let saved_available_params = std::mem::replace(&mut bctx.available_params, must_store);
+                            let saved_available_param_sizes = std::mem::replace(&mut bctx.available_param_sizes, must_store_sizes);
                             bctx.code = new_code;
-                            bctx.available_params = Vec::new();
-                            bctx.available_param_sizes = Vec::new();
-                        } else {
+
                             let (pre_call, post_call, _) = trans_call_instr(call, &mut ctx, &mut bctx, None)?;
                             bctx.code.add(pre_call);
                             bctx.code.add(post_call);
+
+                            bctx.available_params = saved_available_params;
+                            bctx.available_param_sizes = saved_available_param_sizes;
+                        } else {
+                            if do_recursive {
+                                // Save live variables on the local stack before the call.
+                                let total_size: usize = must_store_sizes.iter().sum();
+                                if total_size != 0 {
+                                    bctx.code.add_block(Block::EditVar(EditVarData {
+                                        op: VarOp::Change,
+                                        name: ctx.cfg.local_stack_size_var.clone(),
+                                        value: Value::Known(KnownVal::Num(total_size as f64)),
+                                    }));
+
+                                    let mut offset = 0usize;
+                                    for (var, size) in must_store.iter().zip(&must_store_sizes) {
+                                        let val = if *size == 1 {
+                                            var.get_value(None)
+                                        } else {
+                                            var.get_all_values(*size).vals.into_iter().next().unwrap_or(var.get_value(None))
+                                        };
+                                        bctx.code.add(store_on_stack(
+                                            &ctx.cfg.local_stack_var,
+                                            &ctx.cfg.local_stack_size_var,
+                                            -(offset as i64 + *size as i64 - 1),
+                                            *size,
+                                            &val,
+                                        ));
+                                        offset += *size;
+                                    }
+                                }
+                            }
+
+                            if returns_to_address {
+                                let return_proc_name = localize_call_id(bctx.next_call_id, &label, fn_name, false);
+                                let return_addr_id = if takes_return_address {
+                                    Some(return_addresses.iter().position(|r| r == &return_proc_name).ok_or_else(|| {
+                                        CompException(format!(
+                                            "Could not find return address {} in callee return addresses",
+                                            return_proc_name
+                                        ))
+                                    })?)
+                                } else {
+                                    None
+                                };
+
+                                let (pre_call, post_call, _) = trans_call_instr(call, &mut ctx, &mut bctx, return_addr_id)?;
+                                bctx.code.add(pre_call);
+
+                                // Finish the current procedure; the callee will return to the new target.
+                                ctx.proj.code.push(bctx.code);
+
+                                // Start the return-address target procedure.
+                                let mut new_code = BlockList::from_blocks(vec![Block::ProcedureDef(
+                                    scratch::ast::ProcedureDefData {
+                                        name: return_proc_name,
+                                        params: Vec::new(),
+                                        warp: true,
+                                    },
+                                )]);
+                                new_code.add_block(Block::EditCounter(CounterOp::Increment));
+                                new_code.add(post_call);
+
+                                if do_recursive {
+                                    // Restore live variables after the call returns.
+                                    let total_size: usize = must_store_sizes.iter().sum();
+                                    let mut offset = 0usize;
+                                    for (var, size) in must_store.iter().zip(&must_store_sizes) {
+                                        let loaded = load_from_stack(
+                                            &ctx.cfg.local_stack_var,
+                                            &ctx.cfg.local_stack_size_var,
+                                            -(offset as i64 + *size as i64 - 1),
+                                        );
+                                        if *size == 1 {
+                                            new_code.add_block(var.set_value(loaded, VarOp::Set, None)?);
+                                        } else {
+                                            new_code.add_block(var.set_value(loaded, VarOp::Set, None)?);
+                                        }
+                                        offset += *size;
+                                    }
+                                    if total_size != 0 {
+                                        new_code.add_block(Block::EditVar(EditVarData {
+                                            op: VarOp::Change,
+                                            name: ctx.cfg.local_stack_size_var.clone(),
+                                            value: Value::Known(KnownVal::Num(-(total_size as f64))),
+                                        }));
+                                    }
+                                }
+
+                                bctx.code = new_code;
+                                bctx.available_params = Vec::new();
+                                bctx.available_param_sizes = Vec::new();
+                            } else {
+                                let (pre_call, post_call, _) = trans_call_instr(call, &mut ctx, &mut bctx, None)?;
+                                bctx.code.add(pre_call);
+                                bctx.code.add(post_call);
+
+                                if do_recursive {
+                                    // Restore live variables after the call returns.
+                                    let total_size: usize = must_store_sizes.iter().sum();
+                                    let mut offset = 0usize;
+                                    for (var, size) in must_store.iter().zip(&must_store_sizes) {
+                                        let loaded = load_from_stack(
+                                            &ctx.cfg.local_stack_var,
+                                            &ctx.cfg.local_stack_size_var,
+                                            -(offset as i64 + *size as i64 - 1),
+                                        );
+                                        if *size == 1 {
+                                            bctx.code.add_block(var.set_value(loaded, VarOp::Set, None)?);
+                                        } else {
+                                            bctx.code.add_block(var.set_value(loaded, VarOp::Set, None)?);
+                                        }
+                                        offset += *size;
+                                    }
+                                    if total_size != 0 {
+                                        bctx.code.add_block(Block::EditVar(EditVarData {
+                                            op: VarOp::Change,
+                                            name: ctx.cfg.local_stack_size_var.clone(),
+                                            value: Value::Known(KnownVal::Num(-(total_size as f64))),
+                                        }));
+                                    }
+                                }
+                            }
                         }
                         bctx.next_call_id += 1;
                     } else {
@@ -4347,6 +5171,149 @@ fn init_lookup_tables(ctx: &mut Context) -> Result<BlockList, CompException> {
     Ok(BlockList::new())
 }
 
+/// Replace calls to branch procedures with assignments to the branch jump table
+/// variable, recursing into control flow bodies.
+fn replace_branch_calls(bl: &mut BlockList, replacements: &HashMap<String, Block>) {
+    for block in &mut bl.blocks {
+        match block {
+            Block::ProcedureCall(pc) if replacements.contains_key(&pc.name) => {
+                assert!(pc.args.is_empty(), "branch jump table replacement expects no args");
+                *block = replacements[&pc.name].clone();
+            }
+            Block::ControlFlow(cf) => {
+                if let Some(body) = &mut cf.body {
+                    replace_branch_calls(body, replacements);
+                }
+                if let Some(else_body) = &mut cf.else_body {
+                    replace_branch_calls(else_body, replacements);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Post-optimization transformation that converts inter-block procedure calls
+/// into a per-function branch jump table. Matches Python's `postOptTransform`.
+fn post_opt_transform(mod_: &DecodedModule, ctx: &mut Context) {
+    if !ctx.cfg.use_branch_jump_table {
+        return;
+    }
+
+    // Map procedure names to their index in the project code.
+    let mut procs: HashMap<String, usize> = HashMap::new();
+    for (i, bl) in ctx.proj.code.iter().enumerate() {
+        if let Some(Block::ProcedureDef(pd)) = bl.blocks.first() {
+            procs.insert(pd.name.clone(), i);
+        }
+    }
+
+    let mut to_remove: Vec<usize> = Vec::new();
+
+    for func in mod_.functions.values() {
+        if func.blocks.len() <= 1 {
+            continue;
+        }
+
+        let fn_name = &func.name;
+        let needs_call_replacement: Vec<String> = func
+            .blocks
+            .values()
+            .skip(1)
+            .map(|b| localize_label(&b.label, fn_name))
+            .collect();
+        if needs_call_replacement.is_empty() {
+            continue;
+        }
+
+        let branch_id_var_name =
+            localize_var(&ctx.cfg.branch_jump_table_addr_local, false, Some(fn_name), false);
+
+        let mut replacements: HashMap<String, Block> = HashMap::new();
+        for (i, name) in needs_call_replacement.iter().enumerate() {
+            replacements.insert(
+                name.clone(),
+                Block::EditVar(EditVarData {
+                    op: VarOp::Set,
+                    name: branch_id_var_name.clone(),
+                    value: Value::Known(KnownVal::Num(i as f64)),
+                }),
+            );
+        }
+
+        for name in std::iter::once(fn_name).chain(needs_call_replacement.iter()) {
+            if let Some(&idx) = procs.get(name) {
+                replace_branch_calls(&mut ctx.proj.code[idx], &replacements);
+            }
+        }
+
+        let fn_proc_idx = *procs
+            .get(fn_name)
+            .unwrap_or_else(|| panic!("Could not find procedure for function {}", fn_name));
+
+        {
+            let first_proc = &mut ctx.proj.code[fn_proc_idx];
+            if let Some(last) = first_proc.blocks.last() {
+                assert!(
+                    !last.is_end(),
+                    "Cannot append branch jump table forever loop after ending block in {}",
+                    fn_name
+                );
+            }
+            first_proc.end = false;
+        }
+
+        let mut jump_table: BTreeMap<usize, BlockList> = BTreeMap::new();
+        for (i, name) in needs_call_replacement.iter().enumerate() {
+            let idx = procs[name];
+            let body_blocks: Vec<Block> = ctx.proj.code[idx].blocks.iter().skip(1).cloned().collect();
+            jump_table.insert(i, BlockList::from_blocks(body_blocks));
+        }
+
+        let mut get_branch_id = Value::GetVar {
+            name: branch_id_var_name.clone(),
+        };
+        if ctx.cfg.opt_target.exec.compiler_type_hints {
+            get_branch_id = Value::Op(Op::StrToFloat(Box::new(get_branch_id)));
+        }
+
+        let hi = needs_call_replacement.len().saturating_sub(1).max(0);
+        let dispatch = binary_search_jump_table(
+            get_branch_id,
+            jump_table,
+            None,
+            None,
+            None,
+            false,
+            0,
+            hi,
+        );
+
+        let mut forever_body = BlockList::new();
+        forever_body.add(dispatch);
+        let forever = Block::ControlFlow(ControlFlow {
+            op: ControlOp::Forever,
+            condition: None,
+            var: None,
+            body: Some(forever_body),
+            else_body: None,
+        });
+        ctx.proj.code[fn_proc_idx].add_block(forever);
+
+        to_remove.extend(
+            needs_call_replacement
+                .iter()
+                .filter_map(|n| procs.get(n).copied()),
+        );
+    }
+
+    to_remove.sort_unstable_by(|a, b| b.cmp(a));
+    to_remove.dedup();
+    for idx in to_remove {
+        ctx.proj.code.remove(idx);
+    }
+}
+
 fn binary_search_jump_table(
     value: Value,
     branches: BTreeMap<usize, BlockList>,
@@ -4555,8 +5522,8 @@ mod tests {
         let mut ctx = Context::new(proj, cfg);
         let v1 = gen_temp_var(&mut ctx);
         let v2 = gen_temp_var(&mut ctx);
-        assert!(v1.starts_with("tmp!"));
-        assert!(v2.starts_with("tmp!"));
+        assert!(v1.starts_with("%!tmp:"));
+        assert!(v2.starts_with("%!tmp:"));
         assert_ne!(v1, v2);
     }
 
@@ -4567,7 +5534,7 @@ mod tests {
         let mut ctx = Context::new(proj, cfg);
         let val = ir::Value::KnownInt(KnownIntVal {
             type_: ir::Type::Integer(ir::types::IntegerTy { width: 32 }),
-            value: 42,
+            value: num_bigint::BigUint::from(42u32),
             width: 32,
         });
         let result = trans_value(&val, &mut ctx, None).unwrap();
