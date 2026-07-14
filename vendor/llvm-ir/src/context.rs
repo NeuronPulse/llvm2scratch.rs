@@ -36,6 +36,14 @@ pub struct ConstId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GlobalId(pub u32);
 
+/// Public API for `UnresolvedId`.
+///
+/// Placeholder used during parsing for references to local values that have
+/// not been defined yet. It is resolved to a real `ValueRef` before the
+/// function is handed to consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UnresolvedId(pub u32);
+
 // ---------------------------------------------------------------------------
 // Universal SSA value reference
 // ---------------------------------------------------------------------------
@@ -51,6 +59,8 @@ pub enum ValueRef {
     Constant(ConstId),
     /// `Global` variant.
     Global(GlobalId),
+    /// Forward reference to a local value, resolved after parsing.
+    Unresolved(UnresolvedId),
 }
 
 // ---------------------------------------------------------------------------

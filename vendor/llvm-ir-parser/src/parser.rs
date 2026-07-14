@@ -7,14 +7,12 @@ use std::fmt;
 
 use llvm_ir::{
     ArgId, Argument, BasicBlock, BlockId, ConstId, ConstantData, Context, FastMathFlags, FloatKind,
-    FloatPredicate, Function, GlobalId, GlobalVariable, InstrId, InstrKind, Instruction,
+    FloatPredicate, Function, GlobalId, GlobalVariable, InstrKind, Instruction,
     IntArithFlags, IntPredicate, Linkage, Module, TailCallKind, TypeData, TypeId, ValueRef,
 };
+use llvm_ir::context::UnresolvedId;
 
 use crate::lexer::{Keyword, LexError, Lexer, Token};
-
-/// Sentinel ValueRef used as a placeholder for phi forward references.
-const PLACEHOLDER_VREF: ValueRef = ValueRef::Argument(ArgId(u32::MAX));
 
 // ---------------------------------------------------------------------------
 // ParseError
@@ -77,10 +75,8 @@ struct Parser<'src> {
     locals: HashMap<String, ValueRef>,
     /// Unnamed slots: slot number → ValueRef.
     unnamed: HashMap<u64, ValueRef>,
-    /// Phi forward reference fixups: (instr_id, incoming_index, name).
-    phi_fixups: Vec<(InstrId, usize, String)>,
-    /// Last forward-referenced local name (set by resolve_local, consumed by parse_phi).
-    last_fwd_name: Option<String>,
+    /// Forward-referenced local names allocated during parsing.
+    unresolved: Vec<String>,
     /// Name assigned to the entry basic block in this function (e.g. "0" or "entry").
     entry_block_name: Option<String>,
     /// LLVM-assembly name for the entry basic block (equal to the number of unnamed
@@ -99,8 +95,7 @@ impl<'src> Parser<'src> {
             current_func: None,
             locals: HashMap::new(),
             unnamed: HashMap::new(),
-            phi_fixups: Vec::new(),
-            last_fwd_name: None,
+            unresolved: Vec::new(),
             entry_block_name: None,
             entry_block_llvm_name: None,
         }
@@ -204,32 +199,134 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
-    fn resolve_phi_fixups(&mut self) -> Result<(), ParseError> {
+    fn resolve_unresolved(&mut self) -> Result<(), ParseError> {
         let fid = match self.current_func {
             Some(f) => f,
             None => return Ok(()),
         };
-        // Resolve any pending phi fixups whose referenced value is now defined.
-        // Phi incoming values are defined in predecessor blocks, so a fixup may
-        // become resolvable only after we finish parsing the block that defines
-        // the referenced name.
-        let mut i = 0;
-        while i < self.phi_fixups.len() {
-            let (iid, incoming_idx, name) = &self.phi_fixups[i];
-            if let Some(&resolved) = self.locals.get(name) {
-                if let InstrKind::Phi { incoming, .. } =
-                    &mut self.module.functions[fid].instr_mut(*iid).kind
-                {
-                    if *incoming_idx < incoming.len() {
-                        incoming[*incoming_idx].0 = resolved;
-                    }
+        let func = &mut self.module.functions[fid];
+        for instr in func.instructions.iter_mut() {
+            Self::replace_value_refs(&mut instr.kind, |v| match v {
+                ValueRef::Unresolved(uid) => {
+                    let name = self.unresolved.get(uid.0 as usize)?;
+                    self.locals
+                        .get(name)
+                        .copied()
+                        .or_else(|| name.parse::<u64>().ok().and_then(|slot| self.unnamed.get(&slot)).copied())
                 }
-                self.phi_fixups.remove(i);
-            } else {
-                i += 1;
-            }
+                _ => Some(v),
+            });
         }
         Ok(())
+    }
+
+    fn replace_value_refs<F>(kind: &mut InstrKind, mut f: F)
+    where
+        F: FnMut(ValueRef) -> Option<ValueRef>,
+    {
+        let mut replace = |v: &mut ValueRef| {
+            if let Some(new_v) = f(*v) {
+                *v = new_v;
+            }
+        };
+        match kind {
+            InstrKind::Ret { val } => {
+                if let Some(v) = val {
+                    replace(v);
+                }
+            }
+            InstrKind::Br { .. } | InstrKind::Unreachable => {}
+            InstrKind::CondBr { cond, .. } => replace(cond),
+            InstrKind::Switch { val, .. } => replace(val),
+            InstrKind::Add { lhs, rhs, .. }
+            | InstrKind::Sub { lhs, rhs, .. }
+            | InstrKind::Mul { lhs, rhs, .. }
+            | InstrKind::UDiv { lhs, rhs, .. }
+            | InstrKind::SDiv { lhs, rhs, .. }
+            | InstrKind::URem { lhs, rhs, .. }
+            | InstrKind::SRem { lhs, rhs, .. }
+            | InstrKind::And { lhs, rhs, .. }
+            | InstrKind::Or { lhs, rhs, .. }
+            | InstrKind::Xor { lhs, rhs, .. }
+            | InstrKind::Shl { lhs, rhs, .. }
+            | InstrKind::LShr { lhs, rhs, .. }
+            | InstrKind::AShr { lhs, rhs, .. }
+            | InstrKind::FAdd { lhs, rhs, .. }
+            | InstrKind::FSub { lhs, rhs, .. }
+            | InstrKind::FMul { lhs, rhs, .. }
+            | InstrKind::FDiv { lhs, rhs, .. }
+            | InstrKind::FRem { lhs, rhs, .. }
+            | InstrKind::ICmp { lhs, rhs, .. }
+            | InstrKind::FCmp { lhs, rhs, .. } => {
+                replace(lhs);
+                replace(rhs);
+            }
+            InstrKind::FNeg { operand, .. } => replace(operand),
+            InstrKind::Alloca { num_elements, .. } => {
+                if let Some(v) = num_elements {
+                    replace(v);
+                }
+            }
+            InstrKind::Load { ptr, .. } => replace(ptr),
+            InstrKind::Store { val, ptr, .. } => {
+                replace(val);
+                replace(ptr);
+            }
+            InstrKind::GetElementPtr { ptr, indices, .. } => {
+                replace(ptr);
+                for idx in indices {
+                    replace(idx);
+                }
+            }
+            InstrKind::Trunc { val, .. }
+            | InstrKind::ZExt { val, .. }
+            | InstrKind::SExt { val, .. }
+            | InstrKind::FPTrunc { val, .. }
+            | InstrKind::FPExt { val, .. }
+            | InstrKind::FPToUI { val, .. }
+            | InstrKind::FPToSI { val, .. }
+            | InstrKind::UIToFP { val, .. }
+            | InstrKind::SIToFP { val, .. }
+            | InstrKind::PtrToInt { val, .. }
+            | InstrKind::IntToPtr { val, .. }
+            | InstrKind::BitCast { val, .. }
+            | InstrKind::AddrSpaceCast { val, .. }
+            | InstrKind::Freeze { val, .. } => replace(val),
+            InstrKind::Select { cond, then_val, else_val, .. } => {
+                replace(cond);
+                replace(then_val);
+                replace(else_val);
+            }
+            InstrKind::Phi { incoming, .. } => {
+                for (v, _) in incoming {
+                    replace(v);
+                }
+            }
+            InstrKind::ExtractValue { aggregate, .. } => replace(aggregate),
+            InstrKind::InsertValue { aggregate, val, .. } => {
+                replace(aggregate);
+                replace(val);
+            }
+            InstrKind::ExtractElement { vec, idx, .. } => {
+                replace(vec);
+                replace(idx);
+            }
+            InstrKind::InsertElement { vec, val, idx, .. } => {
+                replace(vec);
+                replace(val);
+                replace(idx);
+            }
+            InstrKind::ShuffleVector { v1, v2, .. } => {
+                replace(v1);
+                replace(v2);
+            }
+            InstrKind::Call { callee, args, .. } => {
+                replace(callee);
+                for arg in args {
+                    replace(arg);
+                }
+            }
+        }
     }
 
     fn parse_global_or_function(&mut self) -> Result<(), ParseError> {
@@ -237,11 +334,39 @@ impl<'src> Parser<'src> {
         let name = self.lex.expect_global_ident()?;
         self.lex.expect(&Token::Equal)?;
         let linkage = self.parse_optional_linkage();
-        // Skip global attributes: unnamed_addr, addrspace(N)
+        // Skip global attributes before the `global`/`constant` keyword:
+        // linkage already consumed, now skip dso_local, unnamed_addr,
+        // local_unnamed_addr, addrspace(N), externally_initialized, etc.
         loop {
             match self.lex.peek()? {
-                Token::Kw(Keyword::UnnamedAddr) => {
+                Token::Kw(Keyword::UnnamedAddr)
+                | Token::Kw(Keyword::DsoLocal) => {
                     self.lex.next()?;
+                }
+                // Unknown attribute words (local_unnamed_addr, addrspace, ...)
+                // are tokenized as LocalIdent. If followed by '(', skip the
+                // whole `word(...)` expression.
+                Token::LocalIdent(_) => {
+                    self.lex.next()?;
+                    if matches!(self.lex.peek()?, Token::LParen) {
+                        self.lex.next()?;
+                        let mut depth = 1u32;
+                        loop {
+                            match self.lex.next()? {
+                                Token::LParen => depth += 1,
+                                Token::RParen => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                Token::Eof => {
+                                    return Err(self.err("unterminated global attribute"))
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 _ => break,
             }
@@ -569,10 +694,9 @@ impl<'src> Parser<'src> {
         let idx = self.module.add_function(func);
         self.current_func = Some(idx.0 as usize);
 
-        // Reset per-function phi state; locals/unnamed were already reset above
+        // Reset per-function state; locals/unnamed were already reset above
         // and then populated with argument names.
-        self.phi_fixups.clear();
-        self.last_fwd_name = None;
+        self.unresolved.clear();
 
         self.lex.expect(&Token::LBrace)?;
         loop {
@@ -587,8 +711,8 @@ impl<'src> Parser<'src> {
             }
         }
 
-        // Final attempt to resolve any remaining phi forward references.
-        self.resolve_phi_fixups()?;
+        // Resolve forward references now that every block has been parsed.
+        self.resolve_unresolved()?;
 
         Ok(())
     }
@@ -685,9 +809,6 @@ impl<'src> Parser<'src> {
             }
         }
 
-        // Resolve phi forward references now that this block's values are defined.
-        self.resolve_phi_fixups()?;
-
         Ok(())
     }
 
@@ -734,11 +855,6 @@ impl<'src> Parser<'src> {
             _ => (None, None),
         };
 
-        // Record which phi fixups (if any) are created by this instruction so
-        // that only the current instruction's placeholders are updated after
-        // allocation. Without this, multiple phi instructions in the same block
-        // would all have their forward references reassigned to the latest iid.
-        let phi_fixups_len_before = self.phi_fixups.len();
         let (kind, ty) = self.parse_instr_kind()?;
         // Skip trailing `#N` attribute group references (e.g. on call instructions).
         while self.lex.eat(&Token::Hash) {
@@ -750,12 +866,6 @@ impl<'src> Parser<'src> {
         let instr_name = result_name.clone();
         let instr = Instruction::new(instr_name, ty, kind);
         let iid = self.module.functions[fid].alloc_instr(instr);
-        // Update only the fixups created while parsing this instruction.
-        for entry in self.phi_fixups.iter_mut().skip(phi_fixups_len_before) {
-            if entry.0 == InstrId(0) {
-                entry.0 = iid;
-            }
-        }
         for (key, value) in metadata_attachments {
             self.module.functions[fid].add_instr_metadata(iid, key.clone(), value.clone());
             if key == "dbg" {
@@ -1188,13 +1298,6 @@ impl<'src> Parser<'src> {
                     // [ value, %label ]
                     self.lex.expect(&Token::LBracket)?;
                     let val = self.parse_value(ty)?;
-                    // If this was a forward reference, record a fixup.
-                    if val == PLACEHOLDER_VREF {
-                        if let Some(name) = self.last_fwd_name.take() {
-                            self.phi_fixups
-                                .push((InstrId(0), incoming.len(), name));
-                        }
-                    }
                     self.lex.expect(&Token::Comma)?;
                     let block_name = self.lex.expect_local_ident()?;
                     let bid = self.get_or_create_block(&block_name)?;
@@ -1679,6 +1782,42 @@ impl<'src> Parser<'src> {
             });
             Ok(ValueRef::Constant(c))
         }
+        Token::LBracket => {
+            // Constant array: [type elem1, type elem2, ...]
+            self.lex.expect(&Token::LBracket)?;
+            let mut elements = Vec::new();
+            if !matches!(self.lex.peek()?, Token::RBracket) {
+                let elt_ty = self.parse_type()?;
+                let c = self.parse_constant(elt_ty)?;
+                elements.push(c);
+                while self.lex.eat(&Token::Comma) {
+                    let elt_ty = self.parse_type()?;
+                    let c = self.parse_constant(elt_ty)?;
+                    elements.push(c);
+                }
+            }
+            self.lex.expect(&Token::RBracket)?;
+            let c = self.ctx.push_const(ConstantData::Array { ty, elements });
+            Ok(ValueRef::Constant(c))
+        }
+        Token::LBrace => {
+            // Constant struct: { type elem1, type elem2, ... }
+            self.lex.expect(&Token::LBrace)?;
+            let mut fields = Vec::new();
+            if !matches!(self.lex.peek()?, Token::RBrace) {
+                let field_ty = self.parse_type()?;
+                let c = self.parse_constant(field_ty)?;
+                fields.push(c);
+                while self.lex.eat(&Token::Comma) {
+                    let field_ty = self.parse_type()?;
+                    let c = self.parse_constant(field_ty)?;
+                    fields.push(c);
+                }
+            }
+            self.lex.expect(&Token::RBrace)?;
+            let c = self.ctx.push_const(ConstantData::Struct { ty, fields });
+            Ok(ValueRef::Constant(c))
+        }
         _ => {
                 let t = self.lex.next()?;
                 Err(self.err(format!("expected value, got {:?}", t)))
@@ -1704,9 +1843,10 @@ impl<'src> Parser<'src> {
                 return Ok(v);
             }
         }
-        // Treat as a forward reference: remember the name so parse_phi can record a fixup.
-        self.last_fwd_name = Some(name.to_string());
-        Ok(PLACEHOLDER_VREF)
+        // Forward reference to a value defined later (possibly in another block).
+        let id = UnresolvedId(self.unresolved.len() as u32);
+        self.unresolved.push(name.to_string());
+        Ok(ValueRef::Unresolved(id))
     }
 
     fn resolve_global_ref(&mut self, name: &str) -> Result<ValueRef, ParseError> {
@@ -1933,8 +2073,37 @@ impl<'src> Parser<'src> {
                 | Token::LBracket
                 | Token::LAngle
                 | Token::LBrace => break,
-                // Named struct type reference — stop skipping.
-                Token::LocalIdent(_) => break,
+                // Unknown bare word. In LLVM IR this is usually a function
+                // attribute like `range(...)`, `memory(...)`, etc. If it is
+                // followed by '(', skip the whole `word(...)` expression.
+                // Otherwise it is a named struct type reference — stop skipping.
+                Token::LocalIdent(_) => {
+                    let name = self.lex.expect_local_ident()?;
+                    if matches!(self.lex.peek()?, Token::LParen) {
+                        // Skip the `word(...)` attribute.
+                        self.lex.next()?;
+                        let mut depth = 1u32;
+                        loop {
+                            match self.lex.next()? {
+                                Token::LParen => depth += 1,
+                                Token::RParen => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                Token::Eof => {
+                                    return Err(self.err("unterminated function attribute"))
+                                }
+                                _ => {}
+                            }
+                        }
+                    } else {
+                        // Named struct type reference; put it back.
+                        self.lex.put_back(Ok(Token::LocalIdent(name)));
+                        break;
+                    }
+                }
                 // Attribute keywords (noundef, etc.) — skip.
                 Token::Kw(Keyword::Noundef)
                 | Token::Kw(Keyword::UnnamedAddr)

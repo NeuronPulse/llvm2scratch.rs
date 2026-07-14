@@ -327,6 +327,9 @@ impl<'a> Printer<'a> {
             ValueRef::Global(id) => {
                 write!(out, "@g{}", id.0).unwrap();
             }
+            ValueRef::Unresolved(id) => {
+                write!(out, "%?{}", id.0).unwrap();
+            }
         }
     }
 
@@ -336,6 +339,7 @@ impl<'a> Printer<'a> {
             ValueRef::Argument(id) => func.arg(id).ty,
             ValueRef::Constant(id) => self.ctx.type_of_const(id),
             ValueRef::Global(_) => self.ctx.ptr_ty,
+            ValueRef::Unresolved(_) => self.ctx.ptr_ty,
         }
     }
 

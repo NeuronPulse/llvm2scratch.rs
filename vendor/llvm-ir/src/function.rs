@@ -207,6 +207,7 @@ impl Function {
             ValueRef::Instruction(id) => Some(self.instructions[id.0 as usize].ty),
             ValueRef::Argument(id) => Some(self.args[id.0 as usize].ty),
             ValueRef::Constant(_) | ValueRef::Global(_) => None, // caller must consult Context/Module
+            ValueRef::Unresolved(_) => None, // resolved before use
         }
     }
 

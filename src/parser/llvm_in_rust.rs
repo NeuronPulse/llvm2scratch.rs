@@ -54,10 +54,6 @@ pub fn convert_module(
                 instrs,
             });
         }
-        if func.name == "factorial_recurse" || func.name == "sum_to_one_digit" || func.name == "numberize" {
-            eprintln!("DEBUG llvm_in_rust {} blocks: {:?}", func.name, block_names);
-        }
-
         let intrinsic = Intrinsic::from_name(&func.name);
 
         functions.insert(func.name.clone(), Function {
@@ -299,6 +295,7 @@ fn convert_value_ref(vref: &ValueRef, ctx: &Context, func: &LlvmFunction, func_n
                 Value::GlobalPtr(GlobalPtrVal { type_: ty, name })
             }
         }
+        ValueRef::Unresolved(uid) => panic!("unresolved value reference {:?}", uid),
     }
 }
 
