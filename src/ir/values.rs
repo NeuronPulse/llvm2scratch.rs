@@ -1,5 +1,7 @@
 use std::hash::{Hash, Hasher};
 
+use num_bigint::BigUint;
+
 use super::types::Type;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -95,7 +97,7 @@ pub struct UndefVal {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KnownIntVal {
     pub type_: Type,
-    pub value: u128,
+    pub value: BigUint,
     pub width: u32,
 }
 
@@ -261,10 +263,10 @@ impl UndefVal {
 }
 
 impl KnownIntVal {
-    pub fn new(type_: Type, value: u128, width: u32) -> Self {
+    pub fn new(type_: Type, value: impl Into<BigUint>, width: u32) -> Self {
         KnownIntVal {
             type_,
-            value,
+            value: value.into(),
             width,
         }
     }
@@ -306,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_known_int_val() {
-        let known_int = KnownIntVal::new(Type::integer(32), 42, 32);
+        let known_int = KnownIntVal::new(Type::integer(32), BigUint::from(42u32), 32);
         let val = Value::KnownInt(known_int);
         assert!(val.is_known());
         assert!(val.is_known_agg_target());

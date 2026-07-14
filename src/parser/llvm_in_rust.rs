@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use num_bigint::BigUint;
 
 use llvm_ir::context::{ConstId, Context, GlobalId, TypeId, ValueRef};
 use llvm_ir::function::Function as LlvmFunction;
@@ -154,18 +155,22 @@ fn convert_constant(const_id: ConstId, ctx: &Context, module: &Module, func_name
         ConstantData::Int { ty, val } => {
             let proj_ty = convert_type_id(*ty, ctx);
             let width = get_int_width(*ty, ctx);
-            Value::KnownInt(KnownIntVal { type_: proj_ty, value: *val as u128, width })
+            Value::KnownInt(KnownIntVal { type_: proj_ty, value: (*val as u128).into(), width })
         }
         ConstantData::IntWide { ty, words } => {
             let proj_ty = convert_type_id(*ty, ctx);
             let width = get_int_width(*ty, ctx);
-            let mut val: u128 = 0;
+            // Reconstruct the full integer from little-endian u64 words.
+            let mut full = num_bigint::BigUint::from(0u32);
             for (i, w) in words.iter().enumerate() {
-                if i < 2 {
-                    val |= (*w as u128) << (i * 64);
-                }
+                let part = num_bigint::BigUint::from(*w) << (i * 64);
+                full |= part;
             }
-            Value::KnownInt(KnownIntVal { type_: proj_ty, value: val, width })
+            Value::KnownInt(KnownIntVal {
+                type_: proj_ty,
+                value: full,
+                width,
+            })
         }
         ConstantData::Float { ty, bits } => {
             let proj_ty = convert_type_id(*ty, ctx);
@@ -248,7 +253,7 @@ fn get_zero_init_val(ty: &Type) -> Value {
     match ty {
         Type::Integer(IntegerTy { width }) => Value::KnownInt(KnownIntVal {
             type_: ty.clone(),
-            value: 0,
+            value: BigUint::from(0u32),
             width: *width,
         }),
         Type::Float | Type::Double | Type::Half | Type::Fp128 => {
@@ -496,7 +501,7 @@ fn convert_instr(instr: &llvm_ir::instruction::Instruction, ctx: &Context, func:
                 values: mask.iter().map(|&i| {
                     Value::KnownInt(KnownIntVal {
                         type_: Type::Integer(IntegerTy { width: 32 }),
-                        value: i as u128,
+                        value: BigUint::from(i as u128),
                         width: 32,
                     })
                 }).collect(),
@@ -529,7 +534,7 @@ fn convert_instr(instr: &llvm_ir::instruction::Instruction, ctx: &Context, func:
                 .map(|v| convert_value_ref(v, ctx, func, func_names, module))
                 .unwrap_or(Value::KnownInt(KnownIntVal {
                     type_: Type::Integer(IntegerTy { width: 32 }),
-                    value: 1,
+                    value: BigUint::from(1u32),
                     width: 32,
                 }));
             Instr::Alloca(Alloca {

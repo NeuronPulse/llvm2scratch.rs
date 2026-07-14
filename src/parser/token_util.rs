@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+#[cfg(test)]
+use num_bigint::BigUint;
+
 use crate::ir::types::*;
 use crate::ir::values::*;
 use crate::ir::instructions::*;
@@ -1226,7 +1229,7 @@ mod tests {
         let result = parse_constant_token(&ty, "120", &HashMap::new(), &[], false, false).unwrap();
         match result {
             Value::KnownInt(k) => {
-                assert_eq!(k.value, 120);
+                assert_eq!(k.value, BigUint::from(120u32));
                 assert_eq!(k.width, 8);
             }
             _ => panic!("Expected KnownIntVal"),
@@ -1238,7 +1241,7 @@ mod tests {
         let ty = Type::integer(8);
         let result = parse_constant_token(&ty, "-2", &HashMap::new(), &[], false, false).unwrap();
         match result {
-            Value::KnownInt(k) => assert_eq!(k.value, 254),
+            Value::KnownInt(k) => assert_eq!(k.value, BigUint::from(254u32)),
             _ => panic!("Expected KnownIntVal"),
         }
     }
@@ -1248,7 +1251,7 @@ mod tests {
         let ty = Type::integer(1);
         let result = parse_constant_token(&ty, "true", &HashMap::new(), &[], false, false).unwrap();
         match result {
-            Value::KnownInt(k) => assert_eq!(k.value, 1),
+            Value::KnownInt(k) => assert_eq!(k.value, BigUint::from(1u32)),
             _ => panic!("Expected KnownIntVal"),
         }
     }
@@ -1258,7 +1261,7 @@ mod tests {
         let ty = Type::integer(16);
         let result = parse_constant_token(&ty, "u0xFF", &HashMap::new(), &[], false, false).unwrap();
         match result {
-            Value::KnownInt(k) => assert_eq!(k.value, 255),
+            Value::KnownInt(k) => assert_eq!(k.value, BigUint::from(255u32)),
             _ => panic!("Expected KnownIntVal"),
         }
     }

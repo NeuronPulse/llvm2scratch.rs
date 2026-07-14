@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use indexmap::IndexMap;
+use num_traits::ToPrimitive;
+
 use crate::ir;
 use crate::ir::instructions::BinaryOpcode;
 use crate::ir::values::LocalVarVal;
@@ -68,15 +71,16 @@ pub fn trans_value(
     match val {
         ir::Value::KnownInt(ki) => {
             if ki.width as usize <= super::config::VARIABLE_MAX_BITS {
-                let val = twos_complement::comptime_undo_twos_complement(ki.value as f64, ki.width as usize);
-                Ok(InferredValue::Single(Value::Known(KnownVal::Num(val))))
+                // Keep the raw unsigned value to match Python's KnownIntVal handling.
+                Ok(InferredValue::Single(Value::Known(KnownVal::Num(ki.value.to_u64().unwrap_or(0) as f64))))
             } else {
-                let mut num = ki.value as u128;
+                let mut num = ki.value.clone();
                 let mut width = ki.width as usize;
                 let mut values = Vec::new();
-                let part_mask: u128 = (1u128 << super::config::VARIABLE_MAX_BITS) - 1;
+                let part_mask = num_bigint::BigUint::from(1u32) << super::config::VARIABLE_MAX_BITS;
                 while width > 0 {
-                    values.push(Value::Known(KnownVal::Num((num & part_mask) as f64)));
+                    let part = &num % &part_mask;
+                    values.push(Value::Known(KnownVal::Num(part.to_u64().unwrap_or(0) as f64)));
                     num >>= super::config::VARIABLE_MAX_BITS;
                     width = width.saturating_sub(super::config::VARIABLE_MAX_BITS);
                 }
@@ -133,7 +137,18 @@ pub fn trans_value(
         }
         ir::Value::GlobalPtr(gp) => {
             if let Some(&ptr) = ctx.globvar_to_ptr.get(&gp.name) {
-                Ok(InferredValue::Single(Value::Known(KnownVal::Num(ptr as f64))))
+                if ctx.cfg.compiler_opt {
+                    Ok(InferredValue::Single(Value::Known(KnownVal::Num(ptr as f64))))
+                } else {
+                    let var = Variable {
+                        var_name: gp.name.clone(),
+                        var_type: VarType::Global,
+                        fn_name: None,
+                    };
+                    Ok(InferredValue::Single(Value::GetVar {
+                        name: var.get_unidxed_raw_var_name(),
+                    }))
+                }
             } else {
                 Err(CompException(format!("Global variable not found: {}", gp.name)))
             }
@@ -164,7 +179,15 @@ pub fn trans_value(
         ir::Value::ConstExpr(ce) => match &ce.expr {
             ir::values::ConstExpr::Conversion(c) => trans_value(&c.value, ctx, bctx),
             ir::values::ConstExpr::GetElementPtr(gep) => {
-                let val = trans_gep_value(&gep.base_ptr, &gep.base_ptr_type, &gep.indices, gep.is_nuw, ctx, bctx)?;
+                let val = trans_gep_value(
+                    &gep.base_ptr,
+                    &gep.base_ptr_type,
+                    &gep.indices,
+                    gep.is_nuw,
+                    ctx,
+                    bctx,
+                    true,
+                )?;
                 Ok(InferredValue::Single(val))
             }
             _ => Err(CompException(format!("Cannot translate const expr: {:?}", ce))),
@@ -180,8 +203,24 @@ fn trans_gep_value(
     is_nuw: bool,
     ctx: &mut Context,
     bctx: Option<&BlockInfo>,
+    force_numeric_global: bool,
 ) -> Result<Value, CompException> {
-    let base = trans_value(base_ptr, ctx, bctx)?.into_single()?;
+    let base = if force_numeric_global {
+        if let ir::Value::GlobalPtr(gp) = base_ptr {
+            if let Some(&ptr) = ctx.globvar_to_ptr.get(&gp.name) {
+                Value::Known(KnownVal::Num(ptr as f64))
+            } else {
+                return Err(CompException(format!(
+                    "Global variable not found: {}",
+                    gp.name
+                )));
+            }
+        } else {
+            trans_value(base_ptr, ctx, bctx)?.into_single()?
+        }
+    } else {
+        trans_value(base_ptr, ctx, bctx)?.into_single()?
+    };
     let index_vals: Vec<(Value, usize)> = indices
         .iter()
         .map(|idx| {
@@ -494,7 +533,7 @@ fn get_func_ptr_signature_info<'a>(signature: &FuncTy, ctx: &'a Context) -> Opti
 pub fn gen_temp_var(ctx: &mut Context) -> String {
     let id = ctx.uid_counter;
     ctx.uid_counter += 1;
-    format!("tmp!{}", id)
+    format!("{}{}", ctx.cfg.tmp_prefix, id)
 }
 
 pub fn trans_load(
@@ -675,7 +714,7 @@ pub fn init_memory(
 
         match &gv.init {
             ir::Value::KnownInt(ki) => {
-                let val = twos_complement::comptime_undo_twos_complement(ki.value as f64, ki.width as usize);
+                let val = ki.value.to_u64().unwrap_or(0) as f64;
                 init_mem.push(KnownVal::Num(val));
             }
             ir::Value::KnownFloat(kf) => {
@@ -967,213 +1006,6 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
         }),
     ]), &mut ctx);
 
-    add_func("SB3_render", vec![], BlockList::from_blocks(vec![
-        Block::EditVolume { op: VolumeOp::Change, value: Value::Known(KnownVal::Num(0.0)) },
-    ]), &mut ctx);
-
-    add_func("SB3_say_str", vec!["input"], BlockList::from_blocks(vec![
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
-        Block::Say { value: Value::GetVar { name: rv.clone() } },
-    ]), &mut ctx);
-
-    add_func("SB3_say_char", vec!["input"], BlockList::from_blocks(vec![
-        Block::Say { value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetParam { name: "input".into() }) }) },
-    ]), &mut ctx);
-
-    add_func("SB3_say_dbl", vec!["input"], BlockList::from_blocks(vec![
-        Block::Say { value: Value::GetParam { name: "input".into() } },
-    ]), &mut ctx);
-
-    add_func("SB3_wait", vec!["duration"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "end".into(), value: Value::Op(Op::Add(Box::new(Value::DaysSince2000), Box::new(Value::Op(Op::Div(Box::new(Value::GetParam { name: "duration".into() }), Box::new(Value::Known(KnownVal::Num(86400.0)))))))) }),
-        Block::ProcedureCall(ProcedureCallData { name: "SB3_render".into(), args: vec![], run_without_refresh: false }),
-        Block::ControlFlow(ControlFlow {
-            op: ControlOp::Until,
-            condition: Some(Value::BoolOp(BoolOp::Gt(Box::new(Value::DaysSince2000), Box::new(Value::GetVar { name: "end".into() })))),
-            var: None,
-            body: Some(BlockList::from_blocks(vec![
-                Block::ProcedureCall(ProcedureCallData { name: "SB3_render".into(), args: vec![], run_without_refresh: false }),
-            ])),
-            else_body: None,
-        }),
-    ]), &mut ctx);
-
-    add_func("SB3_wait_no_render", vec!["duration"], BlockList::from_blocks(vec![
-        Block::Wait { value: Value::GetParam { name: "duration".into() } },
-    ]), &mut ctx);
-
-    add_func("SB3_ask_str", vec!["output", "input", "count"], BlockList::from_blocks(vec![
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
-        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::GetParam { name: "count".into() }], run_without_refresh: false }),
-    ]), &mut ctx);
-
-    add_func("SB3_ask_str_unsafe", vec!["output", "input"], BlockList::from_blocks(vec![
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
-        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::Known(KnownVal::Num(f64::INFINITY))], run_without_refresh: false }),
-    ]), &mut ctx);
-
-    add_func("SB3_ask_dbl", vec!["output", "input"], BlockList::from_blocks(vec![
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
-        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::StrToFloat(Box::new(Value::GetAnswer))) }),
-        Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::GetParam { name: "output".into() }), value: Some(Value::GetVar { name: "char".into() }) }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetAnswer), Box::new(Value::GetVar { name: "char".into() })))))) }),
-    ]), &mut ctx);
-
-    add_func("SB3_days_since_2000", vec![], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::DaysSince2000 }),
-    ]), &mut ctx);
-
-    add_func("_exit", vec!["status"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Op(Op::Join(Box::new(Value::Known(KnownVal::Str("exit called with status ".into()))), Box::new(Value::GetParam { name: "status".into() }))), var_name: None },
-        Block::StopScript(StopOption::All),
-    ]), &mut ctx);
-
-    add_func("close", vec!["a"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("close called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("fstat", vec!["a", "b"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("fstat called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("isatty", vec!["a"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("isatty called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("lseek", vec!["a", "b", "c"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("lseek called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("read", vec!["a", "b", "c"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("read called".into())), var_name: None },
-    ]), &mut ctx);
-
-    add_func("sbrk", vec!["incr"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::GetVar { name: heap_pointer_var.clone() } }),
-        Block::EditVar(EditVarData { op: VarOp::Change, name: heap_pointer_var.clone(), value: Value::GetParam { name: "incr".into() } }),
-    ]), &mut ctx);
-
-    add_func("write", vec!["file", "buf", "len"], BlockList::from_blocks(vec![
-        Block::Ask { value: Value::Known(KnownVal::Str("write called".into())), var_name: None },
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "buf".into() }], run_without_refresh: false }),
-        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-    ]), &mut ctx);
-
-    add_func("!helper_str2scratch", vec!["input"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Known(KnownVal::Str("".into())) }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::GetParam { name: "input".into() } }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
-        Block::ControlFlow(ControlFlow {
-            op: ControlOp::Until,
-            condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(0.0)))))),
-            var: None,
-            body: Some(BlockList::from_blocks(vec![
-                Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::Join(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetVar { name: "char".into() }) })))) }),
-                Block::EditVar(EditVarData { op: VarOp::Change, name: "ptr".into(), value: Value::Known(KnownVal::Num(1.0)) }),
-                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
-            ])),
-            else_body: None,
-        }),
-    ]), &mut ctx);
-
-    let enough_space = Value::BoolOp(BoolOp::Lt(
-        Box::new(Value::Op(Op::LengthOf(Box::new(Value::GetParam { name: "input".into() })))),
-        Box::new(Value::GetParam { name: "count".into() }),
-    ));
-
-    add_func("!helper_scratch2str", vec!["input", "str", "count"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::Op(Op::Sub(Box::new(Value::GetParam { name: "str".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
-        Block::EditVar(EditVarData { op: VarOp::Set, name: "cost".into(), value: Value::CostumeInfo { op: CostumeInfoOp::Number } }),
-        Block::ControlFlow(ControlFlow {
-            op: ControlOp::IfElse,
-            condition: Some(enough_space.clone()),
-            var: None,
-            body: Some(BlockList::from_blocks(vec![
-                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::LengthOf(Box::new(Value::GetParam { name: "input".into() }))) }),
-            ])),
-            else_body: Some(BlockList::from_blocks(vec![
-                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::Sub(Box::new(Value::GetParam { name: "count".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
-            ])),
-        }),
-        Block::ControlFlow(ControlFlow {
-            op: ControlOp::RepTimes,
-            condition: Some(Value::GetVar { name: "char".into() }),
-            var: None,
-            body: Some(BlockList::from_blocks(vec![
-                Block::EditVar(EditVarData { op: VarOp::Set, name: "ascii".into(), value: Value::GetOfList(GetOfList { op: ListOp::IndexOf, name: ascii_lookup.clone(), value: Box::new(Value::Op(Op::LetterOf(Box::new(Value::GetVar { name: "i".into() }), Box::new(Value::GetParam { name: "input".into() })))) }) }),
-                Block::ControlFlow(ControlFlow {
-                    op: ControlOp::If,
-                    condition: Some(Value::BoolOp(BoolOp::And(
-                        Box::new(Value::BoolOp(BoolOp::Gt(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(64.0)))))),
-                        Box::new(Value::BoolOp(BoolOp::Lt(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(91.0)))))),
-                    ))),
-                    var: None,
-                    body: Some(BlockList::from_blocks(vec![
-                        Block::ProcedureCall(ProcedureCallData { name: "!helper_is_lowercase".into(), args: vec![
-                            Value::Op(Op::LetterOf(Box::new(Value::GetVar { name: "i".into() }), Box::new(Value::GetParam { name: "input".into() }))),
-                            Value::Op(Op::Sub(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(64.0))))),
-                        ], run_without_refresh: false }),
-                        Block::ControlFlow(ControlFlow {
-                            op: ControlOp::If,
-                            condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::Known(KnownVal::Num(1.0)))))),
-                            var: None,
-                            body: Some(BlockList::from_blocks(vec![
-                                Block::EditVar(EditVarData { op: VarOp::Change, name: "ascii".into(), value: Value::Known(KnownVal::Num(32.0)) }),
-                            ])),
-                            else_body: None,
-                        }),
-                    ])),
-                    else_body: None,
-                }),
-                Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ptr".into() }), Box::new(Value::GetVar { name: "i".into() })))), value: Some(Value::GetVar { name: "ascii".into() }) }),
-                Block::EditVar(EditVarData { op: VarOp::Change, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
-            ])),
-            else_body: None,
-        }),
-        Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ptr".into() }), Box::new(Value::GetVar { name: "i".into() })))), value: Some(Value::Known(KnownVal::Num(0.0))) }),
-        Block::SwitchCostume { value: Value::GetVar { name: "cost".into() } },
-        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::BoolToFloat(Box::new(enough_space.clone()))) }),
-    ]), &mut ctx);
-
-    let lowercase_var = ctx.cfg.lowercase_var.clone();
-    add_func("!helper_is_lowercase", vec!["char", "alphabet_pos"], BlockList::from_blocks(vec![
-        Block::EditVar(EditVarData {
-            op: VarOp::Set,
-            name: "original".into(),
-            value: Value::GetOfList(GetOfList {
-                op: ListOp::AtIndex,
-                name: lowercase_var.clone(),
-                value: Box::new(Value::GetParam { name: "alphabet_pos".into() }),
-            }),
-        }),
-        Block::EditList(EditListData {
-            op: ListEditOp::ReplaceAt,
-            name: lowercase_var.clone(),
-            index: Some(Value::GetParam { name: "alphabet_pos".into() }),
-            value: Some(Value::GetParam { name: "char".into() }),
-        }),
-        Block::SwitchCostume { value: Value::Known(KnownVal::Str(uppercase_costume_name.to_string())) },
-        Block::SwitchCostume { value: Value::GetList { name: lowercase_var.clone() } },
-        Block::EditList(EditListData {
-            op: ListEditOp::ReplaceAt,
-            name: lowercase_var.clone(),
-            index: Some(Value::GetParam { name: "alphabet_pos".into() }),
-            value: Some(Value::GetVar { name: "original".into() }),
-        }),
-        Block::EditVar(EditVarData {
-            op: VarOp::Set,
-            name: rv.clone(),
-            value: Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Eq(
-                Box::new(Value::CostumeInfo { op: CostumeInfoOp::Number }),
-                Box::new(Value::Known(KnownVal::Num(lc_costume_num as f64))),
-            ))))),
-        }),
-    ]), &mut ctx);
-
     add_func("!helper_IEEE_754", vec!["float", "exp_bits", "max_exp", "2^mant_bits"], BlockList::from_blocks(vec![
         Block::ControlFlow(ControlFlow {
             op: ControlOp::IfElse,
@@ -1358,6 +1190,213 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
                 Box::new(Value::GetParam { name: "max_exp".into() }),
             )),
         }),
+    ]), &mut ctx);
+
+    let lowercase_var = ctx.cfg.lowercase_var.clone();
+    add_func("!helper_is_lowercase", vec!["char", "alphabet_pos"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: "original".into(),
+            value: Value::GetOfList(GetOfList {
+                op: ListOp::AtIndex,
+                name: lowercase_var.clone(),
+                value: Box::new(Value::GetParam { name: "alphabet_pos".into() }),
+            }),
+        }),
+        Block::EditList(EditListData {
+            op: ListEditOp::ReplaceAt,
+            name: lowercase_var.clone(),
+            index: Some(Value::GetParam { name: "alphabet_pos".into() }),
+            value: Some(Value::GetParam { name: "char".into() }),
+        }),
+        Block::SwitchCostume { value: Value::Known(KnownVal::Str(uppercase_costume_name.to_string())) },
+        Block::SwitchCostume { value: Value::GetList { name: lowercase_var.clone() } },
+        Block::EditList(EditListData {
+            op: ListEditOp::ReplaceAt,
+            name: lowercase_var.clone(),
+            index: Some(Value::GetParam { name: "alphabet_pos".into() }),
+            value: Some(Value::GetVar { name: "original".into() }),
+        }),
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: rv.clone(),
+            value: Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Eq(
+                Box::new(Value::CostumeInfo { op: CostumeInfoOp::Number }),
+                Box::new(Value::Known(KnownVal::Num(lc_costume_num as f64))),
+            ))))),
+        }),
+    ]), &mut ctx);
+
+    add_func("!helper_str2scratch", vec!["input"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Known(KnownVal::Str("".into())) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::GetParam { name: "input".into() } }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::Until,
+            condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(0.0)))))),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::Join(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetVar { name: "char".into() }) })))) }),
+                Block::EditVar(EditVarData { op: VarOp::Change, name: "ptr".into(), value: Value::Known(KnownVal::Num(1.0)) }),
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
+            ])),
+            else_body: None,
+        }),
+    ]), &mut ctx);
+
+    let enough_space = Value::BoolOp(BoolOp::Lt(
+        Box::new(Value::Op(Op::LengthOf(Box::new(Value::GetParam { name: "input".into() })))),
+        Box::new(Value::GetParam { name: "count".into() }),
+    ));
+
+    add_func("!helper_scratch2str", vec!["input", "str", "count"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::Op(Op::Sub(Box::new(Value::GetParam { name: "str".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "cost".into(), value: Value::CostumeInfo { op: CostumeInfoOp::Number } }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::IfElse,
+            condition: Some(enough_space.clone()),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::LengthOf(Box::new(Value::GetParam { name: "input".into() }))) }),
+            ])),
+            else_body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::Sub(Box::new(Value::GetParam { name: "count".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
+            ])),
+        }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::RepTimes,
+            condition: Some(Value::GetVar { name: "char".into() }),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "ascii".into(), value: Value::GetOfList(GetOfList { op: ListOp::IndexOf, name: ascii_lookup.clone(), value: Box::new(Value::Op(Op::LetterOf(Box::new(Value::GetVar { name: "i".into() }), Box::new(Value::GetParam { name: "input".into() })))) }) }),
+                Block::ControlFlow(ControlFlow {
+                    op: ControlOp::If,
+                    condition: Some(Value::BoolOp(BoolOp::And(
+                        Box::new(Value::BoolOp(BoolOp::Gt(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(64.0)))))),
+                        Box::new(Value::BoolOp(BoolOp::Lt(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(91.0)))))),
+                    ))),
+                    var: None,
+                    body: Some(BlockList::from_blocks(vec![
+                        Block::ProcedureCall(ProcedureCallData { name: "!helper_is_lowercase".into(), args: vec![
+                            Value::Op(Op::LetterOf(Box::new(Value::GetVar { name: "i".into() }), Box::new(Value::GetParam { name: "input".into() }))),
+                            Value::Op(Op::Sub(Box::new(Value::GetVar { name: "ascii".into() }), Box::new(Value::Known(KnownVal::Num(64.0))))),
+                        ], run_without_refresh: false }),
+                        Block::ControlFlow(ControlFlow {
+                            op: ControlOp::If,
+                            condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::Known(KnownVal::Num(1.0)))))),
+                            var: None,
+                            body: Some(BlockList::from_blocks(vec![
+                                Block::EditVar(EditVarData { op: VarOp::Change, name: "ascii".into(), value: Value::Known(KnownVal::Num(32.0)) }),
+                            ])),
+                            else_body: None,
+                        }),
+                    ])),
+                    else_body: None,
+                }),
+                Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ptr".into() }), Box::new(Value::GetVar { name: "i".into() })))), value: Some(Value::GetVar { name: "ascii".into() }) }),
+                Block::EditVar(EditVarData { op: VarOp::Change, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
+            ])),
+            else_body: None,
+        }),
+        Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ptr".into() }), Box::new(Value::GetVar { name: "i".into() })))), value: Some(Value::Known(KnownVal::Num(0.0))) }),
+        Block::SwitchCostume { value: Value::GetVar { name: "cost".into() } },
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::BoolToFloat(Box::new(enough_space.clone()))) }),
+    ]), &mut ctx);
+
+    add_func("SB3_render", vec![], BlockList::from_blocks(vec![
+        Block::EditVolume { op: VolumeOp::Change, value: Value::Known(KnownVal::Num(0.0)) },
+    ]), &mut ctx);
+
+    add_func("SB3_say_str", vec!["input"], BlockList::from_blocks(vec![
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
+        Block::Say { value: Value::GetVar { name: rv.clone() } },
+    ]), &mut ctx);
+
+    add_func("SB3_say_char", vec!["input"], BlockList::from_blocks(vec![
+        Block::Say { value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetParam { name: "input".into() }) }) },
+    ]), &mut ctx);
+
+    add_func("SB3_say_dbl", vec!["input"], BlockList::from_blocks(vec![
+        Block::Say { value: Value::GetParam { name: "input".into() } },
+    ]), &mut ctx);
+
+    add_func("SB3_wait", vec!["duration"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "end".into(), value: Value::Op(Op::Add(Box::new(Value::DaysSince2000), Box::new(Value::Op(Op::Div(Box::new(Value::GetParam { name: "duration".into() }), Box::new(Value::Known(KnownVal::Num(86400.0)))))))) }),
+        Block::ProcedureCall(ProcedureCallData { name: "SB3_render".into(), args: vec![], run_without_refresh: false }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::Until,
+            condition: Some(Value::BoolOp(BoolOp::Gt(Box::new(Value::DaysSince2000), Box::new(Value::GetVar { name: "end".into() })))),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::ProcedureCall(ProcedureCallData { name: "SB3_render".into(), args: vec![], run_without_refresh: false }),
+            ])),
+            else_body: None,
+        }),
+    ]), &mut ctx);
+
+    add_func("SB3_wait_no_render", vec!["duration"], BlockList::from_blocks(vec![
+        Block::Wait { value: Value::GetParam { name: "duration".into() } },
+    ]), &mut ctx);
+
+    add_func("SB3_ask_str", vec!["output", "input", "count"], BlockList::from_blocks(vec![
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
+        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::GetParam { name: "count".into() }], run_without_refresh: false }),
+    ]), &mut ctx);
+
+    add_func("SB3_ask_str_unsafe", vec!["output", "input"], BlockList::from_blocks(vec![
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
+        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::Known(KnownVal::Num(f64::INFINITY))], run_without_refresh: false }),
+    ]), &mut ctx);
+
+    add_func("SB3_ask_dbl", vec!["output", "input"], BlockList::from_blocks(vec![
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
+        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::Op(Op::StrToFloat(Box::new(Value::GetAnswer))) }),
+        Block::EditList(EditListData { op: ListEditOp::ReplaceAt, name: mem_var.clone(), index: Some(Value::GetParam { name: "output".into() }), value: Some(Value::GetVar { name: "char".into() }) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetAnswer), Box::new(Value::GetVar { name: "char".into() })))))) }),
+    ]), &mut ctx);
+
+    add_func("SB3_days_since_2000", vec![], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::DaysSince2000 }),
+    ]), &mut ctx);
+
+    add_func("_exit", vec!["status"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Op(Op::Join(Box::new(Value::Known(KnownVal::Str("exit called with status ".into()))), Box::new(Value::GetParam { name: "status".into() }))), var_name: None },
+        Block::StopScript(StopOption::All),
+    ]), &mut ctx);
+
+    add_func("close", vec!["a"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("close called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("fstat", vec!["a", "b"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("fstat called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("isatty", vec!["a"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("isatty called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("lseek", vec!["a", "b", "c"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("lseek called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("read", vec!["a", "b", "c"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("read called".into())), var_name: None },
+    ]), &mut ctx);
+
+    add_func("sbrk", vec!["incr"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::GetVar { name: heap_pointer_var.clone() } }),
+        Block::EditVar(EditVarData { op: VarOp::Change, name: heap_pointer_var.clone(), value: Value::GetParam { name: "incr".into() } }),
+    ]), &mut ctx);
+
+    add_func("write", vec!["file", "buf", "len"], BlockList::from_blocks(vec![
+        Block::Ask { value: Value::Known(KnownVal::Str("write called".into())), var_name: None },
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "buf".into() }], run_without_refresh: false }),
+        Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
     ]), &mut ctx);
 
     ctx
@@ -2882,15 +2921,6 @@ fn trans_call_instr(
         run_without_refresh: false,
     }));
 
-    // Deallocate vararg memory after the call.
-    if callee_is_variadic && vararg_alloc_size != 0 {
-        post_call.add_block(Block::EditVar(EditVarData {
-            op: VarOp::Change,
-            name: ctx.cfg.stack_pointer_var.clone(),
-            value: Value::Known(KnownVal::Num(vararg_alloc_size as f64)),
-        }));
-    }
-
     if let Some(result) = &call.result {
         let res_var = Variable {
             var_name: localize_var(&result.name, false, Some(&bctx.fn_info.name), false),
@@ -2909,6 +2939,16 @@ fn trans_call_instr(
             InferredValue::Indexed(return_var.get_all_values(result_size))
         };
         post_call.add(res_var.set_inferred_value(ret_val)?);
+    }
+
+    // Deallocate vararg memory after reading the return value so that the
+    // scratchblocks output matches the Python reference order.
+    if callee_is_variadic && vararg_alloc_size != 0 {
+        post_call.add_block(Block::EditVar(EditVarData {
+            op: VarOp::Change,
+            name: ctx.cfg.stack_pointer_var.clone(),
+            value: Value::Known(KnownVal::Num(vararg_alloc_size as f64)),
+        }));
     }
 
     Ok((pre_call, post_call, callee_returns_to_address))
@@ -3494,7 +3534,15 @@ fn trans_instr(
         }
 
         ir::Instr::GetElementPtr(gep) => {
-            let final_val = trans_gep_value(&gep.base_ptr, &gep.base_ptr_type, &gep.indices, gep.is_nuw, ctx, Some(bctx))?;
+            let final_val = trans_gep_value(
+                &gep.base_ptr,
+                &gep.base_ptr_type,
+                &gep.indices,
+                gep.is_nuw,
+                ctx,
+                Some(bctx),
+                false,
+            )?;
             let res_var = Variable {
                 var_name: localize_var(&gep.result.name, false, Some(&bctx.fn_info.name), false),
                 var_type: VarType::Var,
@@ -3881,8 +3929,8 @@ fn assign_phi_nodes(
     // Track dependency cycles for local-var phi assignments, matching Python's
     // assignPhiNodes behavior.
     let mut end_assignments: Vec<(Variable, InferredValue)> = Vec::new();
-    let mut to_resolve: HashMap<String, String> = HashMap::new();
-    let mut set_by: HashMap<String, String> = HashMap::new();
+    let mut to_resolve: IndexMap<String, String> = IndexMap::new();
+    let mut set_by: IndexMap<String, String> = IndexMap::new();
     let mut resolved: Vec<(String, String)> = Vec::new();
     let mut var_lookup: HashMap<String, Variable> = HashMap::new();
     let mut val_lookup: HashMap<String, InferredValue> = HashMap::new();
@@ -3917,7 +3965,7 @@ fn assign_phi_nodes(
             let deps = to_resolve.get(&var_name).cloned().unwrap();
             set_by.insert(deps.clone(), var_name.clone());
             resolved.push((var_name.clone(), deps));
-            to_resolve.remove(&var_name);
+            to_resolve.shift_remove(&var_name);
         }
 
         if to_set_empty {
@@ -3954,10 +4002,10 @@ fn assign_phi_nodes(
 
             let deps = to_resolve.get(&to_make_temp).cloned().unwrap();
             resolved.push((to_make_temp.clone(), deps.clone()));
-            to_resolve.remove(&to_make_temp);
+            to_resolve.shift_remove(&to_make_temp);
 
             for deps_val in to_resolve.values_mut() {
-                if *deps_val == deps {
+                if *deps_val == to_make_temp {
                     *deps_val = temp_name.clone();
                 }
             }
@@ -5382,8 +5430,8 @@ mod tests {
         let mut ctx = Context::new(proj, cfg);
         let v1 = gen_temp_var(&mut ctx);
         let v2 = gen_temp_var(&mut ctx);
-        assert!(v1.starts_with("tmp!"));
-        assert!(v2.starts_with("tmp!"));
+        assert!(v1.starts_with("%!tmp:"));
+        assert!(v2.starts_with("%!tmp:"));
         assert_ne!(v1, v2);
     }
 
@@ -5394,7 +5442,7 @@ mod tests {
         let mut ctx = Context::new(proj, cfg);
         let val = ir::Value::KnownInt(KnownIntVal {
             type_: ir::Type::Integer(ir::types::IntegerTy { width: 32 }),
-            value: 42,
+            value: num_bigint::BigUint::from(42u32),
             width: 32,
         });
         let result = trans_value(&val, &mut ctx, None).unwrap();

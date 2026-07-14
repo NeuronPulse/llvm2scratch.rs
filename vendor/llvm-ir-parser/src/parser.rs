@@ -5,6 +5,45 @@
 use std::collections::HashMap;
 use std::fmt;
 
+/// Parse a decimal string into little-endian u64 words representing its
+/// absolute value. The returned words are the true binary representation,
+/// not decimal chunks.
+fn parse_decimal_to_u64_words(s: &str) -> Vec<u64> {
+    let digits = s.trim_start_matches('-');
+    let mut words: Vec<u64> = vec![0];
+    for ch in digits.chars() {
+        let d = ch.to_digit(10).unwrap() as u64;
+        // Multiply current value by 10.
+        let mut carry = 0u128;
+        for w in &mut words {
+            let prod = (*w as u128) * 10 + carry;
+            *w = prod as u64;
+            carry = prod >> 64;
+        }
+        if carry != 0 {
+            words.push(carry as u64);
+        }
+        // Add digit d.
+        let mut add_carry = d as u128;
+        for w in &mut words {
+            let sum = (*w as u128) + add_carry;
+            *w = sum as u64;
+            add_carry = sum >> 64;
+            if add_carry == 0 {
+                break;
+            }
+        }
+        if add_carry != 0 {
+            words.push(add_carry as u64);
+        }
+    }
+    // Trim leading zero words.
+    while words.len() > 1 && words.last() == Some(&0) {
+        words.pop();
+    }
+    words
+}
+
 use llvm_ir::{
     ArgId, Argument, BasicBlock, BlockId, ConstId, ConstantData, Context, FastMathFlags, FloatKind,
     FloatPredicate, Function, GlobalId, GlobalVariable, InstrKind, Instruction,
@@ -77,6 +116,9 @@ struct Parser<'src> {
     unnamed: HashMap<u64, ValueRef>,
     /// Forward-referenced local names allocated during parsing.
     unresolved: Vec<String>,
+    /// BlockIds in the order their labels appear in the source. Used to restore
+    /// source-order after forward references caused blocks to be allocated early.
+    block_source_order: Vec<BlockId>,
     /// Name assigned to the entry basic block in this function (e.g. "0" or "entry").
     entry_block_name: Option<String>,
     /// LLVM-assembly name for the entry basic block (equal to the number of unnamed
@@ -96,6 +138,7 @@ impl<'src> Parser<'src> {
             locals: HashMap::new(),
             unnamed: HashMap::new(),
             unresolved: Vec::new(),
+            block_source_order: Vec::new(),
             entry_block_name: None,
             entry_block_llvm_name: None,
         }
@@ -218,6 +261,74 @@ impl<'src> Parser<'src> {
             });
         }
         Ok(())
+    }
+
+    /// Reorder a function's basic blocks to match source order. Forward
+    /// references can cause blocks to be allocated before their label is
+    /// reached, so after parsing we remap BlockIds so that func.blocks is
+    /// ordered by label appearance in the source.
+    fn reorder_blocks_to_source_order(&mut self) {
+        let fid = match self.current_func {
+            Some(f) => f,
+            None => return,
+        };
+        let func = &mut self.module.functions[fid];
+        if self.block_source_order.len() != func.blocks.len() {
+            // Should not happen for well-formed IR; leave order as-is.
+            return;
+        }
+
+        // Build mapping from old BlockId to new BlockId.
+        let mut old_to_new: HashMap<BlockId, BlockId> = HashMap::new();
+        let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(func.blocks.len());
+        for (new_idx, old_bid) in self.block_source_order.iter().enumerate() {
+            old_to_new.insert(*old_bid, BlockId(new_idx as u32));
+            new_blocks.push(func.blocks[old_bid.0 as usize].clone());
+        }
+
+        // Update every BlockId stored in instructions.
+        for instr in func.instructions.iter_mut() {
+            Self::replace_block_ids(&mut instr.kind, |bid| old_to_new.get(&bid).copied());
+        }
+
+        func.blocks = new_blocks;
+
+        // Update pending_blocks so later functions don't reference stale ids.
+        for bid in self.pending_blocks.values_mut() {
+            if let Some(&new_bid) = old_to_new.get(bid) {
+                *bid = new_bid;
+            }
+        }
+    }
+
+    fn replace_block_ids<F>(kind: &mut InstrKind, mut f: F)
+    where
+        F: FnMut(BlockId) -> Option<BlockId>,
+    {
+        let mut replace = |bid: &mut BlockId| {
+            if let Some(new_bid) = f(*bid) {
+                *bid = new_bid;
+            }
+        };
+        match kind {
+            InstrKind::Br { dest } => replace(dest),
+            InstrKind::CondBr { then_dest, else_dest, .. } => {
+                replace(then_dest);
+                replace(else_dest);
+            }
+            InstrKind::Switch { default, cases, .. } => {
+                replace(default);
+                for (_, case_dest) in cases.iter_mut() {
+                    replace(case_dest);
+                }
+            }
+            InstrKind::Phi { incoming, .. } => {
+                for (_, src) in incoming.iter_mut() {
+                    replace(src);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn replace_value_refs<F>(kind: &mut InstrKind, mut f: F)
@@ -664,6 +775,7 @@ impl<'src> Parser<'src> {
         self.locals.clear();
         self.unnamed.clear();
         self.pending_blocks.clear();
+        self.block_source_order.clear();
         // In LLVM assembly unnamed values share one numbering sequence. The entry
         // basic block's assembly name is therefore equal to the number of unnamed
         // values that appear before it, which is exactly the argument count.
@@ -711,7 +823,8 @@ impl<'src> Parser<'src> {
             }
         }
 
-        // Resolve forward references now that every block has been parsed.
+        // Restore source order of basic blocks and resolve forward references.
+        self.reorder_blocks_to_source_order();
         self.resolve_unresolved()?;
 
         Ok(())
@@ -791,6 +904,8 @@ impl<'src> Parser<'src> {
             self.pending_blocks.insert(bb_name.clone(), bid);
             bid
         };
+        // Record source order of block labels.
+        self.block_source_order.push(bid);
         // Parse instructions until we see another block label or `}`.
         loop {
             match self.lex.peek()? {
@@ -1664,21 +1779,9 @@ impl<'src> Parser<'src> {
                     Token::BigIntLit(s) => s,
                     _ => unreachable!(),
                 };
-                // Parse big integer as IntWide.
+                // Parse big integer as IntWide using true binary words.
                 let is_negative = s.starts_with('-');
-                let digits = s.trim_start_matches('-');
-                // Convert to little-endian u64 words.
-                let mut words = Vec::new();
-                let mut remaining = digits.to_string();
-                while !remaining.is_empty() {
-                    let chunk_len = remaining.len().min(19); // 19 digits fits in u64
-                    let chunk = &remaining[remaining.len() - chunk_len..];
-                    let val: u64 = chunk.parse().map_err(|_| {
-                        self.err(format!("bad big int word: {}", chunk))
-                    })?;
-                    words.push(val);
-                    remaining.truncate(remaining.len() - chunk_len);
-                }
+                let mut words = parse_decimal_to_u64_words(&s);
                 if is_negative {
                     // Two's complement negation.
                     let mut carry = 1u64;
@@ -1691,6 +1794,17 @@ impl<'src> Parser<'src> {
                         words.push(carry);
                     }
                 }
+                // Pad or truncate to the type width so downstream code sees
+                // the expected number of words.
+                let width = match self.ctx.get_type(ty) {
+                    TypeData::Integer(w) => *w as usize,
+                    _ => words.len() * 64,
+                };
+                let expected_words = (width + 63) / 64;
+                while words.len() < expected_words {
+                    words.push(0);
+                }
+                words.truncate(expected_words);
                 let c = self.ctx.push_const(ConstantData::IntWide { ty, words });
                 Ok(ValueRef::Constant(c))
             }

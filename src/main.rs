@@ -10,7 +10,7 @@ use llvm2scratch::compiler::translate;
 use llvm2scratch::target::BranchMethod;
 use llvm2scratch::optimizer::Optimization;
 use llvm2scratch::scratch::ast::{Format, ScratchConfig};
-use llvm2scratch::scratch::export::{export_data, export_scratch_file};
+use llvm2scratch::scratch::export::export_scratch_file;
 use llvm2scratch::scratch::{Project, ScratchContext};
 use llvm2scratch::target::loader::get_target;
 use llvm2scratch::target::{DEFAULT_OPT_TARGET, DEFAULT_TARGETS};
@@ -425,8 +425,7 @@ fn main() {
     }
 
     if let Some(path) = matches.get_one::<String>("debug-scratch-text") {
-        let mut ctx = project_to_context(&proj);
-        let text = export_data(&mut ctx, format);
+        let text = proj.stringify(false);
         if let Err(e) = fs::write(path, text) {
             eprintln!("Error writing debug scratch text '{}': {}", path, e);
             process::exit(1);
@@ -434,8 +433,7 @@ fn main() {
     }
 
     if let Some(path) = matches.get_one::<String>("debug-scratchblocks") {
-        let mut ctx = project_to_context(&proj);
-        let text = export_data(&mut ctx, format);
+        let text = proj.stringify(true);
         if let Err(e) = fs::write(path, text) {
             eprintln!("Error writing debug scratchblocks '{}': {}", path, e);
             process::exit(1);
