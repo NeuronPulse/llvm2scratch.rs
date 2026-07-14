@@ -3827,8 +3827,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
                                                            localized_param_sizes, info, ctx,
                                                            is_counted=info.returns_to_address)
       else:
-        next_var_use_depends = info.block_var_use[block.label].depends
-        next_var_use_depends |= ctx.cfg.special_locals
+        next_var_use_depends = info.block_var_use[block.label].depends | ctx.cfg.special_locals
         starting_fn_code, ctx = getCheckedProcedureStart(proc_name, localized_params, localized_param_sizes,
                                                          next_var_use_depends, block.label, info, ctx)
 
@@ -3840,8 +3839,7 @@ def transFuncs(mod: ir.Module, ctx: Context) -> Context:
 
       if is_first_block and info.branches_to_first:
         # Work out what variables might be depended on in future
-        poss_depends = info.block_var_use[block.label].depends
-        poss_depends |= ctx.cfg.special_locals
+        poss_depends = info.block_var_use[block.label].depends | ctx.cfg.special_locals
         starting_fn_code.add(assignParameters(info.params, info.param_sizes, poss_depends, ctx))
 
         first_block_proc_name = localizeLabel(block.label, info.name)

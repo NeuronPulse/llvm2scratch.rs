@@ -7,6 +7,7 @@ use clap::builder::PossibleValuesParser;
 
 use llvm2scratch::compiler::config::CompilerConfig;
 use llvm2scratch::compiler::translate;
+use llvm2scratch::target::BranchMethod;
 use llvm2scratch::optimizer::Optimization;
 use llvm2scratch::scratch::ast::{Format, ScratchConfig};
 use llvm2scratch::scratch::export::{export_data, export_scratch_file};
@@ -387,10 +388,11 @@ fn main() {
     cfg.max_branch_recursion = max_branch_recursion;
     cfg.accurate_byte_spacing = !no_accurate_byte_spacing;
     cfg.targets = targets.clone();
-    cfg.opt_target = opt_target;
+    cfg.opt_target = opt_target.clone();
     cfg.compiler_opt = compiler_opt;
     cfg.compiler_minify = compiler_minify;
     cfg.opt_passes = opt_passes;
+    cfg.use_branch_jump_table = opt_target.exec.preferred_branch_method == BranchMethod::JumpTable;
     cfg.gen_lut_runtime = gen_lut_runtime;
     cfg.scratch_config = ScratchConfig {
         minify,

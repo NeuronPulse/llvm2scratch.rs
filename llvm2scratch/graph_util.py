@@ -71,19 +71,50 @@ def findNodesWithCycle(graph: dict[str, list[str]]) -> set[str]:
   self_loops = {nodes[e.tuple[0]] for e in g.es if e.tuple[0] == e.tuple[1]}
   return result | self_loops
 
-def selectCycleChecks(graph: dict[str, list[str]]) -> list[str]:
-  # TODO: if graph has a very large amount of cycles, then use findNodesWithCycle instead
+def _simpleCycles(graph: dict[str, list[str]]) -> tuple[list[str], list[list[int]]]:
+  """Enumerate all simple directed cycles.
+
+  Returns the sorted list of node names and a list of cycles, where each cycle
+  is a list of node indices.  The implementation matches the Rust reference:
+  it performs a depth-first search from every node and records every path that
+  returns to the start node.  This avoids the nondeterministic behaviour
+  observed with igraph's simple_cycles() on some edge orderings.
+  """
   nodes = sorted(graph.keys())
   node_idx = {n: i for i, n in enumerate(nodes)}
-  edges = [(node_idx[u], node_idx[v]) for u in graph for v in graph[u]]
+  cycles: list[list[int]] = []
+  path: list[str] = []
+  visited: set[str] = set()
 
-  g = ig.Graph(directed=True)
-  g.add_vertices(len(nodes))
-  g.add_edges(edges)
+  def dfs(current: str, start: str) -> None:
+    for neighbour in graph.get(current, []):
+      if neighbour == start and len(path) >= 1:
+        cycles.append([node_idx[p] for p in path])
+      elif neighbour not in visited:
+        visited.add(neighbour)
+        path.append(neighbour)
+        dfs(neighbour, start)
+        path.pop()
+        visited.remove(neighbour)
 
-  cycles = g.simple_cycles()
+  for start in nodes:
+    path = [start]
+    visited = {start}
+    dfs(start, start)
 
-  if not cycles: return []
+  return nodes, cycles
+
+
+def selectCycleChecks(graph: dict[str, list[str]]) -> list[str]:
+  # TODO: if graph has a very large amount of cycles, then use findNodesWithCycle instead
+  nodes, cycles = _simpleCycles(graph)
+
+  if not cycles:
+    scc_nodes = findNodesWithCycle(graph)
+    if scc_nodes:
+      return sorted(scc_nodes)
+    return []
+
   # Any node that can call itself must have a stack check; therefore we can ignore cycles
   # containing that node
   self_loop_nodes = {c[0] for c in cycles if len(c) == 1}
