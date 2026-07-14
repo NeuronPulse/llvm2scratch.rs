@@ -483,7 +483,12 @@ impl<'src> Lexer<'src> {
     }
 
     /// Put back a token, to be returned by the next call to `next()`.
+    /// If a token has already been peeked, it is pushed behind the newly
+    /// put-back token so that stream order is preserved.
     pub fn put_back(&mut self, tok: Result<Token, LexError>) {
+        if let Some(peeked) = self.peeked.take() {
+            self.putback.push(peeked);
+        }
         self.putback.push(tok);
     }
 

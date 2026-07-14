@@ -518,6 +518,27 @@ fn collect_fn_ptr_sigs(mod_: &DecodedModule) -> Vec<(FuncTy, Vec<String>)> {
         }
     }
 
+    // Also register signatures used by indirect call sites that do not refer
+    // to a specific function (e.g. calling a function-pointer argument).
+    for (_, func) in &mod_.functions {
+        for (_, block) in &func.blocks {
+            for instr in &block.instrs {
+                if let ir::Instr::Call(call) = instr {
+                    if !matches!(call.func, ir::Value::Function(_)) {
+                        let signature = FuncTy::new(
+                            call.return_type.clone(),
+                            call.params.clone(),
+                            call.variadic,
+                        );
+                        if !func_ptrs.iter().any(|(sig, _)| *sig == signature) {
+                            func_ptrs.push((signature, Vec::new()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func_ptrs
 }
 
@@ -3302,6 +3323,29 @@ fn trans_instr(
             }
         }
 
+        ir::Instr::UnaryOp(uop) => {
+            let operand_iv = trans_value(&uop.operand, ctx, Some(bctx))?;
+            let res_var = Variable {
+                var_name: localize_var(&uop.result.name, false, Some(&bctx.fn_info.name), false),
+                var_type: VarType::Var,
+                fn_name: None,
+            };
+
+            match uop.opcode {
+                ir::instructions::UnaryOpcode::FNeg => {
+                    let operand = operand_iv.into_single()?;
+                    blocks.add_block(res_var.set_value(
+                        Value::Op(Op::Sub(
+                            Box::new(Value::Known(KnownVal::Num(0.0))),
+                            Box::new(operand),
+                        )),
+                        VarOp::Set,
+                        None,
+                    )?);
+                }
+            }
+        }
+
         ir::Instr::ICmp(icmp) => {
             let lft_iv = trans_value(&icmp.left, ctx, Some(bctx))?;
             let rgt_iv = trans_value(&icmp.right, ctx, Some(bctx))?;
@@ -3400,16 +3444,27 @@ fn trans_instr(
                 fn_name: None,
             };
 
-            // NaN check matching Python's lexical comparison: val < "j".
+            // NaN checks matching Python's lexical comparison.
+            // In Scratch string comparison: "Infinity" < "j" < "NaN".
             let is_not_nan = |val: Value| {
                 Value::BoolOp(BoolOp::Lt(
                     Box::new(val),
                     Box::new(Value::Known(KnownVal::Str("j".to_string()))),
                 ))
             };
+            let is_nan = |val: Value| {
+                Value::BoolOp(BoolOp::Gt(
+                    Box::new(val),
+                    Box::new(Value::Known(KnownVal::Num(f64::INFINITY))),
+                ))
+            };
             let both_not_nan = Value::BoolOp(BoolOp::And(
                 Box::new(is_not_nan(lft.clone())),
                 Box::new(is_not_nan(rgt.clone())),
+            ));
+            let either_nan = Value::BoolOp(BoolOp::Or(
+                Box::new(is_nan(lft.clone())),
+                Box::new(is_nan(rgt.clone())),
             ));
             let cmp_eq = Value::BoolOp(BoolOp::Eq(Box::new(lft.clone()), Box::new(rgt.clone())));
             let cmp_gt = Value::BoolOp(BoolOp::Gt(Box::new(lft.clone()), Box::new(rgt.clone())));
@@ -3427,40 +3482,70 @@ fn trans_instr(
                 ir::instructions::FCmpCond::One => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_eq)))),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_eq.clone())))),
                     ))
                 }
                 ir::instructions::FCmpCond::Ogt => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(cmp_gt),
+                        Box::new(cmp_gt.clone()),
                     ))
                 }
                 ir::instructions::FCmpCond::Oge => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_lt)))),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_lt.clone())))),
                     ))
                 }
                 ir::instructions::FCmpCond::Olt => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(cmp_lt),
+                        Box::new(cmp_lt.clone()),
                     ))
                 }
                 ir::instructions::FCmpCond::Ole => {
                     Value::BoolOp(BoolOp::And(
                         Box::new(both_not_nan.clone()),
-                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_gt)))),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_gt.clone())))),
                     ))
                 }
                 ir::instructions::FCmpCond::Ord => both_not_nan,
-                ir::instructions::FCmpCond::Uno => {
-                    // Matches Python (returns true when neither operand is NaN).
-                    both_not_nan
+                ir::instructions::FCmpCond::Uno => either_nan.clone(),
+                ir::instructions::FCmpCond::Ueq => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(cmp_eq),
+                    ))
                 }
-                _ => {
-                    return Err(CompException(format!("Unsupported fcmp condition: {:?}", fcmp.cond)));
+                ir::instructions::FCmpCond::Une => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_eq)))),
+                    ))
+                }
+                ir::instructions::FCmpCond::Ugt => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(cmp_gt),
+                    ))
+                }
+                ir::instructions::FCmpCond::Uge => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_lt)))),
+                    ))
+                }
+                ir::instructions::FCmpCond::Ult => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(cmp_lt),
+                    ))
+                }
+                ir::instructions::FCmpCond::Ule => {
+                    Value::BoolOp(BoolOp::Or(
+                        Box::new(either_nan.clone()),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_gt)))),
+                    ))
                 }
             };
 
@@ -3532,6 +3617,7 @@ fn trans_instr(
                     Value::Op(Op::Floor(Box::new(val)))
                 }
                 ir::instructions::ConvOpcode::UIToFP => val,
+                ir::instructions::ConvOpcode::FPTrunc | ir::instructions::ConvOpcode::FPExt => val,
                 _ => return Err(CompException(format!("Unsupported conversion opcode: {:?}", conv.opcode))),
             };
 
