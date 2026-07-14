@@ -3012,15 +3012,20 @@ fn compute_must_store(
         must_store_sizes.push(size);
     }
 
-    // Sort numeric names first, then alphabetically, to match Python.
+    // Sort numeric names by numeric value first, then alphabetically, to match Python.
     let mut indexed: Vec<(Variable, usize)> = must_store.into_iter().zip(must_store_sizes.into_iter()).collect();
     indexed.sort_by(|(a, _), (b, _)| {
-        let a_numeric = a.var_name.parse::<i64>().is_ok();
-        let b_numeric = b.var_name.parse::<i64>().is_ok();
-        match (a_numeric, b_numeric) {
+        let a_is_digits = a.var_name.chars().all(|c| c.is_ascii_digit());
+        let b_is_digits = b.var_name.chars().all(|c| c.is_ascii_digit());
+        match (a_is_digits, b_is_digits) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            _ => a.var_name.cmp(&b.var_name),
+            (true, true) => {
+                let a_num: i64 = a.var_name.parse().unwrap_or(0);
+                let b_num: i64 = b.var_name.parse().unwrap_or(0);
+                a_num.cmp(&b_num)
+            }
+            (false, false) => a.var_name.cmp(&b.var_name),
         }
     });
     let mut sorted_must_store: Vec<Variable> = Vec::with_capacity(indexed.len());
