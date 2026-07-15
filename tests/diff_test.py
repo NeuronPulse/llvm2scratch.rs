@@ -21,7 +21,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
-RUST_BIN = ROOT / "target" / "debug" / "llvm2scratch"
+RUST_BIN = ROOT / "target" / "release" / "llvm2scratch"
+if not RUST_BIN.exists():
+    RUST_BIN = ROOT / "target" / "debug" / "llvm2scratch"
 LL_INPUTS = ROOT / "examples" / "input"
 
 @dataclass
