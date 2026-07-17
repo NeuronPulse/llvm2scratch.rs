@@ -453,6 +453,24 @@ fn stringify_block(block: &Block, scratchblocks: bool) -> String {
                 parts.join(" ")
             }
         }
+        Block::Pen(op) => {
+            match op {
+                PenOp::Down => "pen down".to_string(),
+                PenOp::Up => "pen up".to_string(),
+                PenOp::Clear => "clear pen".to_string(),
+                PenOp::SetColor { color } => {
+                    let c = stringify_value(color, scratchblocks);
+                    format!("set pen color to {}", c)
+                }
+                PenOp::SetSize { size } => {
+                    let s = stringify_value(size, scratchblocks);
+                    format!("set pen size to {}", s)
+                }
+            }
+        }
+        Block::MotionGoto { x, y } => {
+            format!("go to x: {} y: {}", stringify_value(x, scratchblocks), stringify_value(y, scratchblocks))
+        }
         Block::RawBlock(contents) => {
             // Raw blocks are not expected to be stringified; output a readable fallback.
             format!("// raw block: {:?}", contents)

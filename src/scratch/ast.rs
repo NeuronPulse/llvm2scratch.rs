@@ -185,6 +185,15 @@ impl Op {
         }
     }
 
+    pub fn right_opt(&self) -> Option<&Value> {
+        match self {
+            Op::Add(_, r) | Op::Sub(_, r) | Op::Mul(_, r) | Op::Div(_, r) |
+            Op::Mod(_, r) | Op::Rand(_, r) | Op::Join(_, r) | Op::LetterOf(_, r) |
+            Op::Contains(_, r) => Some(r),
+            _ => None,
+        }
+    }
+
     pub fn left_mut(&mut self) -> &mut Value {
         match self {
             Op::StrToFloat(v) | Op::BoolToFloat(v) | Op::LengthOf(v) | Op::Round(v) | Op::Not(v) |
@@ -325,6 +334,8 @@ pub enum Block {
     Ask { value: Value, var_name: Option<String> },
     EditVar(EditVarData),
     EditList(EditListData),
+    Pen(PenOp),
+    MotionGoto { x: Value, y: Value },
     ProcedureDef(ProcedureDefData),
     ProcedureCall(ProcedureCallData),
     RawBlock(HashMap<String, JsonValue>),
@@ -334,6 +345,15 @@ pub enum Block {
 pub enum VolumeOp {
     Set,
     Change,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PenOp {
+    Down,
+    Up,
+    Clear,
+    SetColor { color: Value },
+    SetSize { size: Value },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -466,6 +486,11 @@ impl Block {
 
     pub fn is_end(&self) -> bool {
         matches!(self, Block::StopScript(_))
+    }
+
+    /// Returns true if this block requires the Scratch pen extension.
+    pub fn needs_pen_extension(&self) -> bool {
+        matches!(self, Block::Pen(_))
     }
 }
 

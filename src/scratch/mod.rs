@@ -67,6 +67,7 @@ pub struct ScratchContext {
     uid_gen: UidGenerator,
     var_uid_gen: UidGenerator,
     pub exported: bool,
+    pub uses_pen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +90,7 @@ impl ScratchContext {
             uid_gen: UidGenerator::new(minify),
             var_uid_gen: UidGenerator::new(minify),
             exported: false,
+            uses_pen: false,
         }
     }
 
@@ -167,6 +169,12 @@ impl ScratchContext {
     pub fn add_block_list(&mut self, blocks: &BlockList, parent: Option<&Id>) -> Option<Id> {
         if blocks.blocks.is_empty() {
             return None;
+        }
+
+        for block in &blocks.blocks {
+            if block.needs_pen_extension() {
+                self.uses_pen = true;
+            }
         }
 
         let expanded = self.expand_for_each(blocks);
@@ -410,10 +418,10 @@ fn get_raw_block(
             raw.insert("opcode".to_string(), JsonValue::String("control_stop".to_string()));
             let stop_val = match opt {
                 StopOption::All => "all",
-                StopOption::This => "this_script",
-                StopOption::Other => "other_scripts_in_sprite",
+                StopOption::This => "this script",
+                StopOption::Other => "other scripts in sprite",
             };
-            raw.insert("fields".to_string(), serde_json::json!({"STOP": [stop_val, null]}));
+            raw.insert("fields".to_string(), serde_json::json!({"STOP_OPTION": [stop_val, null]}));
         }
         Block::EditCounter(op) => {
             if !ctx.cfg.allow_hacked_blocks {
@@ -534,6 +542,36 @@ fn get_raw_block(
         Block::ProcedureCall(_) => {
             raw.insert("opcode".to_string(), JsonValue::String("procedures_call".to_string()));
         }
+        Block::Pen(op) => {
+            ctx.uses_pen = true;
+            match op {
+                PenOp::Down => {
+                    raw.insert("opcode".to_string(), JsonValue::String("pen_penDown".to_string()));
+                }
+                PenOp::Up => {
+                    raw.insert("opcode".to_string(), JsonValue::String("pen_penUp".to_string()));
+                }
+                PenOp::Clear => {
+                    raw.insert("opcode".to_string(), JsonValue::String("pen_clear".to_string()));
+                }
+                PenOp::SetColor { color } => {
+                    raw.insert("opcode".to_string(), JsonValue::String("pen_setPenColorToColor".to_string()));
+                    let input = get_raw_value(color, my_id, ctx, ScratchCast::ToNum);
+                    raw.insert("inputs".to_string(), serde_json::json!({"COLOR": input}));
+                }
+                PenOp::SetSize { size } => {
+                    raw.insert("opcode".to_string(), JsonValue::String("pen_setPenSizeTo".to_string()));
+                    let input = get_raw_value(size, my_id, ctx, ScratchCast::ToNum);
+                    raw.insert("inputs".to_string(), serde_json::json!({"SIZE": input}));
+                }
+            }
+        }
+        Block::MotionGoto { x, y } => {
+            raw.insert("opcode".to_string(), JsonValue::String("motion_gotoxy".to_string()));
+            let x_input = get_raw_value(x, my_id, ctx, ScratchCast::ToNum);
+            let y_input = get_raw_value(y, my_id, ctx, ScratchCast::ToNum);
+            raw.insert("inputs".to_string(), serde_json::json!({"X": x_input, "Y": y_input}));
+        }
         Block::RawBlock(_) => unreachable!(),
     }
     raw
@@ -550,7 +588,11 @@ fn get_raw_value(
             let (type_id, raw) = match kv {
                 KnownVal::Str(s) => (10, JsonValue::String(s.clone())),
                 KnownVal::Num(n) => {
-                    if n.is_finite() && n.fract() == 0.0 {
+                    if n.is_nan() {
+                        (4, JsonValue::String("NaN".to_string()))
+                    } else if n.is_infinite() {
+                        (4, JsonValue::String(if *n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }))
+                    } else if n.fract() == 0.0 {
                         let int_val = *n as i64;
                         if ctx.cfg.use_hex_if_smaller && cast == ScratchCast::ToNum && int_val > 0 {
                             let base10_digits = (int_val as f64).log10().ceil() as usize;
@@ -681,9 +723,11 @@ fn get_raw_value(
                 "rand" => ("FROM", Some("TO")),
                 "join" => ("STRING1", Some("STRING2")),
                 "letter_of" => ("LETTER", Some("STRING")),
-                "length_of" | "round" | "bool_to_float" | "str_to_float" | "not" => {
+                "length_of" => ("STRING", None),
+                "round" | "bool_to_float" | "not" => {
                     if short_op == "not" { ("OPERAND", None) } else { ("NUM", None) }
                 }
+                "str_to_float" => ("NUM1", Some("NUM2")),
                 _ => if right.is_some() { ("NUM1", Some("NUM2")) } else { ("NUM", None) },
             };
 

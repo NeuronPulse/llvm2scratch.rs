@@ -94,10 +94,12 @@ pub fn export_data(ctx: &mut ScratchContext, format: Format) -> String {
 
             let stage = export_empty_sprite("", true);
 
+            let extensions = if ctx.uses_pen { vec!["pen".to_string()] } else { vec![] };
+
             let project = serde_json::json!({
                 "targets": [stage, buffer_with_comment, sprite],
                 "monitors": [],
-                "extensions": [],
+                "extensions": extensions,
                 "meta": {
                     "semver": "3.0.0",
                     "vm": "13.6.10",
@@ -154,14 +156,14 @@ fn ctx_get_raw(ctx: &mut ScratchContext) -> HashMap<String, JsonValue> {
     }
     let mut raw_vars = serde_json::Map::new();
     for (name, (id, value)) in &ctx.vars {
-        raw_vars.insert(id.clone(), serde_json::json!([name, get_raw_var_init(value)]));
+        raw_vars.insert(id.clone(), serde_json::json!([name, known_val_to_json(value)]));
     }
 
     let mut raw_lists = serde_json::Map::new();
     for (name, (id, values)) in &ctx.lists {
         let raw_vals: Vec<JsonValue> = values
             .iter()
-            .map(|v| serde_json::Value::String(get_raw_var_init(v)))
+            .map(known_val_to_json)
             .collect();
         raw_lists.insert(id.clone(), serde_json::json!([name, raw_vals]));
     }
@@ -195,23 +197,25 @@ fn ctx_get_raw(ctx: &mut ScratchContext) -> HashMap<String, JsonValue> {
     result
 }
 
-fn get_raw_var_init(val: &KnownVal) -> String {
+fn known_val_to_json(val: &KnownVal) -> JsonValue {
     match val {
-        KnownVal::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
-        KnownVal::Str(s) => s.clone(),
+        KnownVal::Bool(b) => JsonValue::String(if *b { "true".to_string() } else { "false".to_string() }),
+        KnownVal::Str(s) => JsonValue::String(s.clone()),
         KnownVal::Num(n) => {
             if n.is_infinite() && *n > 0.0 {
-                "Infinity".to_string()
+                JsonValue::String("Infinity".to_string())
             } else if n.is_infinite() && *n < 0.0 {
-                "-Infinity".to_string()
+                JsonValue::String("-Infinity".to_string())
             } else if n.is_nan() {
-                "NaN".to_string()
+                JsonValue::String("NaN".to_string())
             } else if *n == 0.0 && n.is_sign_negative() {
-                "-0".to_string()
+                // Scratch variables cannot represent -0.0; store as a string
+                // so the value round-trips correctly.
+                JsonValue::String("-0".to_string())
             } else if n.fract() == 0.0 {
-                (*n as i64).to_string()
+                JsonValue::Number((*n as i64).into())
             } else {
-                n.to_string()
+                serde_json::json!(*n)
             }
         }
     }
@@ -267,13 +271,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_raw_var_init() {
-        assert_eq!(get_raw_var_init(&KnownVal::Num(0.0)), "0");
-        assert_eq!(get_raw_var_init(&KnownVal::Num(-0.0)), "-0");
-        assert_eq!(get_raw_var_init(&KnownVal::Num(42.0)), "42");
-        assert_eq!(get_raw_var_init(&KnownVal::Bool(true)), "true");
-        assert_eq!(get_raw_var_init(&KnownVal::Bool(false)), "false");
-        assert_eq!(get_raw_var_init(&KnownVal::Str("hello".to_string())), "hello");
+    fn test_known_val_to_json() {
+        assert_eq!(known_val_to_json(&KnownVal::Num(0.0)), JsonValue::Number(0.into()));
+        assert_eq!(known_val_to_json(&KnownVal::Num(-0.0)), JsonValue::String("-0".to_string()));
+        assert_eq!(known_val_to_json(&KnownVal::Num(42.0)), JsonValue::Number(42.into()));
+        assert_eq!(known_val_to_json(&KnownVal::Bool(true)), JsonValue::String("true".to_string()));
+        assert_eq!(known_val_to_json(&KnownVal::Bool(false)), JsonValue::String("false".to_string()));
+        assert_eq!(known_val_to_json(&KnownVal::Str("hello".to_string())), JsonValue::String("hello".to_string()));
     }
 
     #[test]
