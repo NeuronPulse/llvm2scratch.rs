@@ -27,7 +27,7 @@ def main():
   if not os.path.exists("./output"):
     os.mkdir("output")
 
-  subprocess.run([cc, "-S", "-m32", f"-O{args.optlevel}", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", "sb3api.h", args.input, "-o", os.path.join(script_dir, OUTPUT_IR)],
+  subprocess.run([cc, "-S", "-m32", f"-O{args.optlevel}", "-fno-vectorize", "-fno-slp-vectorize", "-emit-llvm", "-I", ".", args.input, "-o", os.path.join(script_dir, OUTPUT_IR)],
                  cwd=os.path.join(script_dir, "input"))
 
   with open(OUTPUT_IR, "r") as file:
