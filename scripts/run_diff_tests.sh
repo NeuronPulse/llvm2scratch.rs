@@ -54,8 +54,10 @@ run_step() {
 cd "$REPO_ROOT"
 
 # 1. Python unit tests
-run_step "Python unit tests" \
+run_step "Python unit tests (compiler)" \
   python -m unittest llvm2scratch.tests.test_compiler
+run_step "Python unit tests (parser)" \
+  python -m unittest llvm2scratch.tests.test_parser
 
 # 2. SB3 structural diff on examples/input/
 run_step "SB3 structural diff" \
