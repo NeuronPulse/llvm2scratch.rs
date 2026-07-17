@@ -1075,6 +1075,8 @@ impl<'src> Parser<'src> {
             }
             Token::Kw(Keyword::Or) => {
                 self.lex.next()?;
+                // LLVM 15+ may annotate `or` with `disjoint`; ignore it.
+                let _ = self.lex.eat_kw(Keyword::Disjoint);
                 let (lhs, ty) = self.parse_typed_value()?;
                 self.lex.expect(&Token::Comma)?;
                 let rhs = self.parse_value(ty)?;
@@ -1342,6 +1344,11 @@ impl<'src> Parser<'src> {
             }
             Token::Kw(Keyword::Uitofp) => {
                 self.lex.next()?;
+                // LLVM 19 may emit an optional `nneg` attribute on integer-to-
+                // float casts. We parse and ignore it.
+                if *self.lex.peek()? == Token::Kw(Keyword::Nneg) {
+                    self.lex.next()?;
+                }
                 let (val, _) = self.parse_typed_value()?;
                 self.lex.expect_kw(&Keyword::To)?;
                 let to = self.parse_type()?;
@@ -1349,6 +1356,9 @@ impl<'src> Parser<'src> {
             }
             Token::Kw(Keyword::Sitofp) => {
                 self.lex.next()?;
+                if *self.lex.peek()? == Token::Kw(Keyword::Nneg) {
+                    self.lex.next()?;
+                }
                 let (val, _) = self.parse_typed_value()?;
                 self.lex.expect_kw(&Keyword::To)?;
                 let to = self.parse_type()?;
@@ -1519,6 +1529,27 @@ impl<'src> Parser<'src> {
                 self.lex.expect_kw(&Keyword::Call)?;
                 // Optional fast-math flags.
                 let _fmf = self.parse_fast_math_flags();
+                // Optional calling convention (fastcc, etc.) — skip.
+                if matches!(self.lex.peek()?, Token::Kw(Keyword::Fastcc)) {
+                    self.lex.next()?;
+                }
+                // Optional return attributes (noundef, etc.) — skip.
+                loop {
+                    match self.lex.peek()? {
+                        Token::Kw(Keyword::Noundef)
+                        | Token::Kw(Keyword::Nonnull)
+                        | Token::Kw(Keyword::Signext)
+                        | Token::Kw(Keyword::Zeroext)
+                        | Token::Kw(Keyword::Noalias)
+                        | Token::Kw(Keyword::Nocapture)
+                        | Token::Kw(Keyword::Readnone)
+                        | Token::Kw(Keyword::Readonly)
+                        | Token::Kw(Keyword::Writeonly) => {
+                            self.lex.next()?;
+                        }
+                        _ => break,
+                    }
+                }
                 // Return type.
                 let ret_ty = self.parse_type()?;
                 // Optional explicit function type signature, e.g. `double (i32, ...)`.
@@ -1681,8 +1712,16 @@ impl<'src> Parser<'src> {
                 | Token::Kw(Keyword::Declare)
                 | Token::GlobalIdent(_)
                 | Token::Bang => break,
-                // `noundef` is already a keyword — skip it.
-                Token::Kw(Keyword::Noundef) => {
+                // Attribute keywords that can appear before a parameter value.
+                Token::Kw(Keyword::Noundef)
+                | Token::Kw(Keyword::Nonnull)
+                | Token::Kw(Keyword::Signext)
+                | Token::Kw(Keyword::Zeroext)
+                | Token::Kw(Keyword::Noalias)
+                | Token::Kw(Keyword::Nocapture)
+                | Token::Kw(Keyword::Readnone)
+                | Token::Kw(Keyword::Readonly)
+                | Token::Kw(Keyword::Writeonly) => {
                     self.lex.next()?;
                 }
                 Token::Kw(Keyword::Align) => {
@@ -2244,7 +2283,8 @@ impl<'src> Parser<'src> {
                 // Attribute keywords (noundef, etc.) — skip.
                 Token::Kw(Keyword::Noundef)
                 | Token::Kw(Keyword::UnnamedAddr)
-                | Token::Kw(Keyword::DsoLocal) => {
+                | Token::Kw(Keyword::DsoLocal)
+                | Token::Kw(Keyword::Fastcc) => {
                     self.lex.next()?;
                 }
                 // Linkage keywords already consumed.
@@ -2734,6 +2774,7 @@ impl<'src> Parser<'src> {
             Keyword::Exact => "exact",
             Keyword::Nuw => "nuw",
             Keyword::Nsw => "nsw",
+            Keyword::Disjoint => "disjoint",
             Keyword::Volatile => "volatile",
             Keyword::Tail => "tail",
             Keyword::Musttail => "musttail",
@@ -2780,6 +2821,7 @@ impl<'src> Parser<'src> {
             Keyword::Fptosi => "fptosi",
             Keyword::Uitofp => "uitofp",
             Keyword::Sitofp => "sitofp",
+            Keyword::Nneg => "nneg",
             Keyword::Ptrtoint => "ptrtoint",
             Keyword::Inttoptr => "inttoptr",
             Keyword::Bitcast => "bitcast",
@@ -2828,8 +2870,17 @@ impl<'src> Parser<'src> {
             Keyword::X => "x",
             Keyword::Vscale => "vscale",
             Keyword::Noundef => "noundef",
+            Keyword::Nonnull => "nonnull",
+            Keyword::Signext => "signext",
+            Keyword::Zeroext => "zeroext",
+            Keyword::Noalias => "noalias",
+            Keyword::Nocapture => "nocapture",
+            Keyword::Readnone => "readnone",
+            Keyword::Readonly => "readonly",
+            Keyword::Writeonly => "writeonly",
             Keyword::UnnamedAddr => "unnamed_addr",
             Keyword::DsoLocal => "dso_local",
+            Keyword::Fastcc => "fastcc",
             Keyword::Attributes => "attributes",
         }
     }

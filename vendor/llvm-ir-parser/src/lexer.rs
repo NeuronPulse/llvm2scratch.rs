@@ -82,6 +82,8 @@ pub enum Keyword {
     Nuw,
     /// `Nsw` variant.
     Nsw,
+    /// `Disjoint` variant (LLVM 15+ bitwise OR attribute).
+    Disjoint,
     /// `Volatile` variant.
     Volatile,
     /// `Tail` variant.
@@ -176,6 +178,8 @@ pub enum Keyword {
     Uitofp,
     /// `Sitofp` variant.
     Sitofp,
+    /// `Nneg` variant (LLVM non-negative cast attribute).
+    Nneg,
     /// `Ptrtoint` variant.
     Ptrtoint,
     /// `Inttoptr` variant.
@@ -271,10 +275,28 @@ pub enum Keyword {
     Align,
     /// `Noundef` variant.
     Noundef,
+    /// `Nonnull` variant.
+    Nonnull,
+    /// `Signext` variant.
+    Signext,
+    /// `Zeroext` variant.
+    Zeroext,
+    /// `Noalias` variant.
+    Noalias,
+    /// `Nocapture` variant.
+    Nocapture,
+    /// `Readnone` variant.
+    Readnone,
+    /// `Readonly` variant.
+    Readonly,
+    /// `Writeonly` variant.
+    Writeonly,
     /// `UnnamedAddr` variant.
     UnnamedAddr,
     /// `DsoLocal` variant.
     DsoLocal,
+    /// `Fastcc` variant.
+    Fastcc,
     /// `To` variant.
     To,
     /// `X` variant.
@@ -937,6 +959,7 @@ impl<'src> Lexer<'src> {
             "exact" => Keyword::Exact,
             "nuw" => Keyword::Nuw,
             "nsw" => Keyword::Nsw,
+            "disjoint" => Keyword::Disjoint,
             "volatile" => Keyword::Volatile,
             "tail" => Keyword::Tail,
             "musttail" => Keyword::Musttail,
@@ -983,6 +1006,7 @@ impl<'src> Lexer<'src> {
             "fptosi" => Keyword::Fptosi,
             "uitofp" => Keyword::Uitofp,
             "sitofp" => Keyword::Sitofp,
+            "nneg" => Keyword::Nneg,
             "ptrtoint" => Keyword::Ptrtoint,
             "inttoptr" => Keyword::Inttoptr,
             "bitcast" => Keyword::Bitcast,
@@ -1028,8 +1052,17 @@ impl<'src> Lexer<'src> {
             "null" => Keyword::Null,
             "align" => Keyword::Align,
             "noundef" => Keyword::Noundef,
+            "nonnull" => Keyword::Nonnull,
+            "signext" => Keyword::Signext,
+            "zeroext" => Keyword::Zeroext,
+            "noalias" => Keyword::Noalias,
+            "nocapture" => Keyword::Nocapture,
+            "readnone" => Keyword::Readnone,
+            "readonly" => Keyword::Readonly,
+            "writeonly" => Keyword::Writeonly,
             "unnamed_addr" => Keyword::UnnamedAddr,
             "dso_local" => Keyword::DsoLocal,
+            "fastcc" => Keyword::Fastcc,
             "to" => Keyword::To,
             "x" => Keyword::X,
             "vscale" => Keyword::Vscale,

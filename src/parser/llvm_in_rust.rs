@@ -36,26 +36,23 @@ pub fn convert_module(
 
     let mut functions = IndexMap::new();
     for func in &module.functions {
-        if func.is_declaration {
-            continue;
-        }
         let (return_type, _params, variadic) = extract_fn_type(func.ty, ctx);
+        let intrinsic = Intrinsic::from_name(&func.name);
 
         let mut blocks = IndexMap::new();
-        let mut block_names = Vec::new();
-        for block in &func.blocks {
-            block_names.push(block.name.clone());
-            let mut instrs = Vec::new();
-            for instr_id in block.instrs() {
-                let instr = func.instr(instr_id);
-                instrs.push(convert_instr(instr, ctx, func, &func_names, module));
+        if !func.is_declaration {
+            for block in &func.blocks {
+                let mut instrs = Vec::new();
+                for instr_id in block.instrs() {
+                    let instr = func.instr(instr_id);
+                    instrs.push(convert_instr(instr, ctx, func, &func_names, module));
+                }
+                blocks.insert(block.name.clone(), Block {
+                    label: block.name.clone(),
+                    instrs,
+                });
             }
-            blocks.insert(block.name.clone(), Block {
-                label: block.name.clone(),
-                instrs,
-            });
         }
-        let intrinsic = Intrinsic::from_name(&func.name);
 
         functions.insert(func.name.clone(), Function {
             name: func.name.clone(),
