@@ -738,6 +738,7 @@ pub fn known_value_propagation_block(
                                     else_body: cf.else_body.clone(),
                                 };
                                 new_blocklist.add_block(Block::ControlFlow(new_cf));
+                                did_opti_total |= did_opti;
                                 break;
                             } else {
                                 add_block = false;
