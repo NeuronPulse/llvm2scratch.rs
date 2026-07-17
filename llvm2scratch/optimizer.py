@@ -440,6 +440,8 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
       return {"costume:"}, Counter()
     case sb3.Op() | sb3.BoolOp():
       depends, counts = getValueVarUse(value.left)
+      depends = set(depends)  # copy to avoid corrupting cache
+      counts = Counter(counts)  # copy to avoid corrupting cache
       if value.right is not None:
         new_depends, new_counts = getValueVarUse(value.right)
         depends.update(new_depends)
@@ -451,7 +453,7 @@ def getValueVarUse(value: sb3.Value) -> tuple[set[str], Counter[str]]:
       result = {"list:" + value.list_name}, Counter()
     case sb3.GetOfList():
       use, counts = getValueVarUse(value.value)
-      result = {"list:" + value.list_name} | use, counts
+      result = {"list:" + value.list_name} | use, Counter(counts)  # copy counts to avoid corrupting cache
     case _:
       raise OptimizerException(f"Unknown value type {type(value)}")
 

@@ -5,11 +5,11 @@ use std::process;
 
 use clap::builder::PossibleValuesParser;
 
-use llvm2scratch::compiler::config::CompilerConfig;
+use llvm2scratch::compiler::config::{CompilerConfig, BINOP_LOOKUP_BITS, VARIABLE_MAX_BITS};
 use llvm2scratch::compiler::translate;
 use llvm2scratch::target::BranchMethod;
 use llvm2scratch::optimizer::Optimization;
-use llvm2scratch::scratch::ast::{Format, ScratchConfig};
+use llvm2scratch::scratch::ast::{Format, KnownVal, ScratchConfig, Value};
 use llvm2scratch::scratch::export::export_scratch_file;
 use llvm2scratch::scratch::{Project, ScratchContext};
 use llvm2scratch::target::loader::get_target;
@@ -403,7 +403,7 @@ fn main() {
     };
 
     let compiler_cfg = cfg.clone();
-    let mut proj = match translate::compile(&llvm_ir, Some(cfg)) {
+    let (mut proj, highest_return_size, functions) = match translate::compile(&llvm_ir, Some(cfg)) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Compilation error: {}", e);
@@ -411,17 +411,100 @@ fn main() {
         }
     };
 
-    if !no_optimize && !compiler_cfg.opt_passes.is_empty() {
+    let optimization_enabled = !no_optimize && !compiler_cfg.opt_passes.is_empty();
+
+    if optimization_enabled {
         let mut dont_remove = HashSet::new();
         dont_remove.insert(compiler_cfg.return_var.clone());
         dont_remove.insert(compiler_cfg.jump_table_id_var.clone());
+        // Mirror Python: protect indexed return value slots up to
+        // highest_return_size. Variables like "!return value:1" that are
+        // beyond this range are NOT protected and can be elided if unused.
+        if let Some(size) = highest_return_size {
+            for i in 0..size {
+                dont_remove.insert(format!("{}:{}", compiler_cfg.return_var, i));
+            }
+        }
+
+        let mut ignore_external_change = HashSet::new();
+        ignore_external_change.insert(compiler_cfg.stack_pointer_var.clone());
+
+        // Build the list_lookup closure (mirrors Python's `tableLookup`).
+        let mem_var = compiler_cfg.mem_var.clone();
+        let and_table = format!("!AND lookup{}", compiler_cfg.zero_indexed_suffix);
+        let or_table = format!("!OR lookup{}", compiler_cfg.zero_indexed_suffix);
+        let xor_table = format!("!XOR lookup{}", compiler_cfg.zero_indexed_suffix);
+        let pow2_table = compiler_cfg.pow2_lookup_var.clone();
+        let pow2_offset = (VARIABLE_MAX_BITS + 1) as f64;
+        let list_lookup = move |table_name: &str, index_val: &Value| -> Option<Value> {
+            if table_name == mem_var {
+                return None;
+            }
+            // Scratch always floors indices. `scratchCastToNum` semantics:
+            // NaN -> 0.0, parse failure -> 0.0.
+            let index = match index_val {
+                Value::Known(KnownVal::Num(n)) => *n,
+                Value::Known(KnownVal::Str(s)) => s.parse::<f64>().unwrap_or(0.0),
+                Value::Known(KnownVal::Bool(b)) => if *b { 1.0 } else { 0.0 },
+                Value::KnownBool(b) => if *b { 1.0 } else { 0.0 },
+                _ => return None,
+            };
+            let index = index.floor();
+
+            if table_name == and_table || table_name == or_table || table_name == xor_table {
+                let lft = (index as i64) >> BINOP_LOOKUP_BITS;
+                let rgt = (index as i64) & ((1i64 << BINOP_LOOKUP_BITS) - 1);
+                let result = if table_name == and_table {
+                    lft & rgt
+                } else if table_name == or_table {
+                    lft | rgt
+                } else {
+                    lft ^ rgt
+                };
+                return Some(Value::Known(KnownVal::Num(result as f64)));
+            }
+
+            if table_name == pow2_table {
+                let power = index - pow2_offset;
+                return Some(Value::Known(KnownVal::Num(2f64.powf(power))));
+            }
+
+            None
+        };
+
+        // First optimization pass (before post_opt_transform).
+        // Matches Python: ctx = optimize(ctx)
         proj = llvm2scratch::optimizer::optimize(
             &proj,
-            &compiler_cfg.targets,
+            &compiler_cfg.opt_target,
             100,
-            Some(dont_remove),
+            Some(dont_remove.clone()),
+            Some(ignore_external_change.clone()),
+            Some(&list_lookup),
             &compiler_cfg.opt_passes,
         );
+
+        // Post-optimization transform: merge basic block procedures into
+        // branch jump table forever blocks. Matches Python: postOptTransform
+        let did_transform = translate::post_opt_transform(&mut proj, &functions, &compiler_cfg);
+
+        // Second optimization pass (after post_opt_transform), only if
+        // transform did anything. Matches Python: if did_transform: optimize
+        if did_transform {
+            proj = llvm2scratch::optimizer::optimize(
+                &proj,
+                &compiler_cfg.opt_target,
+                100,
+                Some(dont_remove),
+                Some(ignore_external_change),
+                Some(&list_lookup),
+                &compiler_cfg.opt_passes,
+            );
+        }
+    } else {
+        // Even without optimization, still run post_opt_transform to create
+        // the branch jump table forever blocks.
+        translate::post_opt_transform(&mut proj, &functions, &compiler_cfg);
     }
 
     if let Some(path) = matches.get_one::<String>("debug-scratch-text") {

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use crate::scratch::{Block, BlockList, Project, Value};
-use crate::scratch::ast::{ControlOp, KnownVal, ListOp, VarOp};
+use crate::scratch::ast::{BoolOp, ControlOp, CostumeInfoOp, KnownVal, ListOp, Op, PenOp, VarOp};
 use crate::target::{Target, TargetPerf};
 
 use super::BlockListInfo;
@@ -30,6 +30,37 @@ fn collect_value_var_use(value: &Value, reads: &mut HashSet<String>) {
         }
         Value::GetOfList(gol) => {
             collect_value_var_use(&gol.value, reads);
+        }
+        Value::Known(_) | Value::KnownBool(_) | Value::GetParam { .. } |
+        Value::GetList { .. } | Value::GetListLength { .. } |
+        Value::CostumeInfo { .. } | Value::GetCounter | Value::GetAnswer | Value::DaysSince2000 => {}
+    }
+}
+
+/// Like `get_value_var_use` but returns a count per variable (matching Python's
+/// `getValueVarUse` Counter semantics). A variable used N times in the same
+/// expression gets count N, not 1.
+fn get_value_var_use_counts(value: &Value) -> HashMap<String, f64> {
+    let mut counts: HashMap<String, f64> = HashMap::new();
+    collect_value_var_use_counts(value, &mut counts);
+    counts
+}
+
+fn collect_value_var_use_counts(value: &Value, counts: &mut HashMap<String, f64>) {
+    match value {
+        Value::GetVar { name } => {
+            *counts.entry(name.clone()).or_insert(0.0) += 1.0;
+        }
+        Value::Op(op) => {
+            collect_value_var_use_counts(op.left(), counts);
+            collect_value_var_use_counts(op.right(), counts);
+        }
+        Value::BoolOp(bop) => {
+            collect_value_var_use_counts(bop.left(), counts);
+            collect_value_var_use_counts(bop.right(), counts);
+        }
+        Value::GetOfList(gol) => {
+            collect_value_var_use_counts(&gol.value, counts);
         }
         Value::Known(_) | Value::KnownBool(_) | Value::GetParam { .. } |
         Value::GetList { .. } | Value::GetListLength { .. } |
@@ -66,16 +97,16 @@ pub fn get_blocklist_var_use(
 ) -> HashMap<String, f64> {
     let mut times_used: HashMap<String, f64> = HashMap::new();
 
-    fn add_reads(times: &mut HashMap<String, f64>, reads: HashSet<String>, multiplier: f64) {
-        for var in reads {
-            *times.entry(var).or_insert(0.0) += multiplier;
+    fn add_reads(times: &mut HashMap<String, f64>, reads: HashMap<String, f64>, multiplier: f64) {
+        for (var, count) in reads {
+            *times.entry(var).or_insert(0.0) += count * multiplier;
         }
     }
 
     for block in &blocklist.blocks {
         match block {
             Block::EditVar(data) => {
-                add_reads(&mut times_used, get_value_var_use(&data.value), 1.0);
+                add_reads(&mut times_used, get_value_var_use_counts(&data.value), 1.0);
                 if data.op != VarOp::Set {
                     *times_used.entry(data.name.clone()).or_insert(0.0) += 1.0;
                 }
@@ -85,17 +116,17 @@ pub fn get_blocklist_var_use(
             | Block::EditVolume { value, .. }
             | Block::Broadcast { value, .. }
             | Block::Wait { value } => {
-                add_reads(&mut times_used, get_value_var_use(value), 1.0);
+                add_reads(&mut times_used, get_value_var_use_counts(value), 1.0);
             }
             Block::Ask { value, .. } => {
-                add_reads(&mut times_used, get_value_var_use(value), 1.0);
+                add_reads(&mut times_used, get_value_var_use_counts(value), 1.0);
             }
             Block::EditList(data) => {
                 if let Some(idx) = &data.index {
-                    add_reads(&mut times_used, get_value_var_use(idx), 1.0);
+                    add_reads(&mut times_used, get_value_var_use_counts(idx), 1.0);
                 }
                 if let Some(val) = &data.value {
-                    add_reads(&mut times_used, get_value_var_use(val), 1.0);
+                    add_reads(&mut times_used, get_value_var_use_counts(val), 1.0);
                 }
             }
             Block::ControlFlow(cf) => {
@@ -104,7 +135,7 @@ pub fn get_blocklist_var_use(
                         ControlOp::Until | ControlOp::While | ControlOp::Forever => LOOP_USE_MULTIPLIER,
                         _ => 1.0,
                     };
-                    add_reads(&mut times_used, get_value_var_use(cond), cond_mult);
+                    add_reads(&mut times_used, get_value_var_use_counts(cond), cond_mult);
                 }
                 if cf.op == ControlOp::ForEach {
                     if let Some(var) = &cf.var {
@@ -138,7 +169,7 @@ pub fn get_blocklist_var_use(
             Block::ProcedureDef(_) => {}
             Block::ProcedureCall(data) => {
                 for arg in &data.args {
-                    add_reads(&mut times_used, get_value_var_use(arg), 1.0);
+                    add_reads(&mut times_used, get_value_var_use_counts(arg), 1.0);
                 }
                 if let Some(info) = func_info
                     && let Some(bli) = info.get(&data.name) {
@@ -146,6 +177,21 @@ pub fn get_blocklist_var_use(
                             *times_used.entry(var.clone()).or_insert(0.0) += count;
                         }
                     }
+            }
+            Block::Pen(pen_op) => {
+                match pen_op {
+                    PenOp::SetColor { color } => {
+                        add_reads(&mut times_used, get_value_var_use_counts(color), 1.0);
+                    }
+                    PenOp::SetSize { size } => {
+                        add_reads(&mut times_used, get_value_var_use_counts(size), 1.0);
+                    }
+                    _ => {}
+                }
+            }
+            Block::MotionGoto { x, y } => {
+                add_reads(&mut times_used, get_value_var_use_counts(x), 1.0);
+                add_reads(&mut times_used, get_value_var_use_counts(y), 1.0);
             }
             _ => {}
         }
@@ -228,17 +274,29 @@ fn collect_blocklist_modifications(blocklist: &BlockList, mods: &mut HashSet<Str
 
 /// Collect variable names (without the "var:" prefix) that a blocklist depends on or modifies.
 /// This mirrors the information Python uses to populate `cannot_elide` from other functions.
+///
+/// Input reads are filtered by `mods` (matching Python's
+/// `info.dependent |= all_value_dependent - info.always_modify`): a variable
+/// that has already been (always) modified before a read is NOT counted as a
+/// dependency. This is critical for correctness: e.g. if `fib:6` does
+/// `set %fib:7 ...; fib(%fib:7)`, the read of `%fib:7` in the `fib()` call is
+/// filtered because `%fib:7` was set earlier, so `fn_deps["func:fib:6"]` does
+/// NOT include `%fib:7`. Without this filtering, `fn_deps["func:fib"]` would
+/// transitively include `%fib:7`, causing the elision loop to think `fib()`
+/// reads `%fib:7` in its body, preventing elision of `%fib:7`.
 fn collect_blocklist_var_names(
     blocklist: &BlockList,
     deps: &mut HashSet<String>,
     mods: &mut HashSet<String>,
 ) {
-    fn add_var_deps(value: &Value, deps: &mut HashSet<String>) {
+    fn add_var_deps(value: &Value, deps: &mut HashSet<String>, mods: &HashSet<String>) {
         let mut d = HashSet::new();
         collect_value_dependencies(value, &mut d);
         for dep in d {
             if let Some(stripped) = dep.strip_prefix("var:") {
-                deps.insert(stripped.to_string());
+                if !mods.contains(stripped) {
+                    deps.insert(stripped.to_string());
+                }
             }
         }
     }
@@ -246,21 +304,21 @@ fn collect_blocklist_var_names(
     for block in &blocklist.blocks {
         match block {
             Block::EditVar(data) => {
-                add_var_deps(&data.value, deps);
-                mods.insert(data.name.clone());
-                if data.op != VarOp::Set {
+                add_var_deps(&data.value, deps, mods);
+                if data.op != VarOp::Set && !mods.contains(&data.name) {
                     deps.insert(data.name.clone());
                 }
+                mods.insert(data.name.clone());
             }
             Block::Say { value }
             | Block::SwitchCostume { value }
             | Block::EditVolume { value, .. }
             | Block::Broadcast { value, .. }
             | Block::Wait { value } => {
-                add_var_deps(value, deps);
+                add_var_deps(value, deps, mods);
             }
             Block::Ask { value, var_name } => {
-                add_var_deps(value, deps);
+                add_var_deps(value, deps, mods);
                 if let Some(name) = var_name {
                     mods.insert(name.clone());
                     deps.insert(name.clone());
@@ -268,15 +326,15 @@ fn collect_blocklist_var_names(
             }
             Block::EditList(data) => {
                 if let Some(idx) = &data.index {
-                    add_var_deps(idx, deps);
+                    add_var_deps(idx, deps, mods);
                 }
                 if let Some(val) = &data.value {
-                    add_var_deps(val, deps);
+                    add_var_deps(val, deps, mods);
                 }
             }
             Block::ControlFlow(cf) => {
                 if let Some(cond) = &cf.condition {
-                    add_var_deps(cond, deps);
+                    add_var_deps(cond, deps, mods);
                 }
                 if let Some(body) = &cf.body {
                     collect_blocklist_var_names(body, deps, mods);
@@ -287,7 +345,217 @@ fn collect_blocklist_var_names(
             }
             Block::ProcedureCall(data) => {
                 for arg in &data.args {
-                    add_var_deps(arg, deps);
+                    add_var_deps(arg, deps, mods);
+                }
+            }
+            Block::Pen(pen_op) => {
+                match pen_op {
+                    PenOp::SetColor { color } => {
+                        add_var_deps(color, deps, mods);
+                    }
+                    PenOp::SetSize { size } => {
+                        add_var_deps(size, deps, mods);
+                    }
+                    _ => {}
+                }
+            }
+            Block::MotionGoto { x, y } => {
+                add_var_deps(x, deps, mods);
+                add_var_deps(y, deps, mods);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect variable names (without "var:" prefix) that a block reads.
+/// This mirrors Python's `use.dependent` for a single block, used by the
+/// `changed_but_unread` logic to detect whether a variable is read after its
+/// dependencies have been modified.
+fn block_variable_reads(block: &Block) -> HashSet<String> {
+    let mut reads = HashSet::new();
+    collect_block_reads(block, &mut reads);
+    reads
+}
+
+fn collect_block_reads(block: &Block, reads: &mut HashSet<String>) {
+    match block {
+        Block::EditVar(data) => {
+            collect_value_var_use(&data.value, reads);
+            // For "change" op, the variable itself is also read (old value).
+            if data.op != VarOp::Set {
+                reads.insert(data.name.clone());
+            }
+        }
+        Block::Say { value }
+        | Block::SwitchCostume { value }
+        | Block::EditVolume { value, .. }
+        | Block::Broadcast { value, .. }
+        | Block::Wait { value } => {
+            collect_value_var_use(value, reads);
+        }
+        Block::Ask { value, .. } => {
+            collect_value_var_use(value, reads);
+        }
+        Block::EditList(data) => {
+            if let Some(idx) = &data.index {
+                collect_value_var_use(idx, reads);
+            }
+            if let Some(val) = &data.value {
+                collect_value_var_use(val, reads);
+            }
+        }
+        Block::ControlFlow(cf) => {
+            if let Some(cond) = &cf.condition {
+                collect_value_var_use(cond, reads);
+            }
+            // ForEach var is written per-iteration, not read at the control level.
+            if let Some(body) = &cf.body {
+                collect_blocklist_reads(body, reads);
+            }
+            if let Some(else_body) = &cf.else_body {
+                collect_blocklist_reads(else_body, reads);
+            }
+        }
+        Block::ProcedureCall(data) => {
+            for arg in &data.args {
+                collect_value_var_use(arg, reads);
+            }
+            // Note: callee body reads are not included here. Variables read by
+            // callees are already in `cannot_elide` (via other functions' info),
+            // preventing them from entering `to_elide` in the first place.
+        }
+        Block::Pen(pen_op) => {
+            match pen_op {
+                PenOp::SetColor { color } => {
+                    collect_value_var_use(color, reads);
+                }
+                PenOp::SetSize { size } => {
+                    collect_value_var_use(size, reads);
+                }
+                _ => {}
+            }
+        }
+        Block::MotionGoto { x, y } => {
+            collect_value_var_use(x, reads);
+            collect_value_var_use(y, reads);
+        }
+        _ => {}
+    }
+}
+
+fn collect_blocklist_reads(blocklist: &BlockList, reads: &mut HashSet<String>) {
+    for block in &blocklist.blocks {
+        collect_block_reads(block, reads);
+    }
+}
+
+/// Combined variable reads: includes both direct input reads (condition for
+/// ControlFlow, arguments for ProcedureCall, message for Broadcast) and body
+/// reads (body blocks / callee transitive deps). Used for the
+/// `changed_but_unread` removal check — a variable read anywhere in the block
+/// (inputs or body) after its dependency was modified cannot be elided.
+///
+/// `is_ending` propagates to ControlFlow bodies and controls callee dep
+/// inclusion for ending ProcedureCall/Broadcast (same semantics as
+/// `block_modifications_with_callees`).
+fn block_variable_reads_combined(
+    block: &Block,
+    callee_deps: &HashMap<String, HashSet<String>>,
+    is_ending: bool,
+) -> HashSet<String> {
+    let mut reads = block_variable_reads(block);
+    // For ProcedureCall/Broadcast, also include the callee's transitive
+    // variable reads (body reads) — but only if not an ending call.
+    // For ControlFlow, the body reads are already included by
+    // `block_variable_reads` (via `collect_blocklist_reads`), but that
+    // function doesn't include callee deps for nested ProcedureCalls.
+    // We need to add callee deps for non-ending nested calls too.
+    match block {
+        Block::ProcedureCall(data) => {
+            if !is_ending {
+                let key = format!("func:{}", data.name);
+                if let Some(deps) = callee_deps.get(&key) {
+                    for dep in deps {
+                        reads.insert(dep.clone());
+                    }
+                }
+            }
+        }
+        Block::Broadcast { value, .. } => {
+            if !is_ending {
+                if let Value::Known(KnownVal::Str(s)) = value {
+                    let key = format!("broadcast:{}", s);
+                    if let Some(deps) = callee_deps.get(&key) {
+                        for dep in deps {
+                            reads.insert(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Block::ControlFlow(cf) => {
+            // Add callee deps from nested non-ending ProcedureCalls in the body.
+            let body_is_ending = match cf.op {
+                ControlOp::If | ControlOp::IfElse => is_ending,
+                _ => false,
+            };
+            if let Some(body) = &cf.body {
+                collect_blocklist_reads_combined(body, &mut reads, callee_deps, body_is_ending);
+            }
+            if let Some(else_body) = &cf.else_body {
+                collect_blocklist_reads_combined(else_body, &mut reads, callee_deps, body_is_ending);
+            }
+        }
+        _ => {}
+    }
+    reads
+}
+
+/// Helper: collect callee deps from a blocklist, respecting is_ending.
+fn collect_blocklist_reads_combined(
+    blocklist: &BlockList,
+    reads: &mut HashSet<String>,
+    callee_deps: &HashMap<String, HashSet<String>>,
+    is_ending_blocklist: bool,
+) {
+    for (i, block) in blocklist.blocks.iter().enumerate() {
+        let is_end_of_blocklist = i == blocklist.blocks.len() - 1;
+        let is_ending = (is_end_of_blocklist && is_ending_blocklist)
+            || matches!(blocklist.blocks.get(i + 1), Some(Block::StopScript(crate::scratch::ast::StopOption::This)));
+        match block {
+            Block::ProcedureCall(data) => {
+                if !is_ending {
+                    let key = format!("func:{}", data.name);
+                    if let Some(deps) = callee_deps.get(&key) {
+                        for dep in deps {
+                            reads.insert(dep.clone());
+                        }
+                    }
+                }
+            }
+            Block::Broadcast { value, .. } => {
+                if !is_ending {
+                    if let Value::Known(KnownVal::Str(s)) = value {
+                        let key = format!("broadcast:{}", s);
+                        if let Some(deps) = callee_deps.get(&key) {
+                            for dep in deps {
+                                reads.insert(dep.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Block::ControlFlow(cf) => {
+                let body_is_ending = match cf.op {
+                    ControlOp::If | ControlOp::IfElse => is_ending,
+                    _ => false,
+                };
+                if let Some(body) = &cf.body {
+                    collect_blocklist_reads_combined(body, reads, callee_deps, body_is_ending);
+                }
+                if let Some(else_body) = &cf.else_body {
+                    collect_blocklist_reads_combined(else_body, reads, callee_deps, body_is_ending);
                 }
             }
             _ => {}
@@ -295,26 +563,272 @@ fn collect_blocklist_var_names(
     }
 }
 
-fn block_modifications(block: &Block) -> HashSet<String> {
+/// Body-only variable reads: excludes direct input reads (condition for
+/// ControlFlow, arguments for ProcedureCall, message for Broadcast). This
+/// mirrors Python's two-phase logic where pass 2 uses `ignore_inputs=True`,
+/// so only body/callee reads count as "read after modification". Used for the
+/// `changed_but_unread` add check.
+///
+/// `is_ending` controls callee dep inclusion for ending ProcedureCall/
+/// Broadcast (callee deps excluded when ending), and propagates to
+/// ControlFlow bodies as `is_ending_blocklist` (if/if_else propagate,
+/// loops don't) — matching Python's `getBlockListVarUse` semantics.
+fn block_variable_reads_body(
+    block: &Block,
+    callee_deps: &HashMap<String, HashSet<String>>,
+    is_ending: bool,
+) -> HashSet<String> {
+    let mut reads = HashSet::new();
+    match block {
+        Block::ControlFlow(cf) => {
+            // Body-only: exclude condition reads. Collect direct reads from
+            // body blocks (via collect_blocklist_reads) AND callee deps from
+            // nested non-ending ProcedureCalls (via collect_blocklist_reads_combined).
+            let body_is_ending = match cf.op {
+                ControlOp::If | ControlOp::IfElse => is_ending,
+                _ => false,
+            };
+            if let Some(body) = &cf.body {
+                collect_blocklist_reads(body, &mut reads);
+                collect_blocklist_reads_combined(body, &mut reads, callee_deps, body_is_ending);
+            }
+            if let Some(else_body) = &cf.else_body {
+                collect_blocklist_reads(else_body, &mut reads);
+                collect_blocklist_reads_combined(else_body, &mut reads, callee_deps, body_is_ending);
+            }
+        }
+        Block::ProcedureCall(data) => {
+            // Callee body reads only: exclude argument reads.
+            if !is_ending {
+                let key = format!("func:{}", data.name);
+                if let Some(deps) = callee_deps.get(&key) {
+                    for dep in deps {
+                        reads.insert(dep.clone());
+                    }
+                }
+            }
+        }
+        Block::Broadcast { value, .. } => {
+            // Handler body reads only: exclude message reads.
+            if !is_ending {
+                if let Value::Known(KnownVal::Str(s)) = value {
+                    let key = format!("broadcast:{}", s);
+                    if let Some(deps) = callee_deps.get(&key) {
+                        for dep in deps {
+                            reads.insert(dep.clone());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {
+            // For other blocks, body reads = all reads (inputs are evaluated
+            // atomically before any modification).
+            collect_block_reads(block, &mut reads);
+        }
+    }
+    reads
+}
+
+/// Return the function-key for the first block of a blocklist (mirrors Python's
+/// `"func:" + proc_name` / `"broadcast:" + name` / `"start:"` convention).
+fn fn_key_of(block: &Block) -> String {
+    match block {
+        Block::ProcedureDef(data) => format!("func:{}", data.name),
+        Block::OnBroadcast { name } => format!("broadcast:{}", name),
+        Block::OnStartFlag => "start:".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Collect the set of function-keys called by a blocklist (ProcedureCall and
+/// Broadcast). Used to compute the transitive closure of modifications.
+fn collect_blocklist_callees(blocklist: &BlockList, callees: &mut HashSet<String>) {
+    for block in &blocklist.blocks {
+        collect_block_callees(block, callees);
+    }
+}
+
+fn collect_block_callees(block: &Block, callees: &mut HashSet<String>) {
+    match block {
+        Block::ProcedureCall(data) => {
+            callees.insert(format!("func:{}", data.name));
+        }
+        Block::Broadcast { value, .. } => {
+            if let Value::Known(KnownVal::Str(s)) = value {
+                callees.insert(format!("broadcast:{}", s));
+            }
+        }
+        Block::ControlFlow(cf) => {
+            if let Some(body) = &cf.body {
+                collect_blocklist_callees(body, callees);
+            }
+            if let Some(else_body) = &cf.else_body {
+                collect_blocklist_callees(else_body, callees);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Like `block_modifications`, but also includes modifications performed by
+/// callees (ProcedureCall / Broadcast), using the precomputed transitive
+/// closure `callee_mods`. This mirrors Python's `getBlockListVarUse` which
+/// merges `callee_info.might_modify` for procedure/broadcast calls.
+///
+/// `is_ending` indicates whether this block is an "ending" block (last in an
+/// ending blocklist, or followed by `stop this script`). For ProcedureCall/
+/// Broadcast, ending calls exclude callee mods (Python: `if not is_ending`).
+/// For ControlFlow, `is_ending` propagates as `is_ending_blocklist` to the body:
+///   - if/if_else: body gets the parent's `is_ending`
+///   - loops (reptimes/until/while/forever/for_each): body gets `false`
+fn block_modifications_with_callees(
+    block: &Block,
+    callee_mods: &HashMap<String, HashSet<String>>,
+    ignore_prefixed: &HashSet<String>,
+    is_ending: bool,
+) -> HashSet<String> {
     let mut mods = HashSet::new();
-    collect_block_modifications(block, &mut mods);
+    collect_block_modifications_with_callees(block, &mut mods, callee_mods, ignore_prefixed, is_ending);
     mods
 }
 
+fn collect_block_modifications_with_callees(
+    block: &Block,
+    mods: &mut HashSet<String>,
+    callee_mods: &HashMap<String, HashSet<String>>,
+    ignore_prefixed: &HashSet<String>,
+    is_ending: bool,
+) {
+    match block {
+        Block::EditVar(data) => {
+            mods.insert(format!("var:{}", data.name));
+        }
+        Block::EditList(data) => {
+            mods.insert(format!("list:{}", data.name));
+        }
+        Block::EditCounter(_) => {
+            mods.insert("counter:".to_string());
+        }
+        Block::Ask { var_name, .. } => {
+            if let Some(name) = var_name {
+                mods.insert(format!("var:{}", name));
+            }
+            mods.insert("answer:".to_string());
+        }
+        Block::SwitchCostume { .. } => {
+            mods.insert("costume:".to_string());
+        }
+        Block::ControlFlow(cf) => {
+            // Propagate is_ending to body: if/if_else propagate, loops don't.
+            let body_is_ending = match cf.op {
+                ControlOp::If | ControlOp::IfElse => is_ending,
+                _ => false,
+            };
+            if let Some(body) = &cf.body {
+                collect_blocklist_mods_with_callees(body, mods, callee_mods, ignore_prefixed, body_is_ending);
+            }
+            if let Some(else_body) = &cf.else_body {
+                collect_blocklist_mods_with_callees(else_body, mods, callee_mods, ignore_prefixed, body_is_ending);
+            }
+        }
+        Block::ProcedureCall(data) => {
+            if !is_ending {
+                let key = format!("func:{}", data.name);
+                if let Some(c_mods) = callee_mods.get(&key) {
+                    for m in c_mods {
+                        if !ignore_prefixed.contains(m) {
+                            mods.insert(m.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Block::Broadcast { value, .. } => {
+            if !is_ending {
+                if let Value::Known(KnownVal::Str(s)) = value {
+                    let key = format!("broadcast:{}", s);
+                    if let Some(c_mods) = callee_mods.get(&key) {
+                        for m in c_mods {
+                            if !ignore_prefixed.contains(m) {
+                                mods.insert(m.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Process a blocklist (e.g. a ControlFlow body) for modifications, computing
+/// `is_ending` for each block based on position and `is_ending_blocklist`.
+fn collect_blocklist_mods_with_callees(
+    blocklist: &BlockList,
+    mods: &mut HashSet<String>,
+    callee_mods: &HashMap<String, HashSet<String>>,
+    ignore_prefixed: &HashSet<String>,
+    is_ending_blocklist: bool,
+) {
+    for (i, block) in blocklist.blocks.iter().enumerate() {
+        let is_end_of_blocklist = i == blocklist.blocks.len() - 1;
+        let is_ending = (is_end_of_blocklist && is_ending_blocklist)
+            || matches!(blocklist.blocks.get(i + 1), Some(Block::StopScript(crate::scratch::ast::StopOption::This)));
+        collect_block_modifications_with_callees(block, mods, callee_mods, ignore_prefixed, is_ending);
+    }
+}
+
 pub fn get_value_cost(value: &Value, perf: &TargetPerf) -> f64 {
-    match value {
+    let cost = match value {
         Value::Known(_) | Value::KnownBool(_) => 0.0,
         Value::GetVar { .. } => perf.get_var,
-        Value::GetParam { .. } => 0.0,
+        Value::GetParam { .. } => perf.param,
         Value::Op(op) => {
-            perf.add
-                + get_value_cost(op.left(), perf)
-                + get_value_cost(op.right(), perf)
+            let op_cost = match op {
+                Op::Add(_, _) => perf.add,
+                Op::Sub(_, _) => perf.sub,
+                Op::Mul(_, _) => perf.mul,
+                Op::Div(_, _) => perf.div,
+                Op::Mod(_, _) => perf.r#mod,
+                Op::Rand(_, _) => perf.rand,
+                Op::Join(_, _) => perf.join,
+                Op::LetterOf(_, _) => perf.letter_of,
+                Op::LengthOf(_) => perf.length_of_str,
+                Op::Round(_) => perf.round,
+                Op::Not(_) => perf.not_,
+                Op::Contains(_, _) => perf.contains_str,
+                Op::Abs(_) => perf.abs,
+                Op::Floor(_) => perf.floor,
+                Op::Ceiling(_) => perf.ceil,
+                Op::Sqrt(_) => perf.sqrt,
+                Op::Sin(_) => perf.sin,
+                Op::Cos(_) => perf.cos,
+                Op::Tan(_) => perf.tan,
+                Op::Asin(_) => perf.asin,
+                Op::Acos(_) => perf.acos,
+                Op::Atan(_) => perf.atan,
+                Op::Ln(_) => perf.ln,
+                Op::Log(_) => perf.log,
+                Op::Exp(_) => perf.exp,
+                Op::Exp10(_) => perf.pow10,
+                // Internally uses _ + 0
+                Op::StrToFloat(_) => perf.add,
+                // Internally uses round(_)
+                Op::BoolToFloat(_) => perf.round,
+            };
+            op_cost + get_value_cost(op.left(), perf) + get_value_cost(op.right(), perf)
         }
         Value::BoolOp(bop) => {
-            perf.eq
-                + get_value_cost(bop.left(), perf)
-                + get_value_cost(bop.right(), perf)
+            let op_cost = match bop {
+                BoolOp::And(_, _) => perf.and_,
+                BoolOp::Or(_, _) => perf.or_,
+                BoolOp::Eq(_, _) => perf.eq,
+                BoolOp::Lt(_, _) => perf.lt,
+                BoolOp::Gt(_, _) => perf.gt,
+                BoolOp::Not(_) => perf.not_,
+            };
+            op_cost + get_value_cost(bop.left(), perf) + get_value_cost(bop.right(), perf)
         }
         Value::GetOfList(gol) => {
             let op_cost = match gol.op {
@@ -325,8 +839,16 @@ pub fn get_value_cost(value: &Value, perf: &TargetPerf) -> f64 {
         }
         Value::GetList { .. } => perf.get_list,
         Value::GetListLength { .. } => perf.length_of_list,
-        Value::CostumeInfo { .. } | Value::GetCounter | Value::GetAnswer | Value::DaysSince2000 => 0.0,
-    }
+        Value::CostumeInfo { op } => match op {
+            CostumeInfoOp::Name => perf.cost_name,
+            CostumeInfoOp::Number => perf.cost_num,
+        },
+        Value::GetCounter => perf.counter,
+        Value::GetAnswer => perf.answer,
+        // Temporary solution to prevent it from being elided across another var
+        Value::DaysSince2000 => f64::INFINITY,
+    };
+    cost
 }
 
 pub fn assignment_elision_value(
@@ -545,6 +1067,36 @@ fn elide_block(block: &Block, to_elide: &HashMap<String, Value>) -> (Block, bool
                 (block.clone(), false)
             }
         }
+        Block::Pen(pen_op) => {
+            match pen_op {
+                PenOp::SetColor { color } => {
+                    let (new_color, changed) = assignment_elision_value(color, to_elide);
+                    if changed {
+                        (Block::Pen(PenOp::SetColor { color: new_color }), true)
+                    } else {
+                        (block.clone(), false)
+                    }
+                }
+                PenOp::SetSize { size } => {
+                    let (new_size, changed) = assignment_elision_value(size, to_elide);
+                    if changed {
+                        (Block::Pen(PenOp::SetSize { size: new_size }), true)
+                    } else {
+                        (block.clone(), false)
+                    }
+                }
+                _ => (block.clone(), false),
+            }
+        }
+        Block::MotionGoto { x, y } => {
+            let (new_x, cx) = assignment_elision_value(x, to_elide);
+            let (new_y, cy) = assignment_elision_value(y, to_elide);
+            if cx || cy {
+                (Block::MotionGoto { x: new_x, y: new_y }, true)
+            } else {
+                (block.clone(), false)
+            }
+        }
         _ => (block.clone(), false),
     }
 }
@@ -554,25 +1106,111 @@ fn collect_elisions(
     cannot_elide: &HashSet<String>,
     var_use: &HashMap<String, f64>,
     perf: &TargetPerf,
+    callee_mods: &HashMap<String, HashSet<String>>,
+    callee_deps: &HashMap<String, HashSet<String>>,
+    ignore_prefixed: &HashSet<String>,
 ) -> HashMap<String, Value> {
+    // Each entry: (value, dependents). Dependents use the "var:"/"list:" prefix
+    // convention to match `block_modifications`.
     let mut to_elide: IndexMap<String, (Value, HashSet<String>)> = IndexMap::new();
+    // Variables whose dependencies were modified but may still be elided if not
+    // read after this point. Mirrors Python's `changed_but_unread`.
+    let mut changed_but_unread: IndexMap<String, (Value, HashSet<String>)> = IndexMap::new();
     let mut cannot: HashSet<String> = cannot_elide.clone();
 
-    for block in &blocklist.blocks {
-        let block_mods = block_modifications(block);
+    for (blk_idx, block) in blocklist.blocks.iter().enumerate() {
+        // Determine if this block is an "ending" call. Python's
+        // `getBlockListVarUse` excludes callee mods/deps for ending
+        // ProcedureCall/Broadcast blocks, because elisions cannot happen
+        // across ending calls. An ending call is one that is the last block
+        // in the blocklist, or is immediately followed by a `stop this script`.
+        let is_end_of_blocklist = blk_idx == blocklist.blocks.len() - 1;
+        let is_ending = is_end_of_blocklist
+            || matches!(
+                blocklist.blocks.get(blk_idx + 1),
+                Some(Block::StopScript(crate::scratch::ast::StopOption::This))
+            );
 
+        let is_call_block = matches!(block,
+            Block::ProcedureCall(_) | Block::Broadcast { .. });
+
+        // `cannot_write_before_read` is True for blocks that evaluate all their
+        // inputs before performing any modification (i.e. everything except
+        // ControlFlow, ProcedureCall, Broadcast). For those three, the block
+        // may modify a dependency before reading the variable.
+        let cannot_write_before_read = !is_call_block
+            && !matches!(block, Block::ControlFlow(_));
+
+        // Use unified is_ending-aware functions. For ending ProcedureCall/
+        // Broadcast, callee mods/deps are excluded by the functions themselves.
+        let block_mods = block_modifications_with_callees(block, callee_mods, ignore_prefixed, is_ending);
+
+        // Combined reads (inputs + body) for `changed_but_unread` removal.
+        let block_reads = block_variable_reads_combined(block, callee_deps, is_ending);
+
+        // Body-only reads (excluding inputs) for `changed_but_unread` addition.
+        // Only needed when the block can write before read; for other blocks
+        // the cbu_add check short-circuits on `cannot_write_before_read`.
+        let body_reads = if !cannot_write_before_read {
+            block_variable_reads_body(block, callee_deps, is_ending)
+        } else {
+            HashSet::new()
+        };
+
+        // First, drop from `changed_but_unread` any variable read by this block:
+        // it was read after its dependency was modified, so it cannot be elided.
+        let cbu_remove: Vec<String> = changed_but_unread
+            .keys()
+            .filter(|var| block_reads.contains(*var))
+            .cloned()
+            .collect();
+        for var in cbu_remove {
+            changed_but_unread.shift_remove(&var);
+        }
+
+        // Process `to_elide`: remove variables that are overwritten or whose
+        // dependencies are modified by this block.
         let mut remove = Vec::new();
-        for (var, (_, deps)) in &to_elide {
+        let mut cbu_add: Vec<(String, Value, HashSet<String>)> = Vec::new();
+        for (var, (val, deps)) in &to_elide {
             let var_key = format!("var:{}", var);
-            if block_mods.contains(&var_key) || deps.iter().any(|d| block_mods.contains(d)) {
+            if block_mods.contains(&var_key) {
+                // The variable itself was modified → permanently cannot elide.
                 remove.push(var.clone());
+            } else if deps.iter().any(|d| block_mods.contains(d)) {
+                // A dependency was modified → remove from `to_elide`.
+                remove.push(var.clone());
+                // If the block cannot write before read, or doesn't read this
+                // variable in its body (after the modification), the variable
+                // was not read after the modification, so it may still be
+                // elided. For ControlFlow/ProcedureCall/Broadcast, only body
+                // reads count (inputs are evaluated before modification),
+                // mirroring Python's two-phase `ignore_inputs=True` pass.
+                if cannot_write_before_read || !body_reads.contains(var) {
+                    cbu_add.push((var.clone(), val.clone(), deps.clone()));
+                }
             }
+        }
+        for (var, val, deps) in cbu_add {
+            changed_but_unread.insert(var, (val, deps));
         }
         for var in remove {
             to_elide.shift_remove(&var);
             cannot.insert(var);
         }
 
+        // For non-EditVar blocks, all variable modifications prevent future
+        // elision of those variables (mirrors Python's
+        // `cannot_elide |= use.might_modify`).
+        if !matches!(block, Block::EditVar(_)) {
+            for mod_key in &block_mods {
+                if let Some(name) = mod_key.strip_prefix("var:") {
+                    cannot.insert(name.to_string());
+                }
+            }
+        }
+
+        // Add a new `set` assignment as a candidate for elision.
         if let Block::EditVar(data) = block {
             if data.op == VarOp::Set && !cannot.contains(&data.name) {
                 let mut deps = HashSet::new();
@@ -585,11 +1223,18 @@ fn collect_elisions(
         }
     }
 
+    // Variables in `changed_but_unread` were never read after their dependency
+    // was modified, so they can still be elided.
+    for (var, (val, deps)) in changed_but_unread {
+        to_elide.insert(var, (val, deps));
+    }
+
     let mut final_elisions: HashMap<String, Value> = HashMap::new();
     let mut current_deps: HashSet<String> = HashSet::new();
     for (var, (val, deps)) in to_elide {
         let times = var_use.get(&var).copied().unwrap_or(0.0);
-        if !should_elide(&val, times, perf) {
+        let should = should_elide(&val, times, perf);
+        if !should {
             continue;
         }
         let var_key = format!("var:{}", var);
@@ -604,106 +1249,24 @@ fn collect_elisions(
     final_elisions
 }
 
-fn collect_all_variable_names(blocklist: &BlockList, names: &mut HashSet<String>) {
-    for block in &blocklist.blocks {
-        match block {
-            Block::EditVar(data) => {
-                names.insert(data.name.clone());
-                collect_value_var_names(&data.value, names);
-            }
-            Block::Ask { var_name: Some(name), .. } => {
-                names.insert(name.clone());
-            }
-            Block::ControlFlow(cf) => {
-                if let Some(cond) = &cf.condition {
-                    collect_value_var_names(cond, names);
-                }
-                if let Some(body) = &cf.body {
-                    collect_all_variable_names(body, names);
-                }
-                if let Some(else_body) = &cf.else_body {
-                    collect_all_variable_names(else_body, names);
-                }
-            }
-            Block::EditList(data) => {
-                if let Some(idx) = &data.index {
-                    collect_value_var_names(idx, names);
-                }
-                if let Some(val) = &data.value {
-                    collect_value_var_names(val, names);
-                }
-            }
-            Block::Say { value }
-            | Block::SwitchCostume { value }
-            | Block::EditVolume { value, .. }
-            | Block::Broadcast { value, .. }
-            | Block::Wait { value } => {
-                collect_value_var_names(value, names);
-            }
-            Block::ProcedureCall(data) => {
-                for arg in &data.args {
-                    collect_value_var_names(arg, names);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn collect_value_var_names(value: &Value, names: &mut HashSet<String>) {
-    match value {
-        Value::GetVar { name } => { names.insert(name.clone()); }
-        Value::Op(op) => {
-            collect_value_var_names(op.left(), names);
-            collect_value_var_names(op.right(), names);
-        }
-        Value::BoolOp(bop) => {
-            collect_value_var_names(bop.left(), names);
-            collect_value_var_names(bop.right(), names);
-        }
-        Value::GetOfList(gol) => {
-            names.insert(gol.name.clone());
-            collect_value_var_names(&gol.value, names);
-        }
-        Value::GetList { name } | Value::GetListLength { name } => {
-            names.insert(name.clone());
-        }
-        _ => {}
-    }
-}
-
 pub fn assignment_elision(
     proj: &Project,
-    targets: &[Target],
+    opt_target: &Target,
     dont_remove: Option<&HashSet<String>>,
+    ignore_external_change: Option<&HashSet<String>>,
 ) -> (Project, bool) {
-    let perf = if let Some(t) = targets.first() {
-        &t.perf
-    } else {
-        return (proj.clone(), false);
-    };
+    let perf = &opt_target.perf;
 
-    let mut cannot_elide: HashSet<String> = dont_remove.cloned().unwrap_or_default();
-    // Protect indexed return values (e.g. "!return value:0") the same way the Python
-    // implementation does by extending the dont_remove set with all such names.
-    let return_prefix: Option<String> = cannot_elide.iter().find_map(|n| {
-        if n.starts_with("!return value") {
-            Some("!return value".to_string())
-        } else {
-            None
-        }
-    });
-    if let Some(prefix) = return_prefix {
-        let mut all_names = HashSet::new();
-        for code in &proj.code {
-            collect_all_variable_names(code, &mut all_names);
-        }
-        for name in all_names {
-            if name.starts_with(&prefix) {
-                cannot_elide.insert(name);
-            }
-        }
-    }
+    // `ignore_external_change` holds variable names (without "var:" prefix)
+    // whose modification by callees should not block elision (e.g. the stack
+    // pointer, which is restored by the prologue/epilogue).
+    let ignore_set: HashSet<String> = ignore_external_change.cloned().unwrap_or_default();
+    let ignore_prefixed: HashSet<String> = ignore_set
+        .iter()
+        .map(|v| format!("var:{}", v))
+        .collect();
+
+    let cannot_elide: HashSet<String> = dont_remove.cloned().unwrap_or_default();
 
     // Gather per-function dependency/modification information so that variables used
     // or modified by other functions are not elided. This matches Python's behaviour of
@@ -715,6 +1278,95 @@ pub fn assignment_elision(
         let mut mods = HashSet::new();
         collect_blocklist_var_names(code, &mut deps, &mut mods);
         code_info.push((deps, mods));
+    }
+
+    // Build function-key → direct mods, function-key → direct deps, and
+    // function-key → direct callees maps, then compute the transitive closure
+    // of both modifications and dependencies. This mirrors Python's
+    // `recu_fn_info` worklist algorithm which propagates callee
+    // `might_modify`/`always_modify`/`dependent` to callers.
+    let mut fn_direct_mods: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut fn_direct_deps: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut fn_direct_calls: HashMap<String, HashSet<String>> = HashMap::new();
+    for (i, code) in proj.code.iter().enumerate() {
+        if let Some(first) = code.blocks.first() {
+            let key = fn_key_of(first);
+            let mut mods = HashSet::new();
+            collect_blocklist_modifications(code, &mut mods);
+            fn_direct_mods.insert(key.clone(), mods);
+            fn_direct_deps.insert(key.clone(), code_info[i].0.clone());
+
+            let mut calls = HashSet::new();
+            collect_blocklist_callees(code, &mut calls);
+            fn_direct_calls.insert(key, calls);
+        }
+    }
+    // Single-pass propagation of modifications in `proj.code` order. This
+    // deliberately mirrors a bug in Python's `recu_fn_info` worklist:
+    // `info = recu_fn_info[name]` returns a reference (not a copy), so
+    // `info != recu_fn_info[name]` is always False and the worklist is never
+    // refilled. Each function is therefore processed exactly once, in
+    // `proj.code` order, and sees only the already-processed callees'
+    // propagated state. Callees that appear later in `proj.code` contribute
+    // only their direct modifications.
+    //
+    // Concretely, for `fib` (which calls `fib:6`/`fib:8` ending, which call
+    // `fib:16` which sets `!return value`), `fib` is processed before
+    // `fib:6`/`fib:8`/`fib:16`, so `fn_mods["func:fib"]` does NOT include
+    // `!return value`. A correct fixed-point iteration would include it.
+    let mut fn_mods: HashMap<String, HashSet<String>> = fn_direct_mods.clone();
+    for code in &proj.code {
+        let key = match code.blocks.first() {
+            Some(b) => fn_key_of(b),
+            None => continue,
+        };
+        let calls = match fn_direct_calls.get(&key) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+        let mut merged = match fn_mods.get(&key) {
+            Some(m) => m.clone(),
+            None => HashSet::new(),
+        };
+        for callee in &calls {
+            if let Some(callee_mods) = fn_mods.get(callee) {
+                for m in callee_mods {
+                    merged.insert(m.clone());
+                }
+            }
+        }
+        fn_mods.insert(key, merged);
+    }
+    // Transitive closure of dependencies (fixed-point iteration). Used by the
+    // `changed_but_unread` body-only-reads check to determine whether a
+    // ProcedureCall/Broadcast reads a variable in its (transitive) body.
+    let mut fn_deps: HashMap<String, HashSet<String>> = fn_direct_deps.clone();
+    loop {
+        let mut changed = false;
+        let keys: Vec<String> = fn_direct_calls.keys().cloned().collect();
+        for key in keys {
+            let calls = match fn_direct_calls.get(&key) {
+                Some(c) => c.clone(),
+                None => continue,
+            };
+            let mut merged = match fn_deps.get(&key) {
+                Some(d) => d.clone(),
+                None => HashSet::new(),
+            };
+            for callee in &calls {
+                if let Some(callee_deps) = fn_deps.get(callee) {
+                    for d in callee_deps {
+                        if merged.insert(d.clone()) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            fn_deps.insert(key, merged);
+        }
+        if !changed {
+            break;
+        }
     }
 
     let mut new_proj = proj.clone();
@@ -730,7 +1382,15 @@ pub fn assignment_elision(
         }
 
         let var_use = get_blocklist_var_use(code, None);
-        let elisions = collect_elisions(code, &per_code_cannot_elide, &var_use, perf);
+        let elisions = collect_elisions(
+            code,
+            &per_code_cannot_elide,
+            &var_use,
+            perf,
+            &fn_mods,
+            &fn_deps,
+            &ignore_prefixed,
+        );
 
         if elisions.is_empty() {
             continue;
@@ -885,8 +1545,8 @@ mod tests {
     #[test]
     fn test_assignment_elision_project() {
         let proj = Project::new(crate::scratch::ScratchConfig::default());
-        let targets = vec![test_target()];
-        let (new_proj, _) = assignment_elision(&proj, &targets, None);
+        let target = test_target();
+        let (new_proj, _) = assignment_elision(&proj, &target, None, None);
         assert_eq!(new_proj.code.len(), proj.code.len());
     }
 }

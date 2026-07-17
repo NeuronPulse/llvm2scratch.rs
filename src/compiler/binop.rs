@@ -285,7 +285,6 @@ fn and_with_known_mask_parts(
                     cfg,
                     bits,
                 ),
-                None,
             );
             let perf = &cfg.opt_target.perf;
             get_value_cost(&lookup_table_method, perf) < get_value_cost(&extract_region_method, perf)
@@ -309,7 +308,6 @@ fn and_with_known_mask_parts(
                     cfg,
                     bits,
                 ),
-                None,
             ));
 
             let old_region = groups[last_region_index];
@@ -363,7 +361,6 @@ fn or_with_known_mask(
     ));
     let a_or_b_specialized_lut = simplify_value(
         &bin_op_with_known_via_lookup_table(&BinopKind::Or, unknown.clone(), known, width, cfg),
-        None,
     );
     let perf = &cfg.opt_target.perf;
     if get_value_cost(&a_or_b_with_and, perf) < get_value_cost(&a_or_b_specialized_lut, perf) {
@@ -435,7 +432,6 @@ fn xor_with_known_mask(
     ));
     let a_xor_b_specialized_lut = simplify_value(
         &bin_op_with_known_via_lookup_table(&BinopKind::Xor, unknown.clone(), known, width, cfg),
-        None,
     );
     let perf = &cfg.opt_target.perf;
     if get_value_cost(&a_xor_b_with_and, perf) < get_value_cost(&a_xor_b_specialized_lut, perf) {

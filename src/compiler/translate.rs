@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use indexmap::IndexMap;
+use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 
 use crate::ir;
@@ -9,7 +10,7 @@ use crate::ir::values::LocalVarVal;
 use crate::ir::types::FuncTy;
 use crate::parser::llvm_decode::DecodedModule;
 use crate::scratch::{self, Block, BlockList, Project, Value};
-use crate::scratch::ast::{BoolOp, ControlFlow, ControlOp, CounterOp, CostumeInfoOp, KnownVal, ListEditOp, ListOp, Op, VarOp, VolumeOp, StopOption};
+use crate::scratch::ast::{BoolOp, ControlFlow, ControlOp, CounterOp, CostumeInfoOp, KnownVal, ListEditOp, ListOp, Op, PenOp, VarOp, VolumeOp, StopOption};
 use crate::scratch::ast::{GetOfList, EditListData, EditVarData, ProcedureDefData, ProcedureCallData};
 
 use super::config::{
@@ -37,6 +38,7 @@ pub struct Context {
     pub needs_and_lut: bool,
     pub needs_or_lut: bool,
     pub needs_xor_lut: bool,
+    pub needs_str2color: bool,
     pub functions: HashMap<String, ir::Function>,
     uid_counter: usize,
 }
@@ -57,6 +59,7 @@ impl Context {
             needs_and_lut: false,
             needs_or_lut: false,
             needs_xor_lut: false,
+            needs_str2color: false,
             functions: HashMap::new(),
             uid_counter: 0,
         }
@@ -236,7 +239,7 @@ fn trans_gep_value(
         is_nuw,
         ctx.cfg.memory_size,
     );
-    Ok(simplify_value(&val, None))
+    Ok(simplify_value(&val))
 }
 
 fn inferred_to_values(iv: InferredValue) -> Vec<Value> {
@@ -691,6 +694,70 @@ pub fn load_from_stack(
     })
 }
 
+/// Serialize a compile-time constant value into the byte-oriented initial
+/// memory list.  The result is padded with zeros to `expected_size` to match
+/// Python's `padValue` behavior for global initializers.
+fn value_to_init_mem(val: &ir::Value, expected_size: usize) -> Vec<KnownVal> {
+    match val {
+        ir::Value::KnownInt(ki) => {
+            let mut vals = Vec::new();
+            if ki.width as usize <= super::config::VARIABLE_MAX_BITS {
+                vals.push(KnownVal::Num(ki.value.to_u64().unwrap_or(0) as f64));
+            } else {
+                let mut num = ki.value.clone();
+                let mut width = ki.width as usize;
+                let part_mask = BigUint::from(1u32) << super::config::VARIABLE_MAX_BITS;
+                while width > 0 {
+                    let part = &num % &part_mask;
+                    vals.push(KnownVal::Num(part.to_u64().unwrap_or(0) as f64));
+                    num >>= super::config::VARIABLE_MAX_BITS;
+                    width = width.saturating_sub(super::config::VARIABLE_MAX_BITS);
+                }
+            }
+            while vals.len() < expected_size {
+                vals.push(KnownVal::Num(0.0));
+            }
+            vals
+        }
+        ir::Value::KnownFloat(kf) => {
+            let mut vals = vec![KnownVal::Num(kf.value)];
+            while vals.len() < expected_size {
+                vals.push(KnownVal::Num(0.0));
+            }
+            vals
+        }
+        ir::Value::KnownArr(arr) => {
+            let mut vals = Vec::new();
+            for elem in &arr.values {
+                let elem_size = memory::get_size_of(elem.type_(), true).unwrap_or(1);
+                vals.extend(value_to_init_mem(elem, elem_size));
+            }
+            while vals.len() < expected_size {
+                vals.push(KnownVal::Num(0.0));
+            }
+            vals
+        }
+        ir::Value::KnownStruct(struc) => {
+            let mut vals = Vec::new();
+            for elem in &struc.values {
+                let elem_size = memory::get_size_of(elem.type_(), true).unwrap_or(1);
+                vals.extend(value_to_init_mem(elem, elem_size));
+            }
+            while vals.len() < expected_size {
+                vals.push(KnownVal::Num(0.0));
+            }
+            vals
+        }
+        ir::Value::NullPtr(_) | ir::Value::Undef(_) => {
+            (0..expected_size).map(|_| KnownVal::Num(0.0)).collect()
+        }
+        _ => {
+            // Unknown initializer: zero-fill to preserve alignment.
+            (0..expected_size).map(|_| KnownVal::Num(0.0)).collect()
+        }
+    }
+}
+
 pub fn init_memory(
     mod_: &DecodedModule,
     ctx: &mut Context,
@@ -733,21 +800,7 @@ pub fn init_memory(
             )?);
         }
 
-        match &gv.init {
-            ir::Value::KnownInt(ki) => {
-                let val = ki.value.to_u64().unwrap_or(0) as f64;
-                init_mem.push(KnownVal::Num(val));
-            }
-            ir::Value::KnownFloat(kf) => {
-                init_mem.push(KnownVal::Num(kf.value));
-            }
-            ir::Value::NullPtr(_) | ir::Value::Undef(_) => {
-                for _ in 0..sizes[i] {
-                    init_mem.push(KnownVal::Num(0.0));
-                }
-            }
-            _ => {}
-        }
+        init_mem.extend(value_to_init_mem(&gv.init, sizes[i]));
 
         ptr += sizes[i];
     }
@@ -888,7 +941,7 @@ pub fn init_local_stack(ctx: &Context) -> BlockList {
 pub fn compile(
     llvm: &str,
     cfg: Option<CompilerConfig>,
-) -> Result<Project, CompException> {
+) -> Result<(Project, Option<usize>, HashMap<String, crate::ir::instructions::Function>), CompException> {
     let cfg = cfg.unwrap_or_default();
     let proj = Project::new(cfg.scratch_config.clone());
     let mut ctx = Context::new(proj, cfg);
@@ -926,6 +979,7 @@ pub fn compile(
     init_blocks.add(init_local_stack(&ctx));
 
     ctx = trans_funcs(&mod_, ctx)?;
+    maybe_add_str2color_helper(&mut ctx);
     trans_func_ptr_sigs(&mut ctx)?;
 
     let init_lookups = init_lookup_tables(&mut ctx)?;
@@ -934,11 +988,12 @@ pub fn compile(
     let start_blocks = trans_entrypoint_call(&mut ctx)?;
     init_blocks.add(start_blocks);
 
-    post_opt_transform(&mod_, &mut ctx);
-
+    // Note: post_opt_transform is NOT called here. It is called by the caller
+    // (main.rs) AFTER the first optimization pass, to match Python's pipeline:
+    // transFuncs -> optimize -> postOptTransform -> optimize
     ctx.proj.code.push(init_blocks);
 
-    Ok(ctx.proj)
+    Ok((ctx.proj, ctx.highest_return_size, ctx.functions))
 }
 
 fn add_foreign_functions(mut ctx: Context) -> Context {
@@ -1421,6 +1476,81 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
     ]), &mut ctx);
 
     ctx
+}
+
+fn maybe_add_str2color_helper(ctx: &mut Context) {
+    if !ctx.needs_str2color {
+        return;
+    }
+    let rv = ctx.cfg.return_var.clone();
+    let mem_var = ctx.cfg.mem_var.clone();
+    let name = "!helper_str2color";
+    let params = vec!["input"];
+    let localized_params: Vec<Variable> = params.iter().map(|p| Variable {
+        var_name: p.to_string(),
+        var_type: VarType::Param,
+        fn_name: Some(name.to_string()),
+    }).collect();
+    let raw_param_names: Vec<String> = localized_params.iter().map(|p| p.var_name.clone()).collect();
+    let mut blocks = BlockList::from_blocks(vec![
+        Block::ProcedureDef(ProcedureDefData {
+            name: name.to_string(),
+            params: raw_param_names,
+            warp: true,
+        }),
+    ]);
+    blocks.add(BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Known(KnownVal::Num(0.0)) }),
+        // Skip the leading '#'.
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "ptr".into(), value: Value::Op(Op::Add(Box::new(Value::GetParam { name: "input".into() }), Box::new(Value::Known(KnownVal::Num(1.0))))) }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "i".into(), value: Value::Known(KnownVal::Num(0.0)) }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::RepTimes,
+            condition: Some(Value::Known(KnownVal::Num(6.0))),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "char".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: mem_var.clone(), value: Box::new(Value::GetVar { name: "ptr".into() }) }) }),
+                // digit = char - 48 (ASCII '0')
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "digit".into(), value: Value::Op(Op::Sub(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(48.0))))) }),
+                // If char is lowercase a-f, digit = char - 87.
+                Block::ControlFlow(ControlFlow {
+                    op: ControlOp::If,
+                    condition: Some(Value::BoolOp(BoolOp::And(
+                        Box::new(Value::BoolOp(BoolOp::Gt(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(96.0)))))),
+                        Box::new(Value::BoolOp(BoolOp::Lt(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(103.0)))))),
+                    ))),
+                    var: None,
+                    body: Some(BlockList::from_blocks(vec![
+                        Block::EditVar(EditVarData { op: VarOp::Set, name: "digit".into(), value: Value::Op(Op::Sub(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(87.0))))) }),
+                    ])),
+                    else_body: None,
+                }),
+                // If char is uppercase A-F, digit = char - 55.
+                Block::ControlFlow(ControlFlow {
+                    op: ControlOp::If,
+                    condition: Some(Value::BoolOp(BoolOp::And(
+                        Box::new(Value::BoolOp(BoolOp::Gt(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(64.0)))))),
+                        Box::new(Value::BoolOp(BoolOp::Lt(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(71.0)))))),
+                    ))),
+                    var: None,
+                    body: Some(BlockList::from_blocks(vec![
+                        Block::EditVar(EditVarData { op: VarOp::Set, name: "digit".into(), value: Value::Op(Op::Sub(Box::new(Value::GetVar { name: "char".into() }), Box::new(Value::Known(KnownVal::Num(55.0))))) }),
+                    ])),
+                    else_body: None,
+                }),
+                Block::EditVar(EditVarData { op: VarOp::Set, name: rv.clone(), value: Value::Op(Op::Add(Box::new(Value::Op(Op::Mul(Box::new(Value::GetVar { name: rv.clone() }), Box::new(Value::Known(KnownVal::Num(16.0)))))), Box::new(Value::GetVar { name: "digit".into() }))) }),
+                Block::EditVar(EditVarData { op: VarOp::Change, name: "ptr".into(), value: Value::Known(KnownVal::Num(1.0)) }),
+                Block::EditVar(EditVarData { op: VarOp::Change, name: "i".into(), value: Value::Known(KnownVal::Num(1.0)) }),
+            ])),
+            else_body: None,
+        }),
+    ]));
+    ctx.proj.code.push(blocks);
+    let param_sizes: Vec<usize> = vec![1; params.len()];
+    ctx.fn_info.insert(name.to_string(), FuncInfo::new(
+        name.to_string(), ctx.next_fn_id, localized_params, param_sizes, params.len(),
+    ));
+    ctx.next_fn_id += 1;
 }
 
 struct FnInfoIntermediate {
@@ -2102,7 +2232,7 @@ fn bit_shift(
                 Box::new(Value::Known(KnownVal::Num(super::config::VARIABLE_MAX_BITS as f64))),
                 Box::new(shift_single.clone()),
             ));
-            let remainder_shift = InferredValue::Single(simplify_value(&remainder_shift_val, None));
+            let remainder_shift = InferredValue::Single(simplify_value(&remainder_shift_val));
 
             if direction == "left" {
                 let (rem, rem_blocks) = bit_shift(
@@ -2178,8 +2308,8 @@ fn int_compare_single(lft: Value, rgt: Value, width: usize, cond: ir::instructio
         }
         ir::instructions::ICmpCond::Sgt | ir::instructions::ICmpCond::Sge |
         ir::instructions::ICmpCond::Slt | ir::instructions::ICmpCond::Sle => {
-            let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width), None);
-            let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width), None);
+            let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
+            let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
             match cond {
                 ir::instructions::ICmpCond::Sgt => Value::BoolOp(BoolOp::Gt(Box::new(sl), Box::new(sr))),
                 ir::instructions::ICmpCond::Sge => Value::BoolOp(BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Lt(Box::new(sl), Box::new(sr)))))),
@@ -2818,6 +2948,72 @@ fn partial_sum_diff(op: &str, lft: &Value, rgt: &Value, prev_sum: &Value) -> Val
     }
 }
 
+/// Names treated as built-in pen/motion helpers. Calls to these functions are
+/// lowered directly to Scratch pen/motion blocks instead of procedure calls.
+/// This is the *mechanism* layer: only the minimal atomic pen/motion
+/// primitives are recognized. All geometry policy lives in `pen_gfx.h`.
+const PEN_MOTION_BUILTINS: &[&str] = &[
+    "pen_goto",
+    "pen_down",
+    "pen_up",
+    "pen_clear",
+    "pen_color",
+    "pen_color_num",
+    "pen_size",
+];
+
+fn is_pen_motion_builtin(name: &str) -> bool {
+    PEN_MOTION_BUILTINS.contains(&name)
+}
+
+fn trans_pen_motion_call(
+    name: &str,
+    args: &[ir::Value],
+    ctx: &mut Context,
+    bctx: &mut BlockInfo,
+) -> Result<Option<BlockList>, CompException> {
+    let mut values = Vec::new();
+    for arg in args {
+        values.push(trans_value(arg, ctx, Some(bctx))?.into_single()?);
+    }
+
+    let blocks = match name {
+        "pen_down" => Some(BlockList::from_block(Block::Pen(PenOp::Down))),
+        "pen_up" => Some(BlockList::from_block(Block::Pen(PenOp::Up))),
+        "pen_clear" => Some(BlockList::from_block(Block::Pen(PenOp::Clear))),
+        "pen_color" => {
+            ctx.needs_str2color = true;
+            let color_arg = values.first().cloned().unwrap_or(Value::Known(KnownVal::Num(0.0)));
+            let mut bl = BlockList::new();
+            bl.add_block(Block::ProcedureCall(ProcedureCallData {
+                name: "!helper_str2color".into(),
+                args: vec![color_arg],
+                run_without_refresh: false,
+            }));
+            bl.add_block(Block::Pen(PenOp::SetColor {
+                color: Value::GetVar { name: ctx.cfg.return_var.clone() },
+            }));
+            Some(bl)
+        }
+        "pen_color_num" => {
+            let color = values.first().cloned().unwrap_or(Value::Known(KnownVal::Num(0.0)));
+            Some(BlockList::from_block(Block::Pen(PenOp::SetColor { color })))
+        }
+        "pen_size" => {
+            let size = values.first().cloned().unwrap_or(Value::Known(KnownVal::Num(0.0)));
+            Some(BlockList::from_block(Block::Pen(PenOp::SetSize { size })))
+        }
+        "pen_goto" => {
+            let x = values.get(0).cloned().unwrap_or(Value::Known(KnownVal::Num(0.0)));
+            let y = values.get(1).cloned().unwrap_or(Value::Known(KnownVal::Num(0.0)));
+            Some(BlockList::from_block(Block::MotionGoto { x, y }))
+        }
+        _ => None,
+    };
+
+    Ok(blocks)
+}
+
 /// Translate a call instruction. Returns the blocks to run before the call,
 /// the blocks to run after the call (result assignment and vararg cleanup),
 /// and whether the callee returns to an address.
@@ -2829,6 +3025,14 @@ fn trans_call_instr(
 ) -> Result<(BlockList, BlockList, bool), CompException> {
     let mut pre_call = BlockList::new();
     let mut post_call = BlockList::new();
+
+    if let ir::Value::Function(fv) = &call.func {
+        if is_pen_motion_builtin(&fv.name) {
+            if let Some(blocks) = trans_pen_motion_call(&fv.name, &call.args, ctx, bctx)? {
+                return Ok((blocks, BlockList::new(), false));
+            }
+        }
+    }
 
     let (callee_name, callee_is_variadic, callee_value_param_count, prefix_arg, callee_returns_to_address) = match &call.func {
         ir::Value::Function(fv) => {
@@ -3376,13 +3580,13 @@ fn trans_instr(
                     ir::instructions::ICmpCond::Eq => BoolOp::Eq(Box::new(lft), Box::new(rgt)),
                     ir::instructions::ICmpCond::Ne => BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Eq(Box::new(lft), Box::new(rgt))))),
                     ir::instructions::ICmpCond::Sgt => {
-                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width), None);
-                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width), None);
+                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
+                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
                         BoolOp::Gt(Box::new(sl), Box::new(sr))
                     }
                     ir::instructions::ICmpCond::Sge => {
-                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width), None);
-                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width), None);
+                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
+                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
                         match (&sl, &sr) {
                             (Value::Known(KnownVal::Num(a)), _) => {
                                 BoolOp::Gt(
@@ -3400,13 +3604,13 @@ fn trans_instr(
                         }
                     }
                     ir::instructions::ICmpCond::Slt => {
-                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width), None);
-                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width), None);
+                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
+                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
                         BoolOp::Lt(Box::new(sl), Box::new(sr))
                     }
                     ir::instructions::ICmpCond::Sle => {
-                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width), None);
-                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width), None);
+                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
+                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
                         match (&sl, &sr) {
                             (Value::Known(KnownVal::Num(a)), _) => {
                                 BoolOp::Lt(
@@ -3991,6 +4195,38 @@ fn trans_intrinsic(
                     body: Some(body),
                     else_body: None,
                 }));
+            }
+        }
+        Intrinsic::SMax | Intrinsic::SMin | Intrinsic::UMax | Intrinsic::UMin => {
+            let mut it = values.into_iter();
+            let a = it.next().ok_or_else(|| CompException("min/max requires two args".to_string()))?;
+            let b = it.next().ok_or_else(|| CompException("min/max requires two args".to_string()))?;
+            // Scratch comparisons are sign-agnostic for the positive range where
+            // these intrinsics are typically used.
+            let (cmp, true_is_a) = match intrinsic {
+                Intrinsic::SMax | Intrinsic::UMax => (BoolOp::Gt(Box::new(a.clone()), Box::new(b.clone())), true),
+                Intrinsic::SMin | Intrinsic::UMin => (BoolOp::Lt(Box::new(a.clone()), Box::new(b.clone())), true),
+                _ => unreachable!(),
+            };
+            let (true_val, false_val) = if true_is_a { (a, b) } else { (b, a) };
+            let result = gen_temp_var(ctx);
+            blocks.add_block(Block::ControlFlow(ControlFlow {
+                op: ControlOp::IfElse,
+                condition: Some(Value::BoolOp(cmp)),
+                var: None,
+                body: Some(BlockList::from_block(Block::EditVar(EditVarData {
+                    op: VarOp::Set,
+                    name: result.clone(),
+                    value: true_val,
+                }))),
+                else_body: Some(BlockList::from_block(Block::EditVar(EditVarData {
+                    op: VarOp::Set,
+                    name: result.clone(),
+                    value: false_val,
+                }))),
+            }));
+            if let Some(res_var) = result_var {
+                blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::GetVar { name: result }))?);
             }
         }
         Intrinsic::VaEnd
@@ -5195,22 +5431,29 @@ fn replace_branch_calls(bl: &mut BlockList, replacements: &HashMap<String, Block
 
 /// Post-optimization transformation that converts inter-block procedure calls
 /// into a per-function branch jump table. Matches Python's `postOptTransform`.
-fn post_opt_transform(mod_: &DecodedModule, ctx: &mut Context) {
-    if !ctx.cfg.use_branch_jump_table {
-        return;
+///
+/// Returns `true` if any transformation was applied.
+pub fn post_opt_transform(
+    proj: &mut Project,
+    functions: &HashMap<String, crate::ir::instructions::Function>,
+    cfg: &CompilerConfig,
+) -> bool {
+    if !cfg.use_branch_jump_table {
+        return false;
     }
 
     // Map procedure names to their index in the project code.
     let mut procs: HashMap<String, usize> = HashMap::new();
-    for (i, bl) in ctx.proj.code.iter().enumerate() {
+    for (i, bl) in proj.code.iter().enumerate() {
         if let Some(Block::ProcedureDef(pd)) = bl.blocks.first() {
             procs.insert(pd.name.clone(), i);
         }
     }
 
     let mut to_remove: Vec<usize> = Vec::new();
+    let mut did_transform = false;
 
-    for func in mod_.functions.values() {
+    for func in functions.values() {
         if func.blocks.len() <= 1 {
             continue;
         }
@@ -5227,7 +5470,7 @@ fn post_opt_transform(mod_: &DecodedModule, ctx: &mut Context) {
         }
 
         let branch_id_var_name =
-            localize_var(&ctx.cfg.branch_jump_table_addr_local, false, Some(fn_name), false);
+            localize_var(&cfg.branch_jump_table_addr_local, false, Some(fn_name), false);
 
         let mut replacements: HashMap<String, Block> = HashMap::new();
         for (i, name) in needs_call_replacement.iter().enumerate() {
@@ -5243,7 +5486,7 @@ fn post_opt_transform(mod_: &DecodedModule, ctx: &mut Context) {
 
         for name in std::iter::once(fn_name).chain(needs_call_replacement.iter()) {
             if let Some(&idx) = procs.get(name) {
-                replace_branch_calls(&mut ctx.proj.code[idx], &replacements);
+                replace_branch_calls(&mut proj.code[idx], &replacements);
             }
         }
 
@@ -5252,7 +5495,7 @@ fn post_opt_transform(mod_: &DecodedModule, ctx: &mut Context) {
             .unwrap_or_else(|| panic!("Could not find procedure for function {}", fn_name));
 
         {
-            let first_proc = &mut ctx.proj.code[fn_proc_idx];
+            let first_proc = &mut proj.code[fn_proc_idx];
             if let Some(last) = first_proc.blocks.last() {
                 assert!(
                     !last.is_end(),
@@ -5266,14 +5509,14 @@ fn post_opt_transform(mod_: &DecodedModule, ctx: &mut Context) {
         let mut jump_table: BTreeMap<usize, BlockList> = BTreeMap::new();
         for (i, name) in needs_call_replacement.iter().enumerate() {
             let idx = procs[name];
-            let body_blocks: Vec<Block> = ctx.proj.code[idx].blocks.iter().skip(1).cloned().collect();
+            let body_blocks: Vec<Block> = proj.code[idx].blocks.iter().skip(1).cloned().collect();
             jump_table.insert(i, BlockList::from_blocks(body_blocks));
         }
 
         let mut get_branch_id = Value::GetVar {
             name: branch_id_var_name.clone(),
         };
-        if ctx.cfg.opt_target.exec.compiler_type_hints {
+        if cfg.opt_target.exec.compiler_type_hints {
             get_branch_id = Value::Op(Op::StrToFloat(Box::new(get_branch_id)));
         }
 
@@ -5298,20 +5541,23 @@ fn post_opt_transform(mod_: &DecodedModule, ctx: &mut Context) {
             body: Some(forever_body),
             else_body: None,
         });
-        ctx.proj.code[fn_proc_idx].add_block(forever);
+        proj.code[fn_proc_idx].add_block(forever);
 
         to_remove.extend(
             needs_call_replacement
                 .iter()
                 .filter_map(|n| procs.get(n).copied()),
         );
+        did_transform = true;
     }
 
     to_remove.sort_unstable_by(|a, b| b.cmp(a));
     to_remove.dedup();
     for idx in to_remove {
-        ctx.proj.code.remove(idx);
+        proj.code.remove(idx);
     }
+
+    did_transform
 }
 
 fn binary_search_jump_table(

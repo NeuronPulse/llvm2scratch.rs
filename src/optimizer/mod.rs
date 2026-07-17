@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use crate::scratch::Project;
 use crate::target::Target;
 
+use known_value_prop::ListLookup;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Optimization {
     KnownValuePropagation,
@@ -52,9 +54,11 @@ pub struct BlockListInfo {
 
 pub fn optimize(
     proj: &Project,
-    targets: &[Target],
+    opt_target: &Target,
     max_iterations: usize,
     dont_remove: Option<HashSet<String>>,
+    ignore_external_change: Option<HashSet<String>>,
+    list_lookup: Option<ListLookup<'_>>,
     passes: &HashSet<Optimization>,
 ) -> Project {
     let mut proj = proj.clone();
@@ -68,7 +72,7 @@ pub fn optimize(
         let mut any_changed = false;
 
         if passes.contains(&Optimization::KnownValuePropagation) {
-            let (new_proj, changed) = known_value_prop::known_value_propagation(&proj, None);
+            let (new_proj, changed) = known_value_prop::known_value_propagation(&proj, list_lookup);
             if changed {
                 any_changed = true;
                 proj = new_proj;
@@ -76,7 +80,12 @@ pub fn optimize(
         }
 
         if passes.contains(&Optimization::AssignmentElision) {
-            let (new_proj, changed) = assignment_elision::assignment_elision(&proj, targets, dont_remove.as_ref());
+            let (new_proj, changed) = assignment_elision::assignment_elision(
+                &proj,
+                opt_target,
+                dont_remove.as_ref(),
+                ignore_external_change.as_ref(),
+            );
             if changed {
                 any_changed = true;
                 proj = new_proj;
