@@ -110,9 +110,18 @@ PY
   echo "" >> "$report"
   echo "$mode: total=$total, both_ok=$both_ok, scratchblocks_mismatch=$sb_mismatch, py_ok_rust_fail=$py_ok_rust_fail, both_fail=$both_fail, py_fail_rust_ok=$py_fail_rust_ok" >> "$report"
   cat "$report"
+
+  # Rust must match Python scratchblocks and must not fail where Python succeeds.
+  if [ "$sb_mismatch" -gt 0 ] || [ "$py_ok_rust_fail" -gt 0 ]; then
+    return 1
+  fi
+  return 0
 }
 
 cd "$REPO_ROOT"
-run_mode "optimized" ""
+FAILED=0
+run_mode "optimized" "" || FAILED=1
 echo ""
-run_mode "unoptimized" "-O none"
+run_mode "unoptimized" "-O none" || FAILED=1
+
+exit "$FAILED"

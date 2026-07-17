@@ -65,3 +65,10 @@ done
 echo "" >> "$report"
 echo "Fixtures: total=$total, both_ok=$both_ok, py_ok_rust_fail=$py_ok_rust_fail, both_fail=$both_fail, py_fail_rust_ok=$py_fail_rust_ok" >> "$report"
 cat "$report"
+
+# Rust is expected to support at least what Python supports. Fail only if
+# Python compiles a fixture but Rust does not.
+if [ "$py_ok_rust_fail" -gt 0 ]; then
+  exit 1
+fi
+exit 0
