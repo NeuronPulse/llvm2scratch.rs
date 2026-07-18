@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-refactoring-green.svg)]()
+[![Status](https://img.shields.io/badge/status-optimizing%20%26%20extending-green.svg)]()
 
 An LLVM backend to convert [LLVM IR](https://llvm.org/docs/LangRef.html) to [MIT Scratch](https://scratch.mit.edu), a block based coding language. This allows many programs written in languages which can compile to LLVM (C, C++, Rust, etc) to be ported into scratch.
 
