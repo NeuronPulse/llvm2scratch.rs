@@ -790,12 +790,17 @@ impl<'src> Lexer<'src> {
                 }
                 Some(b'\\') => {
                     self.advance();
-                    let h1 = self.advance().ok_or_else(|| self.make_err("bad escape"))?;
-                    let h2 = self.advance().ok_or_else(|| self.make_err("bad escape"))?;
-                    let hex_str = format!("{}{}", h1 as char, h2 as char);
-                    let byte = u8::from_str_radix(&hex_str, 16)
-                        .map_err(|_| self.make_err(format!("invalid hex escape \\{}", hex_str)))?;
-                    s.push(byte as char);
+                    if self.peek_ch() == Some(b'\\') {
+                        self.advance();
+                        s.push('\\');
+                    } else {
+                        let h1 = self.advance().ok_or_else(|| self.make_err("bad escape"))?;
+                        let h2 = self.advance().ok_or_else(|| self.make_err("bad escape"))?;
+                        let hex_str = format!("{}{}", h1 as char, h2 as char);
+                        let byte = u8::from_str_radix(&hex_str, 16)
+                            .map_err(|_| self.make_err(format!("invalid hex escape \\{}", hex_str)))?;
+                        s.push(byte as char);
+                    }
                 }
                 Some(c) => {
                     self.advance();

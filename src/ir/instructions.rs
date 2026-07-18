@@ -274,12 +274,17 @@ pub enum Intrinsic {
     MemCpy,
     MemCpyInline,
     MemMove,
+    MemSet,
     FAbs,
     FShl,
     FShr,
     UAddWithOverflow,
     USubWithOverflow,
     UMulWithOverflow,
+    UAddSat,
+    USubSat,
+    SAddSat,
+    SSubSat,
     FMulAdd,
     LifetimeStart,
     LifetimeEnd,
@@ -288,6 +293,7 @@ pub enum Intrinsic {
     ExpectWithProbability,
     Assume,
     PtrMask,
+    InlineAsm,
 }
 
 impl Intrinsic {
@@ -304,12 +310,17 @@ impl Intrinsic {
             Intrinsic::MemCpy => "llvm.memcpy",
             Intrinsic::MemCpyInline => "llvm.memcpy.inline",
             Intrinsic::MemMove => "llvm.memmove",
+            Intrinsic::MemSet => "llvm.memset",
             Intrinsic::FAbs => "llvm.fabs",
             Intrinsic::FShl => "llvm.fshl",
             Intrinsic::FShr => "llvm.fshr",
             Intrinsic::UAddWithOverflow => "llvm.uadd.with.overflow",
             Intrinsic::USubWithOverflow => "llvm.usub.with.overflow",
             Intrinsic::UMulWithOverflow => "llvm.umul.with.overflow",
+            Intrinsic::UAddSat => "llvm.uadd.sat",
+            Intrinsic::USubSat => "llvm.usub.sat",
+            Intrinsic::SAddSat => "llvm.sadd.sat",
+            Intrinsic::SSubSat => "llvm.ssub.sat",
             Intrinsic::FMulAdd => "llvm.fmuladd",
             Intrinsic::LifetimeStart => "llvm.lifetime.start",
             Intrinsic::LifetimeEnd => "llvm.lifetime.end",
@@ -318,6 +329,7 @@ impl Intrinsic {
             Intrinsic::ExpectWithProbability => "llvm.expect.with.probability",
             Intrinsic::Assume => "llvm.assume",
             Intrinsic::PtrMask => "llvm.ptrmask",
+            Intrinsic::InlineAsm => "llvm.inlineasm",
         }
     }
 
@@ -337,12 +349,17 @@ impl Intrinsic {
             (Intrinsic::MemCpy, "llvm.memcpy"),
             (Intrinsic::MemCpyInline, "llvm.memcpy.inline"),
             (Intrinsic::MemMove, "llvm.memmove"),
+            (Intrinsic::MemSet, "llvm.memset"),
             (Intrinsic::FAbs, "llvm.fabs"),
             (Intrinsic::FShl, "llvm.fshl"),
             (Intrinsic::FShr, "llvm.fshr"),
             (Intrinsic::UAddWithOverflow, "llvm.uadd.with.overflow"),
             (Intrinsic::USubWithOverflow, "llvm.usub.with.overflow"),
             (Intrinsic::UMulWithOverflow, "llvm.umul.with.overflow"),
+            (Intrinsic::UAddSat, "llvm.uadd.sat"),
+            (Intrinsic::USubSat, "llvm.usub.sat"),
+            (Intrinsic::SAddSat, "llvm.sadd.sat"),
+            (Intrinsic::SSubSat, "llvm.ssub.sat"),
             (Intrinsic::FMulAdd, "llvm.fmuladd"),
             (Intrinsic::LifetimeStart, "llvm.lifetime.start"),
             (Intrinsic::LifetimeEnd, "llvm.lifetime.end"),
@@ -351,6 +368,7 @@ impl Intrinsic {
             (Intrinsic::ExpectWithProbability, "llvm.expect.with.probability"),
             (Intrinsic::Assume, "llvm.assume"),
             (Intrinsic::PtrMask, "llvm.ptrmask"),
+            (Intrinsic::InlineAsm, "llvm.inlineasm"),
         ];
         let matching: Vec<_> = candidates
             .into_iter()

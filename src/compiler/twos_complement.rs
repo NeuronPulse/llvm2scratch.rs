@@ -45,6 +45,21 @@ pub fn reverse_twos_complement(val: Value, width: usize) -> Value {
     ))
 }
 
+/// Variant used by Python's compiler_opt signed >=/<= shortcut.
+/// Matches Python's `reverse_twos_complement_and_sub_half`:
+/// `mod(val + 2^(width-1) + 0.5, -2^width)`.
+pub fn reverse_twos_complement_and_sub_half(val: Value, width: usize) -> Value {
+    let half_pow = 2f64.powi(width as i32 - 1) + 0.5;
+    let neg_pow = -2f64.powi(width as i32);
+    Value::Op(Op::Mod(
+        Box::new(Value::Op(Op::Add(
+            Box::new(val),
+            Box::new(Value::Known(KnownVal::Num(half_pow))),
+        ))),
+        Box::new(Value::Known(KnownVal::Num(neg_pow))),
+    ))
+}
+
 pub fn comptime_undo_twos_complement(val: f64, width: usize) -> f64 {
     if width >= 128 {
         return val;

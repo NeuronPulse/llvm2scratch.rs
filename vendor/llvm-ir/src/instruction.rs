@@ -441,6 +441,15 @@ pub enum InstrKind {
         mask: Vec<i32>,
     },
 
+    // --- Inline assembly ---
+    /// `InlineAsm` variant.
+    InlineAsm {
+        asm_string: String,
+        constraints: String,
+        args: Vec<ValueRef>,
+        sideeffect: bool,
+    },
+
     // --- Call ---
     /// `Call` variant.
     Call {
@@ -538,6 +547,7 @@ impl InstrKind {
             InstrKind::InsertElement { .. } => "insertelement",
             InstrKind::ShuffleVector { .. } => "shufflevector",
             InstrKind::Call { .. } => "call",
+            InstrKind::InlineAsm { .. } => "inlineasm",
             InstrKind::Ret { .. } => "ret",
             InstrKind::Br { .. } => "br",
             InstrKind::CondBr { .. } => "br",
@@ -614,6 +624,7 @@ impl InstrKind {
                 v.extend_from_slice(args);
                 v
             }
+            InstrKind::InlineAsm { args, .. } => args.clone(),
             InstrKind::Ret { val } => val.iter().copied().collect(),
             InstrKind::Br { .. } | InstrKind::Unreachable => vec![],
             InstrKind::CondBr { cond, .. } => vec![*cond],
@@ -700,7 +711,8 @@ impl InstrKind {
             | InstrKind::ExtractElement { .. }
             | InstrKind::InsertElement { .. }
             | InstrKind::ShuffleVector { .. }
-            | InstrKind::Call { .. } => vec![],
+            | InstrKind::Call { .. }
+            | InstrKind::InlineAsm { .. } => vec![],
         }
     }
 }

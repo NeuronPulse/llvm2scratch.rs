@@ -408,6 +408,9 @@ impl Context {
             ConstantData::Vector { ty, .. } => *ty,
             ConstantData::GlobalRef { ty, .. } => *ty, // name field ignored here
             ConstantData::GetElementPtr { ty, .. } => *ty,
+            ConstantData::IntToPtr { ty, .. } => *ty,
+            ConstantData::Conversion { ty, .. } => *ty,
+            ConstantData::BinaryOp { ty, .. } => *ty,
         }
     }
 }

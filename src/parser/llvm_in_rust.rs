@@ -236,6 +236,58 @@ fn convert_constant(const_id: ConstId, ctx: &Context, module: &Module, func_name
                 })),
             })
         }
+        ConstantData::IntToPtr { ty, value } => {
+            let proj_ty = convert_type_id(*ty, ctx);
+            let src_val = convert_constant(*value, ctx, module, func_names);
+            Value::ConstExpr(ConstExprVal {
+                type_: proj_ty.clone(),
+                expr: ConstExpr::Conversion(Box::new(Conversion {
+                    result: ResultLocalVar::new(""),
+                    opcode: ConvOpcode::IntToPtr,
+                    value: src_val,
+                    res_type: proj_ty,
+                    is_nuw: false,
+                    is_nsw: false,
+                })),
+            })
+        }
+        ConstantData::Conversion { ty, op, value } => {
+            let proj_ty = convert_type_id(*ty, ctx);
+            let src_val = convert_constant(*value, ctx, module, func_names);
+            let opcode = ConvOpcode::try_from_str(op)
+                .unwrap_or(ConvOpcode::BitCast);
+            Value::ConstExpr(ConstExprVal {
+                type_: proj_ty.clone(),
+                expr: ConstExpr::Conversion(Box::new(Conversion {
+                    result: ResultLocalVar::new(""),
+                    opcode,
+                    value: src_val,
+                    res_type: proj_ty,
+                    is_nuw: false,
+                    is_nsw: false,
+                })),
+            })
+        }
+        ConstantData::BinaryOp { ty, op, left, right, .. } => {
+            let proj_ty = convert_type_id(*ty, ctx);
+            let left_val = convert_constant(*left, ctx, module, func_names);
+            let right_val = convert_constant(*right, ctx, module, func_names);
+            let opcode = BinaryOpcode::try_from_str(op)
+                .unwrap_or(BinaryOpcode::Add);
+            Value::ConstExpr(ConstExprVal {
+                type_: proj_ty.clone(),
+                expr: ConstExpr::BinaryOp(Box::new(BinaryOp {
+                    result: ResultLocalVar::new(""),
+                    opcode,
+                    left: left_val,
+                    right: right_val,
+                    is_nuw: false,
+                    is_nsw: false,
+                    is_exact: false,
+                    is_disjoint: false,
+                })),
+            })
+        }
     }
 }
 
@@ -333,6 +385,29 @@ fn convert_instr(instr: &llvm_ir::instruction::Instruction, ctx: &Context, func:
                 branch_table: cases.iter().map(|(v, b)| {
                     (convert_value_ref(v, ctx, func, func_names, module), LabelVal { type_: Type::Label, label: convert_block_label(b, func) })
                 }).collect(),
+            })
+        }
+        InstrKind::InlineAsm { .. } => {
+            // Inline assembly is target-specific and cannot be executed in Scratch.
+            // Treat it as a no-op intrinsic call so the rest of the pipeline
+            // can ignore it without failing on an unknown instruction.
+            Instr::Call(Call {
+                result: None,
+                func: Value::Function(FunctionVal {
+                    type_: Type::Func(FuncTy {
+                        return_type: Box::new(Type::Void),
+                        params: vec![],
+                        variadic: false,
+                    }),
+                    name: "llvm.inlineasm".to_string(),
+                }),
+                return_type: Type::Void,
+                args: vec![],
+                params: vec![],
+                variadic: false,
+                tail_kind: CallTailKind::NoTail,
+                intrinsic: Some(Intrinsic::InlineAsm),
+                callees: vec![],
             })
         }
         InstrKind::Unreachable => Instr::Unreachable,

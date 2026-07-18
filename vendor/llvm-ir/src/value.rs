@@ -40,6 +40,28 @@ pub enum ConstantData {
         ptr: ValueRef,
         indices: Vec<ValueRef>,
     },
+    /// Constant `inttoptr` expression: integer cast to a pointer.
+    IntToPtr {
+        ty: TypeId,
+        value: ConstId,
+    },
+    /// Constant conversion expression (trunc, zext, ptrtoint, bitcast, etc.).
+    Conversion {
+        ty: TypeId,
+        op: &'static str,
+        value: ConstId,
+    },
+    /// Constant binary operation expression.
+    BinaryOp {
+        ty: TypeId,
+        op: &'static str,
+        left: ConstId,
+        right: ConstId,
+        is_nuw: bool,
+        is_nsw: bool,
+        is_exact: bool,
+        is_disjoint: bool,
+    },
 }
 
 /// A function argument (SSA value produced by function entry).

@@ -272,6 +272,39 @@ impl<'a> Printer<'a> {
                 }
                 out.push(')');
             }
+            ConstantData::IntToPtr { value, .. } => {
+                out.push_str("inttoptr (");
+                let val_ty = self.ctx.type_of_const(*value);
+                self.write_type(out, val_ty);
+                out.push(' ');
+                self.write_const_value(out, *value);
+                out.push_str(" to ptr)");
+            }
+            ConstantData::Conversion { op, value, ty } => {
+                out.push_str(op);
+                out.push_str(" (");
+                let val_ty = self.ctx.type_of_const(*value);
+                self.write_type(out, val_ty);
+                out.push(' ');
+                self.write_const_value(out, *value);
+                out.push_str(" to ");
+                self.write_type(out, *ty);
+                out.push(')');
+            }
+            ConstantData::BinaryOp { op, left, right, ty, .. } => {
+                out.push_str(op);
+                out.push_str(" (");
+                let left_ty = self.ctx.type_of_const(*left);
+                self.write_type(out, left_ty);
+                out.push(' ');
+                self.write_const_value(out, *left);
+                out.push_str(", ");
+                let right_ty = self.ctx.type_of_const(*right);
+                self.write_type(out, right_ty);
+                out.push(' ');
+                self.write_const_value(out, *right);
+                out.push(')');
+            }
         }
     }
 
@@ -796,6 +829,30 @@ impl<'a> Printer<'a> {
                     write!(out, "i32 {}", m).unwrap();
                 }
                 out.push('>');
+            }
+            InstrKind::InlineAsm {
+                asm_string,
+                constraints,
+                args,
+                sideeffect,
+            } => {
+                out.push_str("call ");
+                self.write_type(out, instr.ty);
+                out.push_str(" asm ");
+                if *sideeffect {
+                    out.push_str("sideeffect ");
+                }
+                out.push_str(&format!("{:?}", asm_string));
+                out.push_str(", ");
+                out.push_str(&format!("{:?}", constraints));
+                out.push('(');
+                for (i, &arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.write_typed_value(out, arg, func);
+                }
+                out.push(')');
             }
             InstrKind::Call {
                 tail,

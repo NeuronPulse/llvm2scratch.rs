@@ -44,6 +44,125 @@ fn parse_decimal_to_u64_words(s: &str) -> Vec<u64> {
     words
 }
 
+fn const_conversion_op_name(kw: crate::lexer::Keyword) -> &'static str {
+    use crate::lexer::Keyword;
+    match kw {
+        Keyword::Trunc => "trunc",
+        Keyword::Zext => "zext",
+        Keyword::Sext => "sext",
+        Keyword::Fptrunc => "fptrunc",
+        Keyword::Fpext => "fpext",
+        Keyword::Fptoui => "fptoui",
+        Keyword::Fptosi => "fptosi",
+        Keyword::Uitofp => "uitofp",
+        Keyword::Sitofp => "sitofp",
+        Keyword::Ptrtoint => "ptrtoint",
+        Keyword::Inttoptr => "inttoptr",
+        Keyword::Bitcast => "bitcast",
+        Keyword::Addrspacecast => "addrspacecast",
+        _ => unreachable!(),
+    }
+}
+
+fn const_binary_op_name(kw: crate::lexer::Keyword) -> &'static str {
+    use crate::lexer::Keyword;
+    match kw {
+        Keyword::Add => "add",
+        Keyword::Sub => "sub",
+        Keyword::Mul => "mul",
+        Keyword::Udiv => "udiv",
+        Keyword::Sdiv => "sdiv",
+        Keyword::Urem => "urem",
+        Keyword::Srem => "srem",
+        Keyword::And => "and",
+        Keyword::Or => "or",
+        Keyword::Xor => "xor",
+        Keyword::Shl => "shl",
+        Keyword::Lshr => "lshr",
+        Keyword::Ashr => "ashr",
+        _ => unreachable!(),
+    }
+}
+
+fn is_fn_attr_word(name: &str) -> bool {
+    const ATTRS: &[&str] = &[
+        "noreturn",
+        "nounwind",
+        "optsize",
+        "uwtable",
+        "mustprogress",
+        "nofree",
+        "nosync",
+        "willreturn",
+        "nocallback",
+        "nosanitize_coverage",
+        "speculatable",
+        "strictfp",
+        "alwaysinline",
+        "noinline",
+        "inlinehint",
+        "minsize",
+        "cold",
+        "hot",
+        "jump_table",
+        "null_pointer_is_valid",
+        "syncscope",
+        "convergent",
+        "inaccessiblememonly",
+        "inaccessiblemem_or_argmemonly",
+        "readnone",
+        "readonly",
+        "writeonly",
+        "argmemonly",
+        "returns_twice",
+        "safestack",
+        "shadowcallstack",
+        "ssp",
+        "sspreq",
+        "sspstrong",
+        "thunk",
+        "noredzone",
+        "norecurse",
+        "willreturn",
+        "musttail",
+        "notail",
+        "tail",
+        "alignstack",
+        "allocsize",
+        "builtin",
+        "cconv",
+        "fn_ret_thunk_extern",
+        "immarg",
+        "nest",
+        "returned",
+        "swiftasync",
+        "swifterror",
+        "swiftself",
+        "byref",
+        "byval",
+        "sret",
+        "elementtype",
+        "preallocated",
+        "inreg",
+        "zeroext",
+        "signext",
+        "noalias",
+        "nonnull",
+        "noundef",
+        "nocapture",
+        "nofree",
+        "readnone",
+        "readonly",
+        "writeonly",
+        "dereferenceable",
+        "dereferenceable_or_null",
+        "align",
+        "allocalign",
+        "allocptr",
+    ];
+    ATTRS.contains(&name)
+}
+
 use llvm_ir::{
     ArgId, Argument, BasicBlock, BlockId, ConstId, ConstantData, Context, FastMathFlags, FloatKind,
     FloatPredicate, Function, GlobalId, GlobalVariable, InstrKind, Instruction,
@@ -233,8 +352,8 @@ impl<'src> Parser<'src> {
                 self.lex.next()?;
             }
             _ => {
-                let fields = self.parse_struct_body()?;
-                self.ctx.define_struct_body(ty_id, fields.0, fields.1);
+                let fields = self.parse_struct_body(false)?;
+                self.ctx.define_struct_body(ty_id, fields, false);
             }
         }
         self.module.register_named_type(name, ty_id);
@@ -431,6 +550,11 @@ impl<'src> Parser<'src> {
                 replace(v1);
                 replace(v2);
             }
+            InstrKind::InlineAsm { args, .. } => {
+                for arg in args {
+                    replace(arg);
+                }
+            }
             InstrKind::Call { callee, args, .. } => {
                 replace(callee);
                 for arg in args {
@@ -619,10 +743,19 @@ impl<'src> Parser<'src> {
                 self.ctx.mk_int(b)
             }
             Token::LBracket => self.parse_array_type()?,
-            Token::LAngle => self.parse_vector_type()?,
+            Token::LAngle => {
+                // Could be packed struct `<{ ... }>` or vector `<N x T>`.
+                self.lex.next()?;
+                if matches!(self.lex.peek()?, Token::LBrace) {
+                    let fields = self.parse_struct_body(true)?;
+                    self.ctx.mk_struct_anon(fields, true)
+                } else {
+                    self.parse_vector_type_after_langle()?
+                }
+            }
             Token::LBrace => {
-                let (fields, packed) = self.parse_struct_body()?;
-                self.ctx.mk_struct_anon(fields, packed)
+                let fields = self.parse_struct_body(false)?;
+                self.ctx.mk_struct_anon(fields, false)
             }
             Token::LocalIdent(_) => {
                 // Named struct reference: %Name
@@ -654,7 +787,11 @@ impl<'src> Parser<'src> {
 
     fn parse_vector_type(&mut self) -> Result<TypeId, ParseError> {
         self.lex.expect(&Token::LAngle)?;
-        // Could be `<vscale x N x T>` or `<N x T>`.
+        self.parse_vector_type_after_langle()
+    }
+
+    fn parse_vector_type_after_langle(&mut self) -> Result<TypeId, ParseError> {
+        // Could be `<vscale x N x T>` or `<N x T>`; leading `<` already consumed.
         let scalable = self.lex.eat_kw(Keyword::Vscale);
         if scalable {
             self.lex.expect_kw(&Keyword::X)?;
@@ -666,9 +803,9 @@ impl<'src> Parser<'src> {
         Ok(self.ctx.mk_vector(elem, len, scalable))
     }
 
-    /// Parse `{ field, field, ... }` or `<{ ... }>` (packed).
-    fn parse_struct_body(&mut self) -> Result<(Vec<TypeId>, bool), ParseError> {
-        let packed = self.lex.eat(&Token::LAngle);
+    /// Parse `{ field, field, ... }` (packed=false) or `<{ ... }>` (packed=true).
+    /// When packed is true the leading `<` has already been consumed.
+    fn parse_struct_body(&mut self, packed: bool) -> Result<Vec<TypeId>, ParseError> {
         self.lex.expect(&Token::LBrace)?;
         let mut fields = Vec::new();
         if !matches!(self.lex.peek()?, Token::RBrace) {
@@ -681,7 +818,7 @@ impl<'src> Parser<'src> {
         if packed {
             self.lex.expect(&Token::RAngle)?;
         }
-        Ok((fields, packed))
+        Ok(fields)
     }
 
     #[allow(dead_code)]
@@ -1295,6 +1432,9 @@ impl<'src> Parser<'src> {
             // --- Casts ---
             Token::Kw(Keyword::Trunc) => {
                 self.lex.next()?;
+                while matches!(self.lex.peek()?, Token::Kw(Keyword::Nneg) | Token::Kw(Keyword::Nsw) | Token::Kw(Keyword::Nuw)) {
+                    self.lex.next()?;
+                }
                 let (val, _) = self.parse_typed_value()?;
                 self.lex.expect_kw(&Keyword::To)?;
                 let to = self.parse_type()?;
@@ -1302,6 +1442,9 @@ impl<'src> Parser<'src> {
             }
             Token::Kw(Keyword::Zext) => {
                 self.lex.next()?;
+                while matches!(self.lex.peek()?, Token::Kw(Keyword::Nneg) | Token::Kw(Keyword::Nsw) | Token::Kw(Keyword::Nuw)) {
+                    self.lex.next()?;
+                }
                 let (val, _) = self.parse_typed_value()?;
                 self.lex.expect_kw(&Keyword::To)?;
                 let to = self.parse_type()?;
@@ -1309,6 +1452,9 @@ impl<'src> Parser<'src> {
             }
             Token::Kw(Keyword::Sext) => {
                 self.lex.next()?;
+                while matches!(self.lex.peek()?, Token::Kw(Keyword::Nneg) | Token::Kw(Keyword::Nsw) | Token::Kw(Keyword::Nuw)) {
+                    self.lex.next()?;
+                }
                 let (val, _) = self.parse_typed_value()?;
                 self.lex.expect_kw(&Keyword::To)?;
                 let to = self.parse_type()?;
@@ -1533,7 +1679,7 @@ impl<'src> Parser<'src> {
                 if matches!(self.lex.peek()?, Token::Kw(Keyword::Fastcc)) {
                     self.lex.next()?;
                 }
-                // Optional return attributes (noundef, etc.) — skip.
+                // Optional return attributes (noundef, range(...), etc.) — skip.
                 loop {
                     match self.lex.peek()? {
                         Token::Kw(Keyword::Noundef)
@@ -1547,6 +1693,33 @@ impl<'src> Parser<'src> {
                         | Token::Kw(Keyword::Writeonly) => {
                             self.lex.next()?;
                         }
+                        Token::LocalIdent(name) => {
+                            let name = name.clone();
+                            self.lex.next()?;
+                            if self.lex.eat(&Token::LParen) {
+                                // Parenthesized attribute like range(...).
+                                let mut depth = 1u32;
+                                loop {
+                                    match self.lex.next()? {
+                                        Token::LParen => depth += 1,
+                                        Token::RParen => {
+                                            depth -= 1;
+                                            if depth == 0 {
+                                                break;
+                                            }
+                                        }
+                                        Token::Eof => {
+                                            return Err(self.err("unterminated call return attribute"))
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            } else {
+                                // Not an attribute; put it back so the return type parser sees it.
+                                self.lex.put_back(Ok(Token::LocalIdent(name)));
+                                break;
+                            }
+                        }
                         _ => break,
                     }
                 }
@@ -1558,6 +1731,11 @@ impl<'src> Parser<'src> {
                 } else {
                     None
                 };
+                // Inline assembly call: `call void asm [sideeffect] "...", "..."(...)`.
+                if matches!(self.lex.peek()?, Token::LocalIdent(ref s) if s == "asm") {
+                    self.lex.next()?;
+                    return self.parse_inline_asm(ret_ty);
+                }
                 // Callee.
                 let callee = match self.lex.peek()? {
                     Token::GlobalIdent(_) => {
@@ -1692,6 +1870,60 @@ impl<'src> Parser<'src> {
     // Operand helpers
     // -----------------------------------------------------------------------
 
+    /// Parse the body of an inline assembly call after the leading `asm` keyword.
+    /// Syntax: `[sideeffect|inteldialect|attdialect|alignstack(N)|...] "asm" , "constraints" (args)`
+    fn parse_inline_asm(&mut self, ret_ty: TypeId) -> Result<(InstrKind, TypeId), ParseError> {
+        let mut sideeffect = false;
+        loop {
+            match self.lex.peek()? {
+                Token::LocalIdent(s) => {
+                    match s.as_str() {
+                        "sideeffect" => {
+                            sideeffect = true;
+                            self.lex.next()?;
+                        }
+                        "inteldialect" | "attdialect" | "nounwind" | "willreturn" | "readnone" => {
+                            self.lex.next()?;
+                        }
+                        "alignstack" => {
+                            self.lex.next()?;
+                            if self.lex.eat(&Token::LParen) {
+                                // consume alignment number
+                                self.lex.next()?;
+                                self.lex.expect(&Token::RParen)?;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        let asm_string = self.lex.expect_string_lit()?;
+        self.lex.expect(&Token::Comma)?;
+        let constraints = self.lex.expect_string_lit()?;
+        self.lex.expect(&Token::LParen)?;
+        let mut args = Vec::new();
+        if !matches!(self.lex.peek()?, Token::RParen) {
+            let (a, _) = self.parse_call_arg()?;
+            args.push(a);
+            while self.lex.eat(&Token::Comma) {
+                let (a, _) = self.parse_call_arg()?;
+                args.push(a);
+            }
+        }
+        self.lex.expect(&Token::RParen)?;
+        Ok((
+            InstrKind::InlineAsm {
+                asm_string,
+                constraints,
+                args,
+                sideeffect,
+            },
+            ret_ty,
+        ))
+    }
+
     fn parse_typed_value(&mut self) -> Result<(ValueRef, TypeId), ParseError> {
         let ty = self.parse_type()?;
         let val = self.parse_value(ty)?;
@@ -1822,7 +2054,13 @@ impl<'src> Parser<'src> {
         match self.lex.peek()? {
             Token::LocalIdent(_) => {
                 let name = self.lex.expect_local_ident()?;
-                self.resolve_local(&name)
+                // Named struct literal: %TypeName { field1, field2, ... }
+                if matches!(self.lex.peek()?, Token::LBrace) {
+                    self.lex.expect(&Token::LBrace)?;
+                    self.parse_const_struct_body(ty)
+                } else {
+                    self.resolve_local(&name)
+                }
             }
             Token::GlobalIdent(_) => {
                 let name = self.lex.expect_global_ident()?;
@@ -1918,6 +2156,46 @@ impl<'src> Parser<'src> {
             let c = self.ctx.push_const(ConstantData::Array { ty, elements: elems });
             Ok(ValueRef::Constant(c))
         }
+        Token::Kw(Keyword::Inttoptr) => {
+            self.parse_const_conversion("inttoptr")
+        }
+        Token::Kw(Keyword::Trunc)
+        | Token::Kw(Keyword::Zext)
+        | Token::Kw(Keyword::Sext)
+        | Token::Kw(Keyword::Fptrunc)
+        | Token::Kw(Keyword::Fpext)
+        | Token::Kw(Keyword::Fptoui)
+        | Token::Kw(Keyword::Fptosi)
+        | Token::Kw(Keyword::Uitofp)
+        | Token::Kw(Keyword::Sitofp)
+        | Token::Kw(Keyword::Ptrtoint)
+        | Token::Kw(Keyword::Bitcast)
+        | Token::Kw(Keyword::Addrspacecast) => {
+            let op = match self.lex.peek()? {
+                Token::Kw(kw) => const_conversion_op_name(kw.clone()),
+                _ => unreachable!(),
+            };
+            self.parse_const_conversion(op)
+        }
+        Token::Kw(Keyword::Add)
+        | Token::Kw(Keyword::Sub)
+        | Token::Kw(Keyword::Mul)
+        | Token::Kw(Keyword::Udiv)
+        | Token::Kw(Keyword::Sdiv)
+        | Token::Kw(Keyword::Urem)
+        | Token::Kw(Keyword::Srem)
+        | Token::Kw(Keyword::And)
+        | Token::Kw(Keyword::Or)
+        | Token::Kw(Keyword::Xor)
+        | Token::Kw(Keyword::Shl)
+        | Token::Kw(Keyword::Lshr)
+        | Token::Kw(Keyword::Ashr) => {
+            let op = match self.lex.peek()? {
+                Token::Kw(kw) => const_binary_op_name(kw.clone()),
+                _ => unreachable!(),
+            };
+            self.parse_const_binary_op(op)
+        }
         Token::Kw(Keyword::Getelementptr) => {
             self.lex.next()?;
             let inbounds = self.lex.eat_kw(Keyword::Inbounds);
@@ -1979,26 +2257,95 @@ impl<'src> Parser<'src> {
         Token::LBrace => {
             // Constant struct: { type elem1, type elem2, ... }
             self.lex.expect(&Token::LBrace)?;
-            let mut fields = Vec::new();
-            if !matches!(self.lex.peek()?, Token::RBrace) {
-                let field_ty = self.parse_type()?;
-                let c = self.parse_constant(field_ty)?;
-                fields.push(c);
-                while self.lex.eat(&Token::Comma) {
-                    let field_ty = self.parse_type()?;
-                    let c = self.parse_constant(field_ty)?;
-                    fields.push(c);
+            self.parse_const_struct_body(ty)
+        }
+        Token::LAngle => {
+            // Could be a packed constant struct <{ ... }> or a constant vector <T e1, ...>.
+            self.lex.next()?;
+            if matches!(self.lex.peek()?, Token::LBrace) {
+                // Packed constant struct: <{ type elem1, type elem2, ... }>
+                self.lex.expect(&Token::LBrace)?;
+                let result = self.parse_const_struct_body(ty)?;
+                self.lex.expect(&Token::RAngle)?;
+                Ok(result)
+            } else {
+                // Constant vector: <type elem1, type elem2, ...>
+                let mut elements = Vec::new();
+                if !matches!(self.lex.peek()?, Token::RAngle) {
+                    let elt_ty = self.parse_type()?;
+                    let c = self.parse_constant(elt_ty)?;
+                    elements.push(c);
+                    while self.lex.eat(&Token::Comma) {
+                        let elt_ty = self.parse_type()?;
+                        let c = self.parse_constant(elt_ty)?;
+                        elements.push(c);
+                    }
                 }
+                self.lex.expect(&Token::RAngle)?;
+                let c = self.ctx.push_const(ConstantData::Vector { ty, elements });
+                Ok(ValueRef::Constant(c))
             }
-            self.lex.expect(&Token::RBrace)?;
-            let c = self.ctx.push_const(ConstantData::Struct { ty, fields });
-            Ok(ValueRef::Constant(c))
         }
         _ => {
                 let t = self.lex.next()?;
                 Err(self.err(format!("expected value, got {:?}", t)))
             }
         }
+    }
+
+    fn parse_const_struct_body(&mut self, ty: TypeId) -> Result<ValueRef, ParseError> {
+        let mut fields = Vec::new();
+        if !matches!(self.lex.peek()?, Token::RBrace) {
+            let field_ty = self.parse_type()?;
+            let c = self.parse_constant(field_ty)?;
+            fields.push(c);
+            while self.lex.eat(&Token::Comma) {
+                let field_ty = self.parse_type()?;
+                let c = self.parse_constant(field_ty)?;
+                fields.push(c);
+            }
+        }
+        self.lex.expect(&Token::RBrace)?;
+        let c = self.ctx.push_const(ConstantData::Struct { ty, fields });
+        Ok(ValueRef::Constant(c))
+    }
+
+    fn parse_const_conversion(&mut self, op: &'static str) -> Result<ValueRef, ParseError> {
+        self.lex.next()?;
+        self.lex.expect(&Token::LParen)?;
+        let src_ty = self.parse_type()?;
+        let value = self.parse_constant(src_ty)?;
+        self.lex.expect_kw(&Keyword::To)?;
+        let dst_ty = self.parse_type()?;
+        self.lex.expect(&Token::RParen)?;
+        let c = self.ctx.push_const(ConstantData::Conversion {
+            ty: dst_ty,
+            op,
+            value,
+        });
+        Ok(ValueRef::Constant(c))
+    }
+
+    fn parse_const_binary_op(&mut self, op: &'static str) -> Result<ValueRef, ParseError> {
+        self.lex.next()?;
+        self.lex.expect(&Token::LParen)?;
+        let left_ty = self.parse_type()?;
+        let left = self.parse_constant(left_ty)?;
+        self.lex.expect(&Token::Comma)?;
+        let right_ty = self.parse_type()?;
+        let right = self.parse_constant(right_ty)?;
+        self.lex.expect(&Token::RParen)?;
+        let c = self.ctx.push_const(ConstantData::BinaryOp {
+            ty: left_ty,
+            op,
+            left,
+            right,
+            is_nuw: false,
+            is_nsw: false,
+            is_exact: false,
+            is_disjoint: false,
+        });
+        Ok(ValueRef::Constant(c))
     }
 
     fn parse_constant(&mut self, ty: TypeId) -> Result<ConstId, ParseError> {
@@ -2274,6 +2621,8 @@ impl<'src> Parser<'src> {
                                 _ => {}
                             }
                         }
+                    } else if is_fn_attr_word(&name) {
+                        // Bare function attribute word like `noreturn`.
                     } else {
                         // Named struct type reference; put it back.
                         self.lex.put_back(Ok(Token::LocalIdent(name)));
@@ -2282,6 +2631,14 @@ impl<'src> Parser<'src> {
                 }
                 // Attribute keywords (noundef, etc.) — skip.
                 Token::Kw(Keyword::Noundef)
+                | Token::Kw(Keyword::Noalias)
+                | Token::Kw(Keyword::Nonnull)
+                | Token::Kw(Keyword::Nocapture)
+                | Token::Kw(Keyword::Readonly)
+                | Token::Kw(Keyword::Readnone)
+                | Token::Kw(Keyword::Writeonly)
+                | Token::Kw(Keyword::Zeroext)
+                | Token::Kw(Keyword::Signext)
                 | Token::Kw(Keyword::UnnamedAddr)
                 | Token::Kw(Keyword::DsoLocal)
                 | Token::Kw(Keyword::Fastcc) => {
@@ -2495,7 +2852,15 @@ impl<'src> Parser<'src> {
             if !self.lex.eat(&Token::Bang) {
                 break;
             }
-            let key = self.lex.expect_local_ident()?;
+            let peeked = self.lex.peek()?.clone();
+            let key = match peeked {
+                Token::LocalIdent(_) => self.lex.expect_local_ident()?,
+                Token::Kw(_) => {
+                    let _ = self.lex.next()?;
+                    Self::token_text(&peeked)
+                }
+                other => return Err(self.err(format!("expected metadata key, got {:?}", other))),
+            };
             let value = self.parse_metadata_value_text()?;
             attachments.push((key, value));
         }

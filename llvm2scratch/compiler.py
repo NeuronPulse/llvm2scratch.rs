@@ -2753,12 +2753,12 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             invert_val_if_necessary(sb3.BoolOp(op, lft, rgt)))
 
         case ir.FCmpCond.Uno:
-          res_val = sb3.BoolOp("and", is_not_nan(lft), is_not_nan(rgt))
+          res_val = sb3.BoolOp("or", is_nan(lft), is_nan(rgt))
 
         case ir.FCmpCond.Ueq | ir.FCmpCond.Une | ir.FCmpCond.Ugt | ir.FCmpCond.Uge | ir.FCmpCond.Ult | ir.FCmpCond.Ule:
           op = "=" if instr.cond in {ir.FCmpCond.Ueq, ir.FCmpCond.Une} else \
-              (">" if instr.cond in {ir.FCmpCond.Ogt, ir.FCmpCond.Ole} else "<")
-          inverted = instr.cond in {ir.FCmpCond.One, ir.FCmpCond.Oge, ir.FCmpCond.Ole}
+              (">" if instr.cond in {ir.FCmpCond.Ugt, ir.FCmpCond.Ule} else "<")
+          inverted = instr.cond in {ir.FCmpCond.Une, ir.FCmpCond.Uge, ir.FCmpCond.Ule}
           invert_val_if_necessary = lambda val: sb3.BoolOp("not", val) if inverted else val
 
           res_val = sb3.BoolOp("or",
@@ -2766,7 +2766,7 @@ def transInstr(instr: ir.Instr, ctx: Context, bctx: BlockInfo) -> tuple[sb3.Bloc
             invert_val_if_necessary(sb3.BoolOp(op, lft, rgt)))
 
         case ir.FCmpCond.Ord:
-          res_val = sb3.BoolOp("or", is_nan(lft), is_nan(rgt))
+          res_val = sb3.BoolOp("and", is_not_nan(lft), is_not_nan(rgt))
 
         case _:
           raise CompException(f"fcmp does not support comparsion mode {instr.cond}")
@@ -3317,6 +3317,69 @@ def transIntrinsic(intrinsic: ir.Intrinsic, args: list[ir.Value], result: Variab
       blocks.add(sb3.BlockList([
         sb3.ControlFlow("if_else", cond, sb3.BlockList([result.setValue(lft)]), sb3.BlockList([result.setValue(rgt)]))
       ]))
+
+    case ir.Intrinsic.UAddSat | ir.Intrinsic.USubSat | ir.Intrinsic.SAddSat | ir.Intrinsic.SSubSat:
+      lft, rgt = values
+      assert isinstance(lft, sb3.Value) and isinstance(rgt, sb3.Value)
+      ty = args[0].type
+      assert isinstance(ty, ir.IntegerTy)
+      assert result is not None
+
+      width = ty.width
+      mod_base = 2 ** width
+
+      if intrinsic == ir.Intrinsic.UAddSat:
+        # Unsigned saturating add: min(a + b, 2^width - 1)
+        unwrapped = sb3.Op("add", lft, rgt)
+        max_val = sb3.Known(mod_base - 1)
+        # min(x, y) = (x + y - abs(x - y)) / 2
+        blocks.add(result.setValue(sb3.Op("div",
+          sb3.Op("sub",
+            sb3.Op("add", unwrapped, max_val),
+            sb3.Op("abs", sb3.Op("sub", unwrapped, max_val))
+          ),
+          sb3.Known(2)
+        )))
+      elif intrinsic == ir.Intrinsic.USubSat:
+        # Unsigned saturating sub: max(a - b, 0)
+        unwrapped = sb3.Op("sub", lft, rgt)
+        blocks.add(result.setValue(sb3.Op("mul", unwrapped, sb3.BoolOp(">", lft, rgt))))
+      else:
+        # Signed saturating add/sub.  Inputs are in two's-complement bit form
+        # in [0, 2^width); convert to signed, clamp, then convert back.
+        half = mod_base // 2
+        max_s = half - 1
+        min_s = -half
+
+        def to_signed(v):
+          # v is unsigned representation; signed value is v if v < half else v - mod_base
+          cond = sb3.BoolOp("<", v, sb3.Known(half))
+          return sb3.Op("add", v, sb3.Op("mul", sb3.Op("sub", sb3.Known(1), cond), sb3.Known(-mod_base)))
+
+        def from_signed(v):
+          cond = sb3.BoolOp("<", v, sb3.Known(0))
+          return sb3.Op("add", v, sb3.Op("mul", cond, sb3.Known(mod_base)))
+
+        a_s = to_signed(lft)
+        b_s = to_signed(rgt)
+        if intrinsic == ir.Intrinsic.SAddSat:
+          raw = sb3.Op("add", a_s, b_s)
+        else:
+          raw = sb3.Op("sub", a_s, b_s)
+
+        cond_gt = sb3.BoolOp(">", raw, sb3.Known(max_s))
+        cond_lt = sb3.BoolOp("<", raw, sb3.Known(min_s))
+        blocks.add(sb3.BlockList([
+          sb3.ControlFlow("if_else", cond_gt,
+            sb3.BlockList([result.setValue(from_signed(sb3.Known(max_s)))]),
+            sb3.BlockList([
+              sb3.ControlFlow("if_else", cond_lt,
+                sb3.BlockList([result.setValue(from_signed(sb3.Known(min_s)))]),
+                sb3.BlockList([result.setValue(from_signed(raw))])
+              )
+            ])
+          )
+        ]))
 
     case ir.Intrinsic.MemCpy:
       dest, src, length, _volatile = values

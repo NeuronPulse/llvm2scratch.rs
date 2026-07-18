@@ -7,7 +7,7 @@ use num_traits::ToPrimitive;
 use crate::ir;
 use crate::ir::instructions::BinaryOpcode;
 use crate::ir::values::LocalVarVal;
-use crate::ir::types::FuncTy;
+use crate::ir::types::{FuncTy, IntegerTy, Type};
 use crate::parser::llvm_decode::DecodedModule;
 use crate::scratch::{self, Block, BlockList, Project, Value};
 use crate::scratch::ast::{BoolOp, ControlFlow, ControlOp, CounterOp, CostumeInfoOp, KnownVal, ListEditOp, ListOp, Op, PenOp, VarOp, VolumeOp, StopOption};
@@ -15,7 +15,7 @@ use crate::scratch::ast::{GetOfList, EditListData, EditVarData, ProcedureDefData
 
 use super::config::{
     CompException, CompilerConfig, FuncInfo, FuncPtrSigInfo, BlockInfo,
-    Variable, VarType, IdxbleValue, ReturnAddrInfo, BlockVarUse,
+    Variable, VarType, IdxbleValue, ReturnAddrInfo, BlockVarUse, PTR_WIDTH_BITS,
 };
 use super::variable::{get_value_cost, InferredValue};
 use super::binop::{self, BinopKind};
@@ -228,7 +228,15 @@ fn trans_gep_value(
         .iter()
         .map(|idx| {
             let width = get_value_width(idx);
-            Ok((trans_value(idx, ctx, bctx)?.into_single()?, width))
+            // Constant GEP indices are common in constant expressions. Use the raw
+            // integer value directly so wide integer types (e.g. i64) do not get
+            // split into multiple variable parts by trans_value.
+            let val = if let ir::Value::KnownInt(ki) = idx {
+                Value::Known(KnownVal::Num(ki.value.to_u64().unwrap_or(0) as f64))
+            } else {
+                trans_value(idx, ctx, bctx)?.into_single()?
+            };
+            Ok((val, width))
         })
         .collect::<Result<Vec<_>, CompException>>()?;
     let gep_result = memory::get_gep_offsets(base_ptr_type, &index_vals, ctx.cfg.accurate_byte_spacing)?;
@@ -240,6 +248,50 @@ fn trans_gep_value(
         ctx.cfg.memory_size,
     );
     Ok(simplify_value(&val))
+}
+
+fn trans_bitwise_binop(
+    opcode: ir::instructions::BinaryOpcode,
+    lft_iv: InferredValue,
+    rgt_iv: InferredValue,
+    width: usize,
+    ctx: &mut Context,
+) -> Result<InferredValue, CompException> {
+    let kind = match opcode {
+        ir::instructions::BinaryOpcode::And => BinopKind::And,
+        ir::instructions::BinaryOpcode::Or => BinopKind::Or,
+        ir::instructions::BinaryOpcode::Xor => BinopKind::Xor,
+        _ => return Err(CompException(format!("Unsupported bitwise opcode: {:?}", opcode))),
+    };
+    match (lft_iv, rgt_iv) {
+        (InferredValue::Single(lft), InferredValue::Single(rgt)) => {
+            Ok(InferredValue::Single(binop::binop(
+                kind, lft, rgt, width, &ctx.cfg,
+                &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
+            )?))
+        }
+        (InferredValue::Indexed(lft_idx), InferredValue::Indexed(rgt_idx)) => {
+            if lft_idx.vals.len() != rgt_idx.vals.len() {
+                return Err(CompException(format!(
+                    "Bitwise operands have different part counts: {} vs {}",
+                    lft_idx.vals.len(), rgt_idx.vals.len()
+                )));
+            }
+            let mut result_vals = Vec::new();
+            // Match Python: pass the full integer width to binOp for each part,
+            // even though each part only holds up to VARIABLE_MAX_BITS bits.
+            for (l, r) in lft_idx.vals.iter().zip(rgt_idx.vals.iter()) {
+                result_vals.push(binop::binop(
+                    kind, l.clone(), r.clone(), width, &ctx.cfg,
+                    &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
+                )?);
+            }
+            Ok(InferredValue::Indexed(IdxbleValue { vals: result_vals }))
+        }
+        _ => Err(CompException(format!(
+            "Bitwise operands must both be single or both indexed"
+        ))),
+    }
 }
 
 fn inferred_to_values(iv: InferredValue) -> Vec<Value> {
@@ -3435,88 +3487,116 @@ fn trans_instr(
                     res_val = Some(val);
                 }
                 _ => {
-                    let lft = lft_iv.clone().into_single()?;
-                    let rgt = rgt_iv.clone().into_single()?;
                     match bop.opcode {
-                        ir::instructions::BinaryOpcode::Mul => {
+                        ir::instructions::BinaryOpcode::And
+                        | ir::instructions::BinaryOpcode::Or
+                        | ir::instructions::BinaryOpcode::Xor => {
                             let width = get_value_width(&bop.left);
-                            if bop.is_nuw && bop.is_nsw {
-                                res_val = Some(InferredValue::Single(multiply_no_wrap(lft, rgt, width)?));
-                            } else {
-                                let (val, extra_blocks) = multiply_wrap(lft, rgt, width, ctx)?;
-                                blocks.add(extra_blocks);
-                                res_val = Some(InferredValue::Single(val));
-                            }
-                        }
-                        ir::instructions::BinaryOpcode::And => {
-                            let width = get_value_width(&bop.left);
-                            res_val = Some(InferredValue::Single(binop::binop(
-                                BinopKind::And, lft, rgt, width, &ctx.cfg,
-                                &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
-                            )?));
-                        }
-                        ir::instructions::BinaryOpcode::Or => {
-                            let width = get_value_width(&bop.left);
-                            res_val = Some(InferredValue::Single(binop::binop(
-                                BinopKind::Or, lft, rgt, width, &ctx.cfg,
-                                &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
-                            )?));
-                        }
-                        ir::instructions::BinaryOpcode::Xor => {
-                            let width = get_value_width(&bop.left);
-                            res_val = Some(InferredValue::Single(binop::binop(
-                                BinopKind::Xor, lft, rgt, width, &ctx.cfg,
-                                &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
-                            )?));
-                        }
-                        ir::instructions::BinaryOpcode::AShr => {
-                            let width = get_value_width(&bop.left);
-                            blocks.add(ashr_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
-                        }
-                        ir::instructions::BinaryOpcode::UDiv => {
-                            let width = get_value_width(&bop.left);
-                            if width > super::config::VARIABLE_MAX_BITS {
-                                return Err(CompException(format!(
-                                    "Unsigned division of {}-bit integers is not supported",
-                                    width
-                                )));
-                            }
-                            let div = Value::Op(Op::Div(Box::new(lft), Box::new(rgt)));
-                            let res = if bop.is_exact {
-                                div
-                            } else {
-                                Value::Op(Op::Floor(Box::new(div)))
-                            };
-                            res_val = Some(InferredValue::Single(res));
-                        }
-                        ir::instructions::BinaryOpcode::SDiv => {
-                            let width = get_value_width(&bop.left);
-                            blocks.add(signed_div_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
-                        }
-                        ir::instructions::BinaryOpcode::URem => {
-                            res_val = Some(InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt)))));
-                        }
-                        ir::instructions::BinaryOpcode::SRem => {
-                            let width = get_value_width(&bop.left);
-                            blocks.add(signed_rem_blocks(&res_var, lft, rgt, width, ctx)?);
-                        }
-                        ir::instructions::BinaryOpcode::FAdd => {
-                            res_val = Some(InferredValue::Single(Value::Op(Op::Add(Box::new(lft), Box::new(rgt)))));
-                        }
-                        ir::instructions::BinaryOpcode::FSub => {
-                            res_val = Some(InferredValue::Single(Value::Op(Op::Sub(Box::new(lft), Box::new(rgt)))));
-                        }
-                        ir::instructions::BinaryOpcode::FMul => {
-                            res_val = Some(InferredValue::Single(Value::Op(Op::Mul(Box::new(lft), Box::new(rgt)))));
-                        }
-                        ir::instructions::BinaryOpcode::FDiv => {
-                            res_val = Some(InferredValue::Single(Value::Op(Op::Div(Box::new(lft), Box::new(rgt)))));
-                        }
-                        ir::instructions::BinaryOpcode::FRem => {
-                            res_val = Some(InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt)))));
+                            res_val = Some(trans_bitwise_binop(
+                                bop.opcode, lft_iv, rgt_iv, width, ctx,
+                            )?);
                         }
                         _ => {
-                            return Err(CompException(format!("Unsupported binary opcode: {:?}", bop.opcode)));
+                            let lft = lft_iv.into_single()?;
+                            let rgt = rgt_iv.into_single()?;
+                            match bop.opcode {
+                                ir::instructions::BinaryOpcode::Mul => {
+                                    let width = get_value_width(&bop.left);
+                                    if bop.is_nuw && bop.is_nsw {
+                                        res_val = Some(InferredValue::Single(multiply_no_wrap(lft, rgt, width)?));
+                                    } else {
+                                        let (val, extra_blocks) = multiply_wrap(lft, rgt, width, ctx)?;
+                                        blocks.add(extra_blocks);
+                                        res_val = Some(InferredValue::Single(val));
+                                    }
+                                }
+                                ir::instructions::BinaryOpcode::AShr => {
+                                    let width = get_value_width(&bop.left);
+                                    blocks.add(ashr_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
+                                }
+                                ir::instructions::BinaryOpcode::UDiv => {
+                                    let width = get_value_width(&bop.left);
+                                    if width > super::config::VARIABLE_MAX_BITS {
+                                        return Err(CompException(format!(
+                                            "Unsigned division of {}-bit integers is not supported",
+                                            width
+                                        )));
+                                    }
+                                    let div = Value::Op(Op::Div(Box::new(lft), Box::new(rgt)));
+                                    let res = if bop.is_exact {
+                                        div
+                                    } else {
+                                        Value::Op(Op::Floor(Box::new(div)))
+                                    };
+                                    res_val = Some(InferredValue::Single(res));
+                                }
+                                ir::instructions::BinaryOpcode::SDiv => {
+                                    let width = get_value_width(&bop.left);
+                                    blocks.add(signed_div_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
+                                }
+                                ir::instructions::BinaryOpcode::URem => {
+                                    res_val = Some(InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt)))));
+                                }
+                                ir::instructions::BinaryOpcode::SRem => {
+                                    let width = get_value_width(&bop.left);
+                                    blocks.add(signed_rem_blocks(&res_var, lft, rgt, width, ctx)?);
+                                }
+                                ir::instructions::BinaryOpcode::FAdd => {
+                                    res_val = Some(InferredValue::Single(Value::Op(Op::Add(Box::new(lft), Box::new(rgt)))));
+                                }
+                                ir::instructions::BinaryOpcode::FSub => {
+                                    res_val = Some(InferredValue::Single(Value::Op(Op::Sub(Box::new(lft), Box::new(rgt)))));
+                                }
+                                ir::instructions::BinaryOpcode::FMul => {
+                                    res_val = Some(InferredValue::Single(Value::Op(Op::Mul(Box::new(lft), Box::new(rgt)))));
+                                }
+                                ir::instructions::BinaryOpcode::FDiv => {
+                                    res_val = Some(InferredValue::Single(Value::Op(Op::Div(Box::new(lft), Box::new(rgt)))));
+                                }
+                                ir::instructions::BinaryOpcode::FRem => {
+                                    // Match Python: adjust the sign of fmod so that
+                                    // frem has the same sign as the dividend (IEEE 754).
+                                    let cond = match (&lft, &rgt) {
+                                        (
+                                            Value::Known(KnownVal::Num(lk)),
+                                            Value::Known(KnownVal::Num(rk)),
+                                        ) => {
+                                            if *lk > 0.0 {
+                                                Value::Known(KnownVal::Num(if *rk < 0.0 { 1.0 } else { 0.0 }))
+                                            } else {
+                                                Value::Known(KnownVal::Num(if *rk > 0.0 { 1.0 } else { 0.0 }))
+                                            }
+                                        }
+                                        (Value::Known(KnownVal::Num(lk)), _) => {
+                                            if *lk > 0.0 {
+                                                Value::BoolOp(BoolOp::Lt(Box::new(rgt.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
+                                            } else {
+                                                Value::BoolOp(BoolOp::Gt(Box::new(rgt.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
+                                            }
+                                        }
+                                        (_, Value::Known(KnownVal::Num(rk))) => {
+                                            if *rk > 0.0 {
+                                                Value::BoolOp(BoolOp::Lt(Box::new(lft.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
+                                            } else {
+                                                Value::BoolOp(BoolOp::Gt(Box::new(lft.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
+                                            }
+                                        }
+                                        _ => Value::BoolOp(BoolOp::Lt(
+                                            Box::new(Value::Op(Op::Mul(Box::new(lft.clone()), Box::new(rgt.clone())))),
+                                            Box::new(Value::Known(KnownVal::Num(0.0))),
+                                        )),
+                                    };
+                                    let modded = Value::Op(Op::Mod(Box::new(lft.clone()), Box::new(rgt.clone())));
+                                    let adjustment = Value::Op(Op::Mul(Box::new(rgt.clone()), Box::new(cond)));
+                                    res_val = Some(InferredValue::Single(Value::Op(Op::Sub(
+                                        Box::new(modded),
+                                        Box::new(adjustment),
+                                    ))));
+                                }
+                                _ => {
+                                    return Err(CompException(format!("Unsupported binary opcode: {:?}", bop.opcode)));
+                                }
+                            }
                         }
                     }
                 }
@@ -3585,22 +3665,31 @@ fn trans_instr(
                         BoolOp::Gt(Box::new(sl), Box::new(sr))
                     }
                     ir::instructions::ICmpCond::Sge => {
-                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
-                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
-                        match (&sl, &sr) {
-                            (Value::Known(KnownVal::Num(a)), _) => {
-                                BoolOp::Gt(
-                                    Box::new(Value::Known(KnownVal::Num(*a + 1.0))),
-                                    Box::new(sr),
-                                )
+                        let special_signed_handling = ctx.cfg.compiler_opt
+                            && !matches!(lft, Value::Known(_))
+                            && !matches!(rgt, Value::Known(_));
+                        if special_signed_handling {
+                            let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
+                            let sr = simplify_value(&twos_complement::reverse_twos_complement_and_sub_half(rgt, width));
+                            BoolOp::Gt(Box::new(sl), Box::new(sr))
+                        } else {
+                            let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
+                            let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
+                            match (&sl, &sr) {
+                                (Value::Known(KnownVal::Num(a)), _) => {
+                                    BoolOp::Gt(
+                                        Box::new(Value::Known(KnownVal::Num(*a + 1.0))),
+                                        Box::new(sr),
+                                    )
+                                }
+                                (_, Value::Known(KnownVal::Num(b))) => {
+                                    BoolOp::Gt(
+                                        Box::new(sl),
+                                        Box::new(Value::Known(KnownVal::Num(*b - 1.0))),
+                                    )
+                                }
+                                _ => BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Lt(Box::new(sl), Box::new(sr)))))
                             }
-                            (_, Value::Known(KnownVal::Num(b))) => {
-                                BoolOp::Gt(
-                                    Box::new(sl),
-                                    Box::new(Value::Known(KnownVal::Num(*b - 1.0))),
-                                )
-                            }
-                            _ => BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Lt(Box::new(sl), Box::new(sr)))))
                         }
                     }
                     ir::instructions::ICmpCond::Slt => {
@@ -3609,22 +3698,31 @@ fn trans_instr(
                         BoolOp::Lt(Box::new(sl), Box::new(sr))
                     }
                     ir::instructions::ICmpCond::Sle => {
-                        let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
-                        let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
-                        match (&sl, &sr) {
-                            (Value::Known(KnownVal::Num(a)), _) => {
-                                BoolOp::Lt(
-                                    Box::new(Value::Known(KnownVal::Num(*a - 1.0))),
-                                    Box::new(sr),
-                                )
+                        let special_signed_handling = ctx.cfg.compiler_opt
+                            && !matches!(lft, Value::Known(_))
+                            && !matches!(rgt, Value::Known(_));
+                        if special_signed_handling {
+                            let sl = simplify_value(&twos_complement::reverse_twos_complement_and_sub_half(lft, width));
+                            let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
+                            BoolOp::Lt(Box::new(sl), Box::new(sr))
+                        } else {
+                            let sl = simplify_value(&twos_complement::reverse_twos_complement(lft, width));
+                            let sr = simplify_value(&twos_complement::reverse_twos_complement(rgt, width));
+                            match (&sl, &sr) {
+                                (Value::Known(KnownVal::Num(a)), _) => {
+                                    BoolOp::Lt(
+                                        Box::new(Value::Known(KnownVal::Num(*a - 1.0))),
+                                        Box::new(sr),
+                                    )
+                                }
+                                (_, Value::Known(KnownVal::Num(b))) => {
+                                    BoolOp::Lt(
+                                        Box::new(sl),
+                                        Box::new(Value::Known(KnownVal::Num(*b + 1.0))),
+                                    )
+                                }
+                                _ => BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Gt(Box::new(sl), Box::new(sr)))))
                             }
-                            (_, Value::Known(KnownVal::Num(b))) => {
-                                BoolOp::Lt(
-                                    Box::new(sl),
-                                    Box::new(Value::Known(KnownVal::Num(*b + 1.0))),
-                                )
-                            }
-                            _ => BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Gt(Box::new(sl), Box::new(sr)))))
                         }
                     }
                     ir::instructions::ICmpCond::Ugt => BoolOp::Gt(Box::new(lft), Box::new(rgt)),
@@ -3722,10 +3820,9 @@ fn trans_instr(
                     ))
                 }
                 ir::instructions::FCmpCond::Une => {
-                    // Match the Python reference, which treats Ueq and Une identically.
                     Value::BoolOp(BoolOp::Or(
                         Box::new(either_nan.clone()),
-                        Box::new(cmp_eq),
+                        Box::new(Value::BoolOp(BoolOp::Not(Box::new(cmp_eq.clone())))),
                     ))
                 }
                 ir::instructions::FCmpCond::Ugt => {
@@ -3762,25 +3859,37 @@ fn trans_instr(
         }
 
         ir::Instr::Conversion(conv) => {
-            let val = trans_value(&conv.value, ctx, Some(bctx))?.into_single()?;
+            let val_iv = trans_value(&conv.value, ctx, Some(bctx))?;
             let res_var = Variable {
                 var_name: localize_var(&conv.result.name, false, Some(&bctx.fn_info.name), false),
                 var_type: VarType::Var,
                 fn_name: None,
             };
 
-            let res_val = match conv.opcode {
+            let res_val: InferredValue = match conv.opcode {
                 ir::instructions::ConvOpcode::Trunc => {
                     let width = get_type_width(&conv.res_type);
-                    twos_complement::apply_twos_complement(val, width)
+                    match val_iv {
+                        InferredValue::Single(v) => InferredValue::Single(twos_complement::apply_twos_complement(v, width)),
+                        InferredValue::Indexed(idx) => {
+                            // The lowest part holds the least-significant VARIABLE_MAX_BITS bits,
+                            // which is sufficient for any truncation to <= VARIABLE_MAX_BITS bits.
+                            let low = idx.vals[0].clone();
+                            InferredValue::Single(twos_complement::apply_twos_complement(low, width))
+                        }
+                    }
                 }
-                ir::instructions::ConvOpcode::ZExt => val,
+                ir::instructions::ConvOpcode::ZExt => {
+                    let val = val_iv.into_single()?;
+                    InferredValue::Single(val)
+                }
                 ir::instructions::ConvOpcode::SExt => {
+                    let val = val_iv.into_single()?;
                     let from_bits = get_value_width(&conv.value);
                     let to_bits = get_type_width(&conv.res_type);
                     let limit = 2f64.powi(from_bits as i32 - 1) - 1.0;
                     let diff = (2f64.powi(to_bits as i32) - 1.0) - (2f64.powi(from_bits as i32) - 1.0);
-                    Value::Op(Op::Add(
+                    InferredValue::Single(Value::Op(Op::Add(
                         Box::new(val.clone()),
                         Box::new(Value::Op(Op::Mul(
                             Box::new(Value::Known(KnownVal::Num(diff))),
@@ -3789,15 +3898,21 @@ fn trans_instr(
                                 Box::new(Value::Known(KnownVal::Num(limit))),
                             ))),
                         ))),
-                    ))
+                    )))
                 }
-                ir::instructions::ConvOpcode::IntToPtr | ir::instructions::ConvOpcode::PtrToInt => val,
-                ir::instructions::ConvOpcode::BitCast => val,
+                ir::instructions::ConvOpcode::IntToPtr | ir::instructions::ConvOpcode::PtrToInt => {
+                    InferredValue::Single(val_iv.into_single()?)
+                }
+                ir::instructions::ConvOpcode::BitCast => {
+                    InferredValue::Single(val_iv.into_single()?)
+                }
                 ir::instructions::ConvOpcode::SIToFP => {
+                    let val = val_iv.into_single()?;
                     let width = get_value_width(&conv.value);
-                    twos_complement::undo_twos_complement(val, width)
+                    InferredValue::Single(twos_complement::undo_twos_complement(val, width))
                 }
                 ir::instructions::ConvOpcode::FPToSI => {
+                    let val = val_iv.into_single()?;
                     let width = get_type_width(&conv.res_type);
                     let mod_base = 2f64.powi(width as i32);
                     let abs_val = Value::Op(Op::Abs(Box::new(val.clone())));
@@ -3813,20 +3928,25 @@ fn trans_instr(
                         Box::new(Value::Known(KnownVal::Num(1.0))),
                     ));
                     let signed = Value::Op(Op::Mul(Box::new(floored_abs), Box::new(sign)));
-                    Value::Op(Op::Mod(
+                    InferredValue::Single(Value::Op(Op::Mod(
                         Box::new(signed),
                         Box::new(Value::Known(KnownVal::Num(mod_base))),
-                    ))
+                    )))
                 }
                 ir::instructions::ConvOpcode::FPToUI => {
-                    Value::Op(Op::Floor(Box::new(val)))
+                    let val = val_iv.into_single()?;
+                    InferredValue::Single(Value::Op(Op::Floor(Box::new(val))))
                 }
-                ir::instructions::ConvOpcode::UIToFP => val,
-                ir::instructions::ConvOpcode::FPTrunc | ir::instructions::ConvOpcode::FPExt => val,
+                ir::instructions::ConvOpcode::UIToFP => {
+                    InferredValue::Single(val_iv.into_single()?)
+                }
+                ir::instructions::ConvOpcode::FPTrunc | ir::instructions::ConvOpcode::FPExt => {
+                    InferredValue::Single(val_iv.into_single()?)
+                }
                 _ => return Err(CompException(format!("Unsupported conversion opcode: {:?}", conv.opcode))),
             };
 
-            blocks.add_block(res_var.set_value(res_val, VarOp::Set, None)?);
+            blocks.add(res_var.set_inferred_value(res_val)?);
         }
 
         ir::Instr::GetElementPtr(gep) => {
@@ -4008,6 +4128,16 @@ fn trans_instr(
             }
         }
 
+        ir::Instr::Freeze(freeze) => {
+            let value = trans_value(&freeze.value, ctx, Some(bctx))?;
+            let res_var = Variable {
+                var_name: localize_var(&freeze.result.name, false, Some(&bctx.fn_info.name), false),
+                var_type: VarType::Var,
+                fn_name: None,
+            };
+            blocks.add(res_var.set_inferred_value(value)?);
+        }
+
         ir::Instr::Call(call) => {
             // Compute result variable (if any) before handling intrinsics, since some
             // intrinsics such as llvm.fmuladd write to a local result.
@@ -4066,13 +4196,33 @@ fn trans_intrinsic(
         | Intrinsic::NoAliasScopeDecl
         | Intrinsic::Expect
         | Intrinsic::ExpectWithProbability
-        | Intrinsic::Assume => return Ok(blocks),
+        | Intrinsic::Assume
+        | Intrinsic::InlineAsm => return Ok(blocks),
         _ => {}
     }
 
     let mut values: Vec<Value> = Vec::new();
     for arg in args {
-        values.push(trans_value(arg, ctx, Some(bctx))?.into_single()?);
+        let iv = trans_value(arg, ctx, Some(bctx))?;
+        // Wide integer constants whose magnitude fits in a single Scratch value
+        // (e.g. small i64 lengths for memset/memmove) can be used as singles.
+        values.push(match iv {
+            InferredValue::Single(v) => v,
+            InferredValue::Indexed(ref idx) if idx.vals.len() == 2 => {
+                if let (Some(Value::Known(KnownVal::Num(low))), Some(Value::Known(KnownVal::Num(high)))) =
+                    (idx.vals.get(0), idx.vals.get(1))
+                {
+                    if *high == 0.0 && low.is_finite() && low.fract() == 0.0 && *low >= 0.0 {
+                        Value::Known(KnownVal::Num(*low))
+                    } else {
+                        iv.into_single()?
+                    }
+                } else {
+                    iv.into_single()?
+                }
+            }
+            InferredValue::Indexed(_) => iv.into_single()?,
+        });
     }
 
     match intrinsic {
@@ -4122,6 +4272,126 @@ fn trans_intrinsic(
             ));
             if let Some(res_var) = result_var {
                 blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+            }
+        }
+        Intrinsic::UAddSat | Intrinsic::USubSat | Intrinsic::SAddSat | Intrinsic::SSubSat => {
+            let mut it = values.into_iter();
+            let lft = it.next().ok_or_else(|| CompException("saturating arithmetic requires left operand".to_string()))?;
+            let rgt = it.next().ok_or_else(|| CompException("saturating arithmetic requires right operand".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("saturating arithmetic requires integer operands".to_string())),
+            };
+            let res_var = result_var.ok_or_else(|| CompException("saturating arithmetic requires a result variable".to_string()))?;
+
+            if intrinsic == &Intrinsic::UAddSat || intrinsic == &Intrinsic::USubSat {
+                let mod_base = 2f64.powi(width as i32);
+                if intrinsic == &Intrinsic::UAddSat {
+                    // Unsigned saturating add: min(a + b, 2^width - 1)
+                    let unwrapped = Value::Op(Op::Add(Box::new(lft.clone()), Box::new(rgt.clone())));
+                    let max_val = Value::Known(KnownVal::Num(mod_base - 1.0));
+                    // min(x, y) = (x + y - abs(x - y)) / 2
+                    let diff = Value::Op(Op::Sub(Box::new(unwrapped.clone()), Box::new(max_val.clone())));
+                    let numerator = Value::Op(Op::Sub(
+                        Box::new(Value::Op(Op::Add(Box::new(unwrapped), Box::new(max_val)))),
+                        Box::new(Value::Op(Op::Abs(Box::new(diff)))),
+                    ));
+                    let res = Value::Op(Op::Div(
+                        Box::new(numerator),
+                        Box::new(Value::Known(KnownVal::Num(2.0))),
+                    ));
+                    blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+                } else {
+                    // Unsigned saturating sub: max(a - b, 0) = (a - b) * (a >= b)
+                    let unwrapped = Value::Op(Op::Sub(Box::new(lft.clone()), Box::new(rgt.clone())));
+                    let cond = Value::BoolOp(BoolOp::Gt(
+                        Box::new(lft),
+                        Box::new(rgt),
+                    ));
+                    let res = Value::Op(Op::Mul(Box::new(unwrapped), Box::new(cond)));
+                    blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+                }
+            } else {
+                // Signed saturating add/sub.  Inputs are in two's-complement bit form
+                // in [0, 2^width); convert to signed, clamp, then convert back.
+                let mod_base = 2f64.powi(width as i32);
+                let half = mod_base / 2.0;
+                let max_s = half - 1.0;
+                let min_s = -half;
+
+                let to_signed = |v: Value| -> Value {
+                    let cond = Value::BoolOp(BoolOp::Lt(
+                        Box::new(v.clone()),
+                        Box::new(Value::Known(KnownVal::Num(half))),
+                    ));
+                    Value::Op(Op::Add(
+                        Box::new(v),
+                        Box::new(Value::Op(Op::Mul(
+                            Box::new(Value::Op(Op::Sub(
+                                Box::new(Value::Known(KnownVal::Num(1.0))),
+                                Box::new(cond),
+                            ))),
+                            Box::new(Value::Known(KnownVal::Num(-mod_base))),
+                        ))),
+                    ))
+                };
+                let from_signed = |v: Value| -> Value {
+                    let cond = Value::BoolOp(BoolOp::Lt(
+                        Box::new(v.clone()),
+                        Box::new(Value::Known(KnownVal::Num(0.0))),
+                    ));
+                    Value::Op(Op::Add(
+                        Box::new(v),
+                        Box::new(Value::Op(Op::Mul(
+                            Box::new(cond),
+                            Box::new(Value::Known(KnownVal::Num(mod_base))),
+                        ))),
+                    ))
+                };
+
+                let a_s = to_signed(lft);
+                let b_s = to_signed(rgt);
+                let raw = if intrinsic == &Intrinsic::SAddSat {
+                    Value::Op(Op::Add(Box::new(a_s), Box::new(b_s)))
+                } else {
+                    Value::Op(Op::Sub(Box::new(a_s), Box::new(b_s)))
+                };
+
+                let cond_gt = Value::BoolOp(BoolOp::Gt(
+                    Box::new(raw.clone()),
+                    Box::new(Value::Known(KnownVal::Num(max_s))),
+                ));
+                let cond_lt = Value::BoolOp(BoolOp::Lt(
+                    Box::new(raw.clone()),
+                    Box::new(Value::Known(KnownVal::Num(min_s))),
+                ));
+
+                let mut else_blocks = BlockList::new();
+                else_blocks.add(res_var.set_inferred_value(InferredValue::Single(from_signed(Value::Known(KnownVal::Num(min_s)))))?);
+
+                let mut then_blocks = BlockList::new();
+                then_blocks.add(res_var.set_inferred_value(InferredValue::Single(from_signed(raw)))?);
+
+                let mut inner_if = BlockList::new();
+                inner_if.add_block(Block::ControlFlow(ControlFlow {
+                    op: ControlOp::IfElse,
+                    condition: Some(cond_lt),
+                    body: Some(else_blocks),
+                    else_body: Some(then_blocks),
+                    var: None,
+                }));
+
+                let mut max_blocks = BlockList::new();
+                max_blocks.add(res_var.set_inferred_value(InferredValue::Single(from_signed(Value::Known(KnownVal::Num(max_s)))))?);
+
+                blocks.add_block(Block::ControlFlow(ControlFlow {
+                    op: ControlOp::IfElse,
+                    condition: Some(cond_gt),
+                    body: Some(max_blocks),
+                    else_body: Some(inner_if),
+                    var: None,
+                }));
             }
         }
         Intrinsic::MemCpy => {
@@ -4197,37 +4467,315 @@ fn trans_intrinsic(
                 }));
             }
         }
+        Intrinsic::MemSet => {
+            let mut it = values.into_iter();
+            let dest = it.next().ok_or_else(|| CompException("memset requires dest".to_string()))?;
+            let value = it.next().ok_or_else(|| CompException("memset requires value".to_string()))?;
+            let length = it.next().ok_or_else(|| CompException("memset requires length".to_string()))?;
+
+            let known_length = match &length {
+                Value::Known(KnownVal::Num(n)) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n < 12.0 => Some(*n as usize),
+                _ => None,
+            };
+
+            if let Some(len) = known_length {
+                for offset in 0..len {
+                    let offset_val = Value::Known(KnownVal::Num(offset as f64));
+                    blocks.add_block(Block::EditList(EditListData {
+                        op: ListEditOp::ReplaceAt,
+                        name: ctx.cfg.mem_var.clone(),
+                        index: Some(Value::Op(Op::Add(
+                            Box::new(dest.clone()),
+                            Box::new(offset_val),
+                        ))),
+                        value: Some(value.clone()),
+                    }));
+                }
+            } else {
+                let ptr_offset = gen_temp_var(ctx);
+                blocks.add_block(Block::EditVar(EditVarData {
+                    op: VarOp::Set,
+                    name: ptr_offset.clone(),
+                    value: Value::Known(KnownVal::Num(0.0)),
+                }));
+
+                let body = BlockList::from_blocks(vec![
+                    Block::EditList(EditListData {
+                        op: ListEditOp::ReplaceAt,
+                        name: ctx.cfg.mem_var.clone(),
+                        index: Some(Value::Op(Op::Add(
+                            Box::new(dest.clone()),
+                            Box::new(Value::GetVar { name: ptr_offset.clone() }),
+                        ))),
+                        value: Some(value.clone()),
+                    }),
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Change,
+                        name: ptr_offset.clone(),
+                        value: Value::Known(KnownVal::Num(1.0)),
+                    }),
+                ]);
+
+                blocks.add_block(Block::ControlFlow(ControlFlow {
+                    op: ControlOp::RepTimes,
+                    condition: Some(length),
+                    var: None,
+                    body: Some(body),
+                    else_body: None,
+                }));
+            }
+        }
+        Intrinsic::MemMove => {
+            let mut it = values.into_iter();
+            let dest = it.next().ok_or_else(|| CompException("memmove requires dest".to_string()))?;
+            let src = it.next().ok_or_else(|| CompException("memmove requires src".to_string()))?;
+            let length = it.next().ok_or_else(|| CompException("memmove requires length".to_string()))?;
+            // Fourth argument is the volatile flag; it is ignored for Scratch.
+
+            // Memmove must handle overlapping regions.  If dest > src we copy
+            // from the end backwards, otherwise we copy forwards.
+            let known_length = match &length {
+                Value::Known(KnownVal::Num(n)) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n < 12.0 => Some(*n as usize),
+                _ => None,
+            };
+
+            if let Some(len) = known_length {
+                // For known lengths we cannot decide direction at compile time
+                // because dest/src may still be runtime values.  Use a single
+                // runtime direction test and unrolled copies in each branch.
+                let forward_blocks = {
+                    let mut b = BlockList::new();
+                    for offset in 0..len {
+                        let offset_val = Value::Known(KnownVal::Num(offset as f64));
+                        let get_ptr = Value::GetOfList(GetOfList {
+                            op: ListOp::AtIndex,
+                            name: ctx.cfg.mem_var.clone(),
+                            value: Box::new(Value::Op(Op::Add(
+                                Box::new(src.clone()),
+                                Box::new(offset_val.clone()),
+                            ))),
+                        });
+                        b.add_block(Block::EditList(EditListData {
+                            op: ListEditOp::ReplaceAt,
+                            name: ctx.cfg.mem_var.clone(),
+                            index: Some(Value::Op(Op::Add(
+                                Box::new(dest.clone()),
+                                Box::new(offset_val),
+                            ))),
+                            value: Some(get_ptr),
+                        }));
+                    }
+                    b
+                };
+                let backward_blocks = {
+                    let mut b = BlockList::new();
+                    for offset in (0..len).rev() {
+                        let offset_val = Value::Known(KnownVal::Num(offset as f64));
+                        let get_ptr = Value::GetOfList(GetOfList {
+                            op: ListOp::AtIndex,
+                            name: ctx.cfg.mem_var.clone(),
+                            value: Box::new(Value::Op(Op::Add(
+                                Box::new(src.clone()),
+                                Box::new(offset_val.clone()),
+                            ))),
+                        });
+                        b.add_block(Block::EditList(EditListData {
+                            op: ListEditOp::ReplaceAt,
+                            name: ctx.cfg.mem_var.clone(),
+                            index: Some(Value::Op(Op::Add(
+                                Box::new(dest.clone()),
+                                Box::new(offset_val),
+                            ))),
+                            value: Some(get_ptr),
+                        }));
+                    }
+                    b
+                };
+                blocks.add_block(Block::ControlFlow(ControlFlow {
+                    op: ControlOp::IfElse,
+                    condition: Some(Value::BoolOp(BoolOp::Gt(
+                        Box::new(dest.clone()),
+                        Box::new(src.clone()),
+                    ))),
+                    var: None,
+                    body: Some(backward_blocks),
+                    else_body: Some(forward_blocks),
+                }));
+            } else {
+                let ptr_offset = gen_temp_var(ctx);
+                let forward_body = BlockList::from_blocks(vec![
+                    Block::EditList(EditListData {
+                        op: ListEditOp::ReplaceAt,
+                        name: ctx.cfg.mem_var.clone(),
+                        index: Some(Value::Op(Op::Add(
+                            Box::new(dest.clone()),
+                            Box::new(Value::GetVar { name: ptr_offset.clone() }),
+                        ))),
+                        value: Some(Value::GetOfList(GetOfList {
+                            op: ListOp::AtIndex,
+                            name: ctx.cfg.mem_var.clone(),
+                            value: Box::new(Value::Op(Op::Add(
+                                Box::new(src.clone()),
+                                Box::new(Value::GetVar { name: ptr_offset.clone() }),
+                            ))),
+                        })),
+                    }),
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Change,
+                        name: ptr_offset.clone(),
+                        value: Value::Known(KnownVal::Num(1.0)),
+                    }),
+                ]);
+                let backward_body = BlockList::from_blocks(vec![
+                    Block::EditList(EditListData {
+                        op: ListEditOp::ReplaceAt,
+                        name: ctx.cfg.mem_var.clone(),
+                        index: Some(Value::Op(Op::Add(
+                            Box::new(dest.clone()),
+                            Box::new(Value::GetVar { name: ptr_offset.clone() }),
+                        ))),
+                        value: Some(Value::GetOfList(GetOfList {
+                            op: ListOp::AtIndex,
+                            name: ctx.cfg.mem_var.clone(),
+                            value: Box::new(Value::Op(Op::Add(
+                                Box::new(src.clone()),
+                                Box::new(Value::GetVar { name: ptr_offset.clone() }),
+                            ))),
+                        })),
+                    }),
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Change,
+                        name: ptr_offset.clone(),
+                        value: Value::Known(KnownVal::Num(-1.0)),
+                    }),
+                ]);
+
+                let forward_setup = BlockList::from_blocks(vec![
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Set,
+                        name: ptr_offset.clone(),
+                        value: Value::Known(KnownVal::Num(0.0)),
+                    }),
+                    Block::ControlFlow(ControlFlow {
+                        op: ControlOp::RepTimes,
+                        condition: Some(length.clone()),
+                        var: None,
+                        body: Some(forward_body),
+                        else_body: None,
+                    }),
+                ]);
+                let backward_setup = BlockList::from_blocks(vec![
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Set,
+                        name: ptr_offset.clone(),
+                        value: Value::Op(Op::Sub(Box::new(length.clone()), Box::new(Value::Known(KnownVal::Num(1.0))))),
+                    }),
+                    Block::ControlFlow(ControlFlow {
+                        op: ControlOp::RepTimes,
+                        condition: Some(length.clone()),
+                        var: None,
+                        body: Some(backward_body),
+                        else_body: None,
+                    }),
+                ]);
+
+                blocks.add_block(Block::ControlFlow(ControlFlow {
+                    op: ControlOp::IfElse,
+                    condition: Some(Value::BoolOp(BoolOp::Gt(
+                        Box::new(dest.clone()),
+                        Box::new(src.clone()),
+                    ))),
+                    var: None,
+                    body: Some(backward_setup),
+                    else_body: Some(forward_setup),
+                }));
+            }
+        }
+        Intrinsic::Abs => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("abs requires value".to_string()))?;
+            // Second argument is the int-min-poison flag; it is ignored for Scratch.
+            let _is_int_min_poison = it.next();
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("abs requires integer operand".to_string())),
+            };
+            let res_var = result_var.ok_or_else(|| CompException("abs requires a result variable".to_string()))?;
+
+            // Match Python: interpret the unsigned two's-complement bits as signed,
+            // negate when negative, then wrap back into unsigned representation.
+            let half = 2f64.powi(width as i32 - 1);
+            let modulus = 2f64.powi(width as i32);
+            let is_pos = Value::BoolOp(BoolOp::Lt(
+                Box::new(val.clone()),
+                Box::new(Value::Known(KnownVal::Num(half))),
+            ));
+            let sign = Value::Op(Op::Sub(
+                Box::new(Value::Op(Op::Mul(
+                    Box::new(is_pos),
+                    Box::new(Value::Known(KnownVal::Num(2.0))),
+                ))),
+                Box::new(Value::Known(KnownVal::Num(1.0))),
+            ));
+            let res = Value::Op(Op::Mod(
+                Box::new(Value::Op(Op::Mul(Box::new(val), Box::new(sign)))),
+                Box::new(Value::Known(KnownVal::Num(modulus))),
+            ));
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+        }
+        Intrinsic::FAbs => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("fabs requires value".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("fabs requires a result variable".to_string()))?;
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::Op(Op::Abs(Box::new(val)))))?);
+        }
         Intrinsic::SMax | Intrinsic::SMin | Intrinsic::UMax | Intrinsic::UMin => {
             let mut it = values.into_iter();
             let a = it.next().ok_or_else(|| CompException("min/max requires two args".to_string()))?;
             let b = it.next().ok_or_else(|| CompException("min/max requires two args".to_string()))?;
-            // Scratch comparisons are sign-agnostic for the positive range where
-            // these intrinsics are typically used.
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("min/max requires integer operands".to_string())),
+            };
+            let res_var = result_var.ok_or_else(|| CompException("min/max requires a result variable".to_string()))?;
+
+            // Unsigned comparisons work directly on the unsigned representation.
+            // Signed comparisons must reverse two's complement first, matching Python's intCompare.
+            let (a_cmp, b_cmp) = match intrinsic {
+                Intrinsic::SMax | Intrinsic::SMin => (
+                    twos_complement::reverse_twos_complement(a.clone(), width),
+                    twos_complement::reverse_twos_complement(b.clone(), width),
+                ),
+                Intrinsic::UMax | Intrinsic::UMin => (a.clone(), b.clone()),
+                _ => unreachable!(),
+            };
+
             let (cmp, true_is_a) = match intrinsic {
-                Intrinsic::SMax | Intrinsic::UMax => (BoolOp::Gt(Box::new(a.clone()), Box::new(b.clone())), true),
-                Intrinsic::SMin | Intrinsic::UMin => (BoolOp::Lt(Box::new(a.clone()), Box::new(b.clone())), true),
+                Intrinsic::SMax | Intrinsic::UMax => (BoolOp::Gt(Box::new(a_cmp), Box::new(b_cmp)), true),
+                Intrinsic::SMin | Intrinsic::UMin => (BoolOp::Lt(Box::new(a_cmp), Box::new(b_cmp)), true),
                 _ => unreachable!(),
             };
             let (true_val, false_val) = if true_is_a { (a, b) } else { (b, a) };
-            let result = gen_temp_var(ctx);
             blocks.add_block(Block::ControlFlow(ControlFlow {
                 op: ControlOp::IfElse,
                 condition: Some(Value::BoolOp(cmp)),
                 var: None,
-                body: Some(BlockList::from_block(Block::EditVar(EditVarData {
-                    op: VarOp::Set,
-                    name: result.clone(),
-                    value: true_val,
-                }))),
-                else_body: Some(BlockList::from_block(Block::EditVar(EditVarData {
-                    op: VarOp::Set,
-                    name: result.clone(),
-                    value: false_val,
-                }))),
+                body: Some(BlockList::from_block(res_var.set_value(true_val, VarOp::Set, None)?)),
+                else_body: Some(BlockList::from_block(res_var.set_value(false_val, VarOp::Set, None)?)),
             }));
-            if let Some(res_var) = result_var {
-                blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::GetVar { name: result }))?);
-            }
+        }
+        Intrinsic::PtrMask => {
+            let mut it = values.into_iter();
+            let ptr = it.next().ok_or_else(|| CompException("ptrmask requires pointer".to_string()))?;
+            let mask = it.next().ok_or_else(|| CompException("ptrmask requires mask".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("ptrmask requires a result variable".to_string()))?;
+            let res = binop::binop(
+                binop::BinopKind::And, ptr, mask, PTR_WIDTH_BITS, &ctx.cfg,
+                &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
+            )?;
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
         }
         Intrinsic::VaEnd
         | Intrinsic::LifetimeStart
@@ -5576,6 +6124,9 @@ fn binary_search_jump_table(
 
     let keys: Vec<usize> = branches.keys().copied().collect();
     let mid = (lo + hi) / 2;
+    if mid >= keys.len() {
+        return default_branch.unwrap_or_else(BlockList::new);
+    }
     let mid_val = keys[mid];
 
     if lo == hi {
