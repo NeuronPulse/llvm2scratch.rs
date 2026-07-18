@@ -4,12 +4,11 @@ set -uo pipefail
 # Unified entry point for all Python-vs-Rust differential tests.
 #
 # Runs, in order:
-#   1. Python unit tests (llvm2scratch.tests.test_compiler)
+#   1. Python unit tests
 #   2. SB3 structural diff on examples/input/ .ll files (tests/diff_test.py)
 #   3. Scratchblocks text diff on examples/input/ .ll files (tests/scratchblocks_diff_test.py)
-#   4. Scratchblocks text diff on generated stress programs, if available
-#      (tests/scratchblocks_stress_diff_test.py or scripts/compare_py_rs_main.sh)
-#   5. Parser fixtures compiler diff (scripts/compare_py_rs_fixtures.sh)
+#   4. Scratchblocks text diff on generated stress programs (scripts/check_stress_parity.py)
+#   5. Parser fixtures compiler diff (scripts/check_fixture_parity.py)
 #
 # Usage:
 #   bash scripts/run_diff_tests.sh
@@ -71,9 +70,7 @@ run_step "Scratchblocks diff" \
 if [ "$RUN_STRESS" -eq 1 ]; then
   if [ -d "/tmp/llvm_stress_main/ll" ]; then
     run_step "Stress scratchblocks diff" \
-      python tests/scratchblocks_stress_diff_test.py
-    run_step "Stress optimized/unoptimized diff" \
-      bash scripts/compare_py_rs_main.sh
+      python3 "${SCRIPT_DIR}/check_stress_parity.py"
   else
     echo ""
     echo "=== Stress tests ==="
