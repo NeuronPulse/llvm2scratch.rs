@@ -307,6 +307,24 @@ pub enum Keyword {
     Vscale, // "vscale" before "x" in scalable vector
     /// `Attributes` variant.
     Attributes,
+    // LLVM 19+ GEP flag
+    /// `Nusw` variant (LLVM 19+ GEP no-unsigned-signed-wrap).
+    Nusw,
+    // Memory ordering / atomic keywords
+    /// `Nontemporal` variant.
+    Nontemporal,
+    /// `Atomic` variant.
+    Atomic,
+    /// `Acquire` variant.
+    Acquire,
+    /// `Release` variant.
+    Release,
+    /// `AcqRel` variant.
+    AcqRel,
+    /// `SeqCst` variant.
+    SeqCst,
+    /// `SyncScope` variant.
+    SyncScope,
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,6 +1115,14 @@ impl<'src> Lexer<'src> {
             "x" => Keyword::X,
             "vscale" => Keyword::Vscale,
             "attributes" => Keyword::Attributes,
+            "nusw" => Keyword::Nusw,
+            "nontemporal" => Keyword::Nontemporal,
+            "atomic" => Keyword::Atomic,
+            "acquire" => Keyword::Acquire,
+            "release" => Keyword::Release,
+            "acq_rel" => Keyword::AcqRel,
+            "seq_cst" => Keyword::SeqCst,
+            "syncscope" => Keyword::SyncScope,
             // Unknown words become bare local identifiers (shouldn't normally happen at module level).
             other => return Token::LocalIdent(other.to_string()),
         };

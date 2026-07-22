@@ -62,3 +62,12 @@ examples/input/*.ll
 poetry.lock
 pyrightconfig.json
 pyrefly.toml
+
+# Standalone demo repos (each has its own .git)
+examples/demos/ELIZA-scratch/
+examples/demos/llm_from_scratch/
+examples/demos/newlib-scratch/
+examples/demos/sha2scratch/
+
+# AI agent workspace files
+.trae/

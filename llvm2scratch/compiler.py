@@ -94,6 +94,9 @@ class Context:
   globvar_to_ptr: dict[str, int] = field(default_factory=dict)
   highest_return_size: int | None = None
   next_fn_id: int = 0
+  # Sequential counter for temp variable names, kept deterministic so output
+  # is byte-for-byte reproducible and matches the Rust implementation.
+  tmp_counter: int = 0
   # Starting ptr addr for functions. Could be independent from stack
   # using LLVM datalayout
   min_func_ptr_addr: int = 0
@@ -670,7 +673,9 @@ def combineIdxbleValues(vals: list[sb3.Value | IdxbleValue]) -> IdxbleValue:
   return IdxbleValue(res)
 
 def genTempVar(ctx: Context) -> str:
-  return ctx.cfg.tmp_prefix + random.randbytes(12).hex()
+  name = ctx.cfg.tmp_prefix + str(ctx.tmp_counter)
+  ctx.tmp_counter += 1
+  return name
 
 def shouldOptimiseValueUse(val: sb3.Value, times_used: float, ctx: Context) -> bool:
   """Returns if a value that is used multiple times should be stored"""

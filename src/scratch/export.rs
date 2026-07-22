@@ -142,8 +142,8 @@ fn ctx_get_raw(ctx: &mut ScratchContext) -> JsonMap<String, JsonValue> {
                         "tagName": "mutation",
                         "children": [],
                         "proccode": proccode,
-                        "argumentids": serde_json::to_string(&param_ids).unwrap_or_default(),
-                        "warp": serde_json::to_string(&run_without_refresh).unwrap_or_default()
+                        "argumentids": python_json_dumps(&param_ids),
+                        "warp": python_json_dumps(&run_without_refresh)
                     }));
                     r
                 };

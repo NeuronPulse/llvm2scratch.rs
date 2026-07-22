@@ -170,9 +170,8 @@ pub fn trans_value(
         }
         ir::Value::Function(fv) => {
             if ctx.fn_ptr_sigs.iter().any(|(_, ptrs)| ptrs.contains(&fv.name)) {
-                Ok(InferredValue::Single(Value::Known(KnownVal::Num(
-                    get_func_ptr_addr(&fv.name, ctx) as f64
-                ))))
+                let ptr_addr = get_func_ptr_addr(&fv.name, ctx)?;
+                Ok(InferredValue::Single(Value::Known(KnownVal::Num(ptr_addr as f64))))
             } else if let Some(info) = ctx.fn_info.get(&fv.name) {
                 Ok(InferredValue::Single(Value::Known(KnownVal::Num(info.fn_id as f64))))
             } else {
@@ -300,6 +299,65 @@ pub fn trans_value(
                 };
                 let elem_size = memory::get_size_of(elem_ty, false)?;
                 shuffle_vector(v1_iv, v2_iv, mask_iv, elem_size)
+            }
+            ir::values::ConstExpr::BinaryOp(bop) => {
+                let lft_iv = trans_value(&bop.left, ctx, bctx)?;
+                let rgt_iv = trans_value(&bop.right, ctx, bctx)?;
+                let width = get_value_width(&bop.left);
+                let res = if width > super::config::VARIABLE_MAX_BITS {
+                    return Err(CompException(format!(
+                        "ConstExpr BinaryOp for wide integer ({}-bit) not supported", width
+                    )));
+                } else {
+                    let lft = lft_iv.into_single()?;
+                    let rgt = rgt_iv.into_single()?;
+                    match bop.opcode {
+                        o if o == ir::instructions::BinaryOpcode::Add => InferredValue::Single(Value::Op(Op::Add(Box::new(lft), Box::new(rgt)))),
+                        o if o == ir::instructions::BinaryOpcode::Sub => InferredValue::Single(Value::Op(Op::Sub(Box::new(lft), Box::new(rgt)))),
+                        o if o == ir::instructions::BinaryOpcode::Mul => InferredValue::Single(Value::Op(Op::Mul(Box::new(lft), Box::new(rgt)))),
+                        o if o == ir::instructions::BinaryOpcode::UDiv => {
+                            let div = Value::Op(Op::Div(Box::new(lft), Box::new(rgt)));
+                            InferredValue::Single(if bop.is_exact { div } else { Value::Op(Op::Floor(Box::new(div))) })
+                        }
+                        o if o == ir::instructions::BinaryOpcode::URem => InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt)))),
+                        o if o == ir::instructions::BinaryOpcode::SDiv || o == ir::instructions::BinaryOpcode::SRem => {
+                            return Err(CompException("ConstExpr signed div/rem not supported".to_string()));
+                        }
+                        o if o == ir::instructions::BinaryOpcode::Shl => {
+                            let modulus = Value::Known(KnownVal::Num(2f64.powi(width as i32)));
+                            InferredValue::Single(Value::Op(Op::Mod(
+                                Box::new(Value::Op(Op::Mul(Box::new(lft), Box::new(Value::Known(KnownVal::Num(2f64.powi(width as i32))))))),
+                                Box::new(modulus),
+                            )))
+                        }
+                        o if o == ir::instructions::BinaryOpcode::LShr => {
+                            InferredValue::Single(Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(Box::new(lft), Box::new(rgt)))))))
+                        }
+                        o if o == ir::instructions::BinaryOpcode::AShr => {
+                            let half = 2f64.powi((width - 1) as i32);
+                            let twos = 2f64.powi(width as i32);
+                            let cond = Value::BoolOp(BoolOp::Lt(Box::new(lft.clone()), Box::new(Value::Known(KnownVal::Num(half)))));
+                            let signed = Value::Op(Op::Sub(Box::new(lft), Box::new(Value::Op(Op::Mul(
+                                Box::new(Value::Known(KnownVal::Num(twos))),
+                                Box::new(Value::Op(Op::BoolToFloat(Box::new(cond)))),
+                            )))));
+                            InferredValue::Single(signed) // simplified: just the signed interpretation
+                        }
+                        o if o == ir::instructions::BinaryOpcode::And || o == ir::instructions::BinaryOpcode::Or || o == ir::instructions::BinaryOpcode::Xor => {
+                            return Err(CompException(format!("ConstExpr bitwise {:?} not supported", bop.opcode)));
+                        }
+                        o if o == ir::instructions::BinaryOpcode::FAdd => InferredValue::Single(Value::Op(Op::Add(Box::new(lft), Box::new(rgt)))),
+                        o if o == ir::instructions::BinaryOpcode::FSub => InferredValue::Single(Value::Op(Op::Sub(Box::new(lft), Box::new(rgt)))),
+                        o if o == ir::instructions::BinaryOpcode::FMul => InferredValue::Single(Value::Op(Op::Mul(Box::new(lft), Box::new(rgt)))),
+                        o if o == ir::instructions::BinaryOpcode::FDiv => InferredValue::Single(Value::Op(Op::Div(Box::new(lft), Box::new(rgt)))),
+                        o if o == ir::instructions::BinaryOpcode::FRem => {
+                            let modded = Value::Op(Op::Mod(Box::new(lft.clone()), Box::new(rgt.clone())));
+                            InferredValue::Single(Value::Op(Op::Sub(Box::new(modded), Box::new(rgt))))
+                        }
+                        _ => return Err(CompException(format!("ConstExpr BinaryOp opcode {:?} not supported", bop.opcode))),
+                    }
+                };
+                Ok(res)
             }
             _ => Err(CompException(format!("Cannot translate const expr: {:?}", ce))),
         },
@@ -548,15 +606,15 @@ fn localize_func_ptr_sig_callback(signature_id: usize) -> String {
     format!("{}:callback", localize_func_ptr_sig(signature_id))
 }
 
-fn get_func_ptr_addr(ptr: &str, ctx: &Context) -> usize {
+fn get_func_ptr_addr(ptr: &str, ctx: &Context) -> Result<usize, CompException> {
     let mut addr = ctx.min_func_ptr_addr;
     for (_, ptrs) in &ctx.fn_ptr_sigs {
         if let Some(pos) = ptrs.iter().position(|p| p == ptr) {
-            return addr + pos;
+            return Ok(addr + pos);
         }
         addr += ptrs.len();
     }
-    panic!("Could not find function pointer for {}", ptr);
+    Err(CompException(format!("Could not find function pointer for {}", ptr)))
 }
 
 fn get_value_func_ptr_refs(value: &ir::Value) -> HashSet<String> {
@@ -937,7 +995,11 @@ pub fn load_from_stack(
 /// Serialize a compile-time constant value into the byte-oriented initial
 /// memory list.  The result is padded with zeros to `expected_size` to match
 /// Python's `padValue` behavior for global initializers.
-fn value_to_init_mem(val: &ir::Value, expected_size: usize) -> Vec<KnownVal> {
+fn value_to_init_mem(
+    val: &ir::Value,
+    expected_size: usize,
+    ctx: &mut Context,
+) -> Result<Vec<KnownVal>, CompException> {
     match val {
         ir::Value::KnownInt(ki) => {
             let mut vals = Vec::new();
@@ -957,44 +1019,117 @@ fn value_to_init_mem(val: &ir::Value, expected_size: usize) -> Vec<KnownVal> {
             while vals.len() < expected_size {
                 vals.push(KnownVal::Num(0.0));
             }
-            vals
+            Ok(vals)
         }
         ir::Value::KnownFloat(kf) => {
             let mut vals = vec![KnownVal::Num(kf.value)];
             while vals.len() < expected_size {
                 vals.push(KnownVal::Num(0.0));
             }
-            vals
+            Ok(vals)
         }
         ir::Value::KnownArr(arr) => {
             let mut vals = Vec::new();
             for elem in &arr.values {
                 let elem_size = memory::get_size_of(elem.type_(), true).unwrap_or(1);
-                vals.extend(value_to_init_mem(elem, elem_size));
+                vals.extend(value_to_init_mem(elem, elem_size, ctx)?);
             }
             while vals.len() < expected_size {
                 vals.push(KnownVal::Num(0.0));
             }
-            vals
+            Ok(vals)
         }
         ir::Value::KnownStruct(struc) => {
             let mut vals = Vec::new();
             for elem in &struc.values {
                 let elem_size = memory::get_size_of(elem.type_(), true).unwrap_or(1);
-                vals.extend(value_to_init_mem(elem, elem_size));
+                vals.extend(value_to_init_mem(elem, elem_size, ctx)?);
             }
             while vals.len() < expected_size {
                 vals.push(KnownVal::Num(0.0));
             }
-            vals
+            Ok(vals)
+        }
+        ir::Value::KnownVec(kv) => {
+            let mut vals = Vec::new();
+            for elem in &kv.values {
+                let elem_size = memory::get_size_of(elem.type_(), true).unwrap_or(1);
+                vals.extend(value_to_init_mem(elem, elem_size, ctx)?);
+            }
+            while vals.len() < expected_size {
+                vals.push(KnownVal::Num(0.0));
+            }
+            Ok(vals)
         }
         ir::Value::NullPtr(_) | ir::Value::Undef(_) => {
-            (0..expected_size).map(|_| KnownVal::Num(0.0)).collect()
+            Ok((0..expected_size).map(|_| KnownVal::Num(0.0)).collect())
         }
-        _ => {
-            // Unknown initializer: zero-fill to preserve alignment.
-            (0..expected_size).map(|_| KnownVal::Num(0.0)).collect()
+        ir::Value::GlobalPtr(gp) => {
+            if let Some(&ptr) = ctx.globvar_to_ptr.get(&gp.name) {
+                let mut vals = vec![KnownVal::Num(ptr as f64)];
+                while vals.len() < expected_size {
+                    vals.push(KnownVal::Num(0.0));
+                }
+                Ok(vals)
+            } else {
+                Err(CompException(format!(
+                    "Global variable not found: {}",
+                    gp.name
+                )))
+            }
         }
+        ir::Value::Function(fv) => {
+            if ctx.fn_ptr_sigs.iter().any(|(_, ptrs)| ptrs.contains(&fv.name)) {
+                let ptr_addr = get_func_ptr_addr(&fv.name, ctx)?;
+                let mut vals = vec![KnownVal::Num(ptr_addr as f64)];
+                while vals.len() < expected_size {
+                    vals.push(KnownVal::Num(0.0));
+                }
+                Ok(vals)
+            } else if let Some(info) = ctx.fn_info.get(&fv.name) {
+                let mut vals = vec![KnownVal::Num(info.fn_id as f64)];
+                while vals.len() < expected_size {
+                    vals.push(KnownVal::Num(0.0));
+                }
+                Ok(vals)
+            } else {
+                Err(CompException(format!("Function not found: {}", fv.name)))
+            }
+        }
+        ir::Value::ConstExpr(ce) => match &ce.expr {
+            ir::values::ConstExpr::Conversion(c) => {
+                value_to_init_mem(&c.value, expected_size, ctx)
+            }
+            ir::values::ConstExpr::GetElementPtr(gep) => {
+                let val = trans_gep_value(
+                    &gep.base_ptr,
+                    &gep.base_ptr_type,
+                    &gep.indices,
+                    gep.is_nuw,
+                    ctx,
+                    None,
+                    true,
+                )?;
+                match val {
+                    Value::Known(KnownVal::Num(n)) => {
+                        let mut vals = vec![KnownVal::Num(n)];
+                        while vals.len() < expected_size {
+                            vals.push(KnownVal::Num(0.0));
+                        }
+                        Ok(vals)
+                    }
+                    _ => Ok((0..expected_size)
+                        .map(|_| KnownVal::Num(0.0))
+                        .collect()),
+                }
+            }
+            _ => Ok((0..expected_size)
+                .map(|_| KnownVal::Num(0.0))
+                .collect()),
+        },
+        _ => Ok((0..expected_size)
+            .map(|_| KnownVal::Num(0.0))
+            .collect()),
     }
 }
 
@@ -1061,7 +1196,7 @@ pub fn init_memory(
             )?);
         }
 
-        init_mem.extend(value_to_init_mem(&gv.init, sizes[i]));
+        init_mem.extend(value_to_init_mem(&gv.init, sizes[i], ctx)?);
 
         ptr += sizes[i];
     }
@@ -1273,9 +1408,10 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
     for x in 1u32..256 {
         let c = char::from_u32(x).unwrap_or(char::REPLACEMENT_CHARACTER);
         let s = c.to_string();
-        let escaped = s.escape_unicode().to_string();
-        if escaped.starts_with('\\') && c != '\\' {
-            ascii_lookup_vals.push(KnownVal::Str(escaped));
+        // Match Python's unicode_escape behavior: escape control characters
+        // (1-31, 127) and high bytes (128-255), but keep backslash literal.
+        if (x <= 31 || x >= 127) && x != 92 {
+            ascii_lookup_vals.push(KnownVal::Str(format!("\\{:02X}", x)));
         } else {
             ascii_lookup_vals.push(KnownVal::Str(s));
         }
@@ -1287,7 +1423,10 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
             var_type: VarType::Param,
             fn_name: Some(name.to_string()),
         }).collect();
-        let raw_param_names: Vec<String> = localized_params.iter().map(|p| p.var_name.clone()).collect();
+        let raw_param_names: Vec<String> = localized_params
+            .iter()
+            .map(|p| p.get_raw_var_name(None))
+            .collect();
         let mut blocks = BlockList::from_blocks(vec![
             Block::ProcedureDef(ProcedureDefData {
                 name: name.to_string(),
@@ -1932,7 +2071,10 @@ fn maybe_add_str2color_helper(ctx: &mut Context) {
         var_type: VarType::Param,
         fn_name: Some(name.to_string()),
     }).collect();
-    let raw_param_names: Vec<String> = localized_params.iter().map(|p| p.var_name.clone()).collect();
+    let raw_param_names: Vec<String> = localized_params
+        .iter()
+        .map(|p| p.get_raw_var_name(None))
+        .collect();
     let mut blocks = BlockList::from_blocks(vec![
         Block::ProcedureDef(ProcedureDefData {
             name: name.to_string(),
@@ -3506,6 +3648,164 @@ fn ashr_i64_by_32(val: &IdxbleValue) -> Result<IdxbleValue, CompException> {
     })
 }
 
+fn handle_arith_binop(
+    opcode: ir::instructions::BinaryOpcode,
+    lft: Value,
+    rgt: Value,
+    _res_var: &Variable,
+    _blocks: &mut BlockList,
+    _ctx: &mut Context,
+) -> Result<Option<InferredValue>, CompException> {
+    match opcode {
+        ir::instructions::BinaryOpcode::FAdd => Ok(Some(InferredValue::Single(Value::Op(Op::Add(Box::new(lft), Box::new(rgt)))))),
+        ir::instructions::BinaryOpcode::FSub => Ok(Some(InferredValue::Single(Value::Op(Op::Sub(Box::new(lft), Box::new(rgt)))))),
+        ir::instructions::BinaryOpcode::FMul => Ok(Some(InferredValue::Single(Value::Op(Op::Mul(Box::new(lft), Box::new(rgt)))))),
+        ir::instructions::BinaryOpcode::FDiv => Ok(Some(InferredValue::Single(Value::Op(Op::Div(Box::new(lft), Box::new(rgt)))))),
+        ir::instructions::BinaryOpcode::FRem => {
+            let cond = match (&lft, &rgt) {
+                (Value::Known(KnownVal::Num(lk)), Value::Known(KnownVal::Num(rk))) => {
+                    if *lk > 0.0 {
+                        Value::Known(KnownVal::Num(if *rk < 0.0 { 1.0 } else { 0.0 }))
+                    } else {
+                        Value::Known(KnownVal::Num(if *rk > 0.0 { 1.0 } else { 0.0 }))
+                    }
+                }
+                (Value::Known(KnownVal::Num(lk)), _) => {
+                    if *lk > 0.0 {
+                        Value::BoolOp(BoolOp::Lt(Box::new(rgt.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
+                    } else {
+                        Value::BoolOp(BoolOp::Gt(Box::new(rgt.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
+                    }
+                }
+                (_, Value::Known(KnownVal::Num(rk))) => {
+                    if *rk > 0.0 {
+                        Value::BoolOp(BoolOp::Lt(Box::new(lft.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
+                    } else {
+                        Value::BoolOp(BoolOp::Gt(Box::new(lft.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
+                    }
+                }
+                _ => Value::BoolOp(BoolOp::Lt(
+                    Box::new(Value::Op(Op::Mul(Box::new(lft.clone()), Box::new(rgt.clone())))),
+                    Box::new(Value::Known(KnownVal::Num(0.0))),
+                )),
+            };
+            let modded = Value::Op(Op::Mod(Box::new(lft.clone()), Box::new(rgt.clone())));
+            let adjustment = Value::Op(Op::Mul(Box::new(rgt.clone()), Box::new(cond)));
+            Ok(Some(InferredValue::Single(Value::Op(Op::Sub(
+                Box::new(modded),
+                Box::new(adjustment),
+            )))))
+        }
+        _ => Err(CompException(format!("Unsupported binary opcode: {:?}", opcode))),
+    }
+}
+
+fn is_comptime_known(val: &Value) -> bool {
+    matches!(val, Value::Known(KnownVal::Num(_)))
+}
+
+fn try_comptime_wide_div(
+    lft: &IdxbleValue,
+    rgt: &IdxbleValue,
+    _width: usize,
+) -> Result<Option<IdxbleValue>, CompException> {
+    let all_known = lft.vals.iter().all(is_comptime_known)
+        && rgt.vals.iter().all(is_comptime_known);
+    if !all_known {
+        return Ok(None);
+    }
+
+    let mut dividend = 0u128;
+    for (i, v) in lft.vals.iter().enumerate() {
+        if let Value::Known(KnownVal::Num(n)) = v {
+            let chunk_val = *n as u128;
+            dividend |= chunk_val << (i * super::config::VARIABLE_MAX_BITS);
+        }
+    }
+
+    let mut divisor = 0u128;
+    for (i, v) in rgt.vals.iter().enumerate() {
+        if let Value::Known(KnownVal::Num(n)) = v {
+            let chunk_val = *n as u128;
+            divisor |= chunk_val << (i * super::config::VARIABLE_MAX_BITS);
+        }
+    }
+
+    if divisor == 0 {
+        return Err(CompException("Division by zero".to_string()));
+    }
+
+    let quotient = dividend / divisor;
+    let nchunks = lft.vals.len();
+    let mut result = Vec::with_capacity(nchunks);
+    for i in 0..nchunks {
+        let chunk = (quotient >> (i * super::config::VARIABLE_MAX_BITS)) & ((1u128 << super::config::VARIABLE_MAX_BITS) - 1);
+        result.push(Value::Known(KnownVal::Num(chunk as f64)));
+    }
+    Ok(Some(IdxbleValue { vals: result }))
+}
+
+fn try_comptime_wide_rem(
+    lft: &IdxbleValue,
+    rgt: &IdxbleValue,
+    _width: usize,
+) -> Result<Option<IdxbleValue>, CompException> {
+    let all_known = lft.vals.iter().all(is_comptime_known)
+        && rgt.vals.iter().all(is_comptime_known);
+    if !all_known {
+        return Ok(None);
+    }
+
+    let mut dividend = 0u128;
+    for (i, v) in lft.vals.iter().enumerate() {
+        if let Value::Known(KnownVal::Num(n)) = v {
+            let chunk_val = *n as u128;
+            dividend |= chunk_val << (i * super::config::VARIABLE_MAX_BITS);
+        }
+    }
+
+    let mut divisor = 0u128;
+    for (i, v) in rgt.vals.iter().enumerate() {
+        if let Value::Known(KnownVal::Num(n)) = v {
+            let chunk_val = *n as u128;
+            divisor |= chunk_val << (i * super::config::VARIABLE_MAX_BITS);
+        }
+    }
+
+    if divisor == 0 {
+        return Err(CompException("Division by zero".to_string()));
+    }
+
+    let remainder = dividend % divisor;
+    let nchunks = lft.vals.len();
+    let mut result = Vec::with_capacity(nchunks);
+    for i in 0..nchunks {
+        let chunk = (remainder >> (i * super::config::VARIABLE_MAX_BITS)) & ((1u128 << super::config::VARIABLE_MAX_BITS) - 1);
+        result.push(Value::Known(KnownVal::Num(chunk as f64)));
+    }
+    Ok(Some(IdxbleValue { vals: result }))
+}
+
+fn wide_udiv(lft: &IdxbleValue, rgt: &IdxbleValue, width: usize) -> Result<InferredValue, CompException> {
+    if let Some(result) = try_comptime_wide_div(lft, rgt, width)? {
+        return Ok(InferredValue::Indexed(result));
+    }
+    Err(CompException(format!(
+        "Unsigned division of {}-bit wide integers is not supported for non-constant values", width
+    )))
+}
+
+fn wide_udiv_with_rem(lft: &IdxbleValue, rgt: &IdxbleValue, width: usize) -> Result<(InferredValue, InferredValue), CompException> {
+    let q = try_comptime_wide_div(lft, rgt, width)?;
+    let r = try_comptime_wide_rem(lft, rgt, width)?;
+    match (q, r) {
+        (Some(q), Some(r)) => Ok((InferredValue::Indexed(q), InferredValue::Indexed(r))),
+        _ => Err(CompException(format!(
+            "Unsigned division/remainder of {}-bit wide integers is not supported for non-constant values", width
+        ))),
+    }
+}
+
 fn replace_var_name_in_value(value: &mut Value, old_name: &str, new_name: &str) {
     match value {
         Value::GetVar { name } => {
@@ -4724,90 +5024,56 @@ fn trans_instr(
                             }
                         }
                         _ => {
-                            let lft = lft_iv.into_single()?;
-                            let rgt = rgt_iv.into_single()?;
-                            match bop.opcode {
-                                ir::instructions::BinaryOpcode::UDiv => {
-                                    let width = get_value_width(&bop.left);
-                                    if width > super::config::VARIABLE_MAX_BITS {
+                            let width = get_value_width(&bop.left);
+                            if width > super::config::VARIABLE_MAX_BITS && matches!(&lft_iv, InferredValue::Indexed(_)) {
+                                let lft_idx = match lft_iv {
+                                    InferredValue::Indexed(iv) => iv,
+                                    _ => unreachable!(),
+                                };
+                                let rgt_idx = match rgt_iv {
+                                    InferredValue::Indexed(iv) => iv,
+                                    _ => IdxbleValue { vals: vec![rgt_iv.into_single()?] },
+                                };
+                                match bop.opcode {
+                                    ir::instructions::BinaryOpcode::UDiv => {
+                                        res_val = Some(wide_udiv(&lft_idx, &rgt_idx, width)?);
+                                    }
+                                    ir::instructions::BinaryOpcode::URem => {
+                                        let (_, rem) = wide_udiv_with_rem(&lft_idx, &rgt_idx, width)?;
+                                        res_val = Some(rem);
+                                    }
+                                    _ => {
                                         return Err(CompException(format!(
-                                            "Unsigned division of {}-bit integers is not supported",
-                                            width
+                                            "{}-bit wide integer operation {:?} is not supported",
+                                            width, bop.opcode
                                         )));
                                     }
-                                    let div = Value::Op(Op::Div(Box::new(lft), Box::new(rgt)));
-                                    let res = if bop.is_exact {
-                                        div
-                                    } else {
-                                        Value::Op(Op::Floor(Box::new(div)))
-                                    };
-                                    res_val = Some(InferredValue::Single(res));
                                 }
-                                ir::instructions::BinaryOpcode::SDiv => {
-                                    let width = get_value_width(&bop.left);
-                                    blocks.add(signed_div_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
-                                }
-                                ir::instructions::BinaryOpcode::URem => {
-                                    res_val = Some(InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt)))));
-                                }
-                                ir::instructions::BinaryOpcode::SRem => {
-                                    let width = get_value_width(&bop.left);
-                                    blocks.add(signed_rem_blocks(&res_var, lft, rgt, width, ctx)?);
-                                }
-                                ir::instructions::BinaryOpcode::FAdd => {
-                                    res_val = Some(InferredValue::Single(Value::Op(Op::Add(Box::new(lft), Box::new(rgt)))));
-                                }
-                                ir::instructions::BinaryOpcode::FSub => {
-                                    res_val = Some(InferredValue::Single(Value::Op(Op::Sub(Box::new(lft), Box::new(rgt)))));
-                                }
-                                ir::instructions::BinaryOpcode::FMul => {
-                                    res_val = Some(InferredValue::Single(Value::Op(Op::Mul(Box::new(lft), Box::new(rgt)))));
-                                }
-                                ir::instructions::BinaryOpcode::FDiv => {
-                                    res_val = Some(InferredValue::Single(Value::Op(Op::Div(Box::new(lft), Box::new(rgt)))));
-                                }
-                                ir::instructions::BinaryOpcode::FRem => {
-                                    // Match Python: adjust the sign of fmod so that
-                                    // frem has the same sign as the dividend (IEEE 754).
-                                    let cond = match (&lft, &rgt) {
-                                        (
-                                            Value::Known(KnownVal::Num(lk)),
-                                            Value::Known(KnownVal::Num(rk)),
-                                        ) => {
-                                            if *lk > 0.0 {
-                                                Value::Known(KnownVal::Num(if *rk < 0.0 { 1.0 } else { 0.0 }))
-                                            } else {
-                                                Value::Known(KnownVal::Num(if *rk > 0.0 { 1.0 } else { 0.0 }))
-                                            }
-                                        }
-                                        (Value::Known(KnownVal::Num(lk)), _) => {
-                                            if *lk > 0.0 {
-                                                Value::BoolOp(BoolOp::Lt(Box::new(rgt.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
-                                            } else {
-                                                Value::BoolOp(BoolOp::Gt(Box::new(rgt.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
-                                            }
-                                        }
-                                        (_, Value::Known(KnownVal::Num(rk))) => {
-                                            if *rk > 0.0 {
-                                                Value::BoolOp(BoolOp::Lt(Box::new(lft.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
-                                            } else {
-                                                Value::BoolOp(BoolOp::Gt(Box::new(lft.clone()), Box::new(Value::Known(KnownVal::Num(0.0)))))
-                                            }
-                                        }
-                                        _ => Value::BoolOp(BoolOp::Lt(
-                                            Box::new(Value::Op(Op::Mul(Box::new(lft.clone()), Box::new(rgt.clone())))),
-                                            Box::new(Value::Known(KnownVal::Num(0.0))),
-                                        )),
-                                    };
-                                    let modded = Value::Op(Op::Mod(Box::new(lft.clone()), Box::new(rgt.clone())));
-                                    let adjustment = Value::Op(Op::Mul(Box::new(rgt.clone()), Box::new(cond)));
-                                    res_val = Some(InferredValue::Single(Value::Op(Op::Sub(
-                                        Box::new(modded),
-                                        Box::new(adjustment),
-                                    ))));
-                                }
-                                _ => {
-                                    return Err(CompException(format!("Unsupported binary opcode: {:?}", bop.opcode)));
+                            } else {
+                                let lft = lft_iv.into_single()?;
+                                let rgt = rgt_iv.into_single()?;
+                                match bop.opcode {
+                                    ir::instructions::BinaryOpcode::UDiv => {
+                                        let div = Value::Op(Op::Div(Box::new(lft), Box::new(rgt)));
+                                        let res = if bop.is_exact {
+                                            div
+                                        } else {
+                                            Value::Op(Op::Floor(Box::new(div)))
+                                        };
+                                        res_val = Some(InferredValue::Single(res));
+                                    }
+                                    ir::instructions::BinaryOpcode::SDiv => {
+                                        blocks.add(signed_div_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
+                                    }
+                                    ir::instructions::BinaryOpcode::URem => {
+                                        res_val = Some(InferredValue::Single(Value::Op(Op::Mod(Box::new(lft), Box::new(rgt)))));
+                                    }
+                                    ir::instructions::BinaryOpcode::SRem => {
+                                        blocks.add(signed_rem_blocks(&res_var, lft, rgt, width, ctx)?);
+                                    }
+                                    _ => {
+                                        res_val = handle_arith_binop(bop.opcode, lft, rgt, &res_var, &mut blocks, ctx)?;
+                                    }
                                 }
                             }
                         }
@@ -6157,7 +6423,7 @@ fn trans_intrinsic(
         Intrinsic::FShl | Intrinsic::FShr => {
             let mut it = values.into_iter();
             let a = it.next().ok_or_else(|| CompException("fshl/fshr requires three arguments".to_string()))?;
-            let b = it.next().ok_or_else(|| CompException("fshl/fshr requires three arguments".to_string()))?;
+            let b_val = it.next().ok_or_else(|| CompException("fshl/fshr requires three arguments".to_string()))?;
             let c = it.next().ok_or_else(|| CompException("fshl/fshr requires three arguments".to_string()))?;
             let res_var = result_var.ok_or_else(|| CompException("fshl/fshr requires a result variable".to_string()))?;
 
@@ -6166,35 +6432,69 @@ fn trans_intrinsic(
                 _ => return Err(CompException("fshl/fshr requires integer operands".to_string())),
             };
 
-            let c_num = match c {
-                Value::Known(KnownVal::Num(n)) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as i32,
-                _ => return Err(CompException(format!("fshl/fshr requires a known non-negative shift amount, got {:?}", c))),
-            };
-            if c_num as usize >= width {
-                return Err(CompException(format!("fshl/fshr shift amount {} out of range for width {}", c_num, width)));
-            }
-
             // fshr(a, b, c) = fshl(b, a, c): swap a and b for fshr
             let (a, b) = if matches!(intrinsic, Intrinsic::FShr) {
-                (b, a)
+                (b_val, a)
             } else {
-                (a, b)
+                (a, b_val)
             };
 
-            let modulus = 2f64.powi(width as i32);
-            let a_shift = 2f64.powi(c_num);
-            let b_shift = 2f64.powi((width as i32) - c_num);
+            let modulus = Value::Known(KnownVal::Num(2f64.powi(width as i32)));
 
-            let shifted_a = Value::Op(Op::Mod(
-                Box::new(Value::Op(Op::Mul(Box::new(a), Box::new(Value::Known(KnownVal::Num(a_shift)))))),
-                Box::new(Value::Known(KnownVal::Num(modulus))),
-            ));
-            let shifted_b = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
-                Box::new(b),
-                Box::new(Value::Known(KnownVal::Num(b_shift))),
-            )))));
-            let res = Value::Op(Op::Add(Box::new(shifted_a), Box::new(shifted_b)));
-            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+            // Compute fshl(a, b, shift) = (a*2^shift + b/2^(width-shift)) mod 2^width
+            let compute_fshl = |shift_val: f64| -> Value {
+                let a_shift = 2f64.powi(shift_val as i32);
+                let b_shift = 2f64.powi((width as i32) - shift_val as i32);
+                let shifted_a = Value::Op(Op::Mod(
+                    Box::new(Value::Op(Op::Mul(Box::new(a.clone()), Box::new(Value::Known(KnownVal::Num(a_shift)))))),
+                    Box::new(modulus.clone()),
+                ));
+                let shifted_b = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                    Box::new(b.clone()),
+                    Box::new(Value::Known(KnownVal::Num(b_shift))),
+                )))));
+                let raw = Value::Op(Op::Add(Box::new(shifted_a), Box::new(shifted_b)));
+                Value::Op(Op::Mod(Box::new(raw), Box::new(modulus.clone())))
+            };
+
+            match c {
+                Value::Known(KnownVal::Num(n)) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
+                    let c_num = n as i32;
+                    if c_num as usize >= width {
+                        return Err(CompException(format!("fshl/fshr shift amount {} out of range for width {}", c_num, width)));
+                    }
+                    let res = compute_fshl(n);
+                    blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+                }
+                c => {
+                    // Runtime shift amount: generate if/else chain for all possible
+                    // shift values 0..width. The last matching condition wins.
+                    let res = compute_fshl(0.0);
+                    blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+                    for shift_val in 1..width {
+                        let shift_f = shift_val as f64;
+                        let cond = Value::BoolOp(BoolOp::Eq(
+                            Box::new(c.clone()),
+                            Box::new(Value::Known(KnownVal::Num(shift_f))),
+                        ));
+                        let then_res = compute_fshl(shift_f);
+                        let then_blocks = BlockList::from_blocks(vec![
+                            Block::EditVar(EditVarData {
+                                op: VarOp::Set,
+                                name: res_var.var_name.clone(),
+                                value: then_res,
+                            }),
+                        ]);
+                        blocks.add_block(Block::ControlFlow(ControlFlow {
+                            op: ControlOp::If,
+                            condition: Some(cond),
+                            body: Some(then_blocks),
+                            else_body: None,
+                            var: None,
+                        }));
+                    }
+                }
+            }
         }
         Intrinsic::UMulWithOverflow => {
             let mut it = values.into_iter();
@@ -6250,50 +6550,54 @@ fn trans_intrinsic(
                 _ => return Err(CompException("ctlz requires integer operand".to_string())),
             };
 
-            if width != 32 {
-                return Err(CompException(format!("ctlz width {} not supported", width)));
+            if width == 0 || width > 48 {
+                return Err(CompException(format!("ctlz width {} not supported (1..48 supported)", width)));
             }
 
-            // Count leading zeros for a 32-bit value with a binary search.
+            // Standard Hacker's Delight binary search for leading zeros.
+            // Pad to next power of two, run the search on the padded domain,
+            // then subtract the excess padding bits from the result.
+            let domain = width.next_power_of_two();
+            let excess = domain - width;
+
             let mut ctlz_blocks = BlockList::new();
-            let count_var = gen_temp_var(ctx);
-            let val_var = gen_temp_var(ctx);
+            let n_var = gen_temp_var(ctx);
+            let x_var = gen_temp_var(ctx);
 
             ctlz_blocks.add_block(Block::EditVar(EditVarData {
                 op: VarOp::Set,
-                name: count_var.clone(),
-                value: Value::Known(KnownVal::Num(0.0)),
+                name: n_var.clone(),
+                value: Value::Known(KnownVal::Num(domain as f64)),
             }));
             ctlz_blocks.add_block(Block::EditVar(EditVarData {
                 op: VarOp::Set,
-                name: val_var.clone(),
+                name: x_var.clone(),
                 value: val,
             }));
 
-            for (shift, add) in [(16, 16), (8, 8), (4, 4), (2, 2), (1, 1)] {
-                let divisor = Value::Known(KnownVal::Num(2f64.powi(shift)));
-                let multiplier = Value::Known(KnownVal::Num(2f64.powi(shift)));
+            let mut shift = domain / 2;
+            while shift > 0 {
+                let divisor = Value::Known(KnownVal::Num(2f64.powi(shift as i32)));
                 let shifted = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
-                    Box::new(Value::GetVar { name: val_var.clone() }),
+                    Box::new(Value::GetVar { name: x_var.clone() }),
                     Box::new(divisor),
                 )))));
-                let cond = Value::BoolOp(BoolOp::Eq(
-                    Box::new(shifted),
+                // If the upper `shift` bits are non-zero, discard the lower bits
+                let is_zero = Value::BoolOp(BoolOp::Eq(
+                    Box::new(shifted.clone()),
                     Box::new(Value::Known(KnownVal::Num(0.0))),
                 ));
+                let cond = Value::BoolOp(BoolOp::Not(Box::new(is_zero)));
                 let then_blocks = BlockList::from_blocks(vec![
                     Block::EditVar(EditVarData {
                         op: VarOp::Change,
-                        name: count_var.clone(),
-                        value: Value::Known(KnownVal::Num(add as f64)),
+                        name: n_var.clone(),
+                        value: Value::Known(KnownVal::Num(-(shift as f64))),
                     }),
                     Block::EditVar(EditVarData {
                         op: VarOp::Set,
-                        name: val_var.clone(),
-                        value: Value::Op(Op::Mul(
-                            Box::new(Value::GetVar { name: val_var.clone() }),
-                            Box::new(multiplier),
-                        )),
+                        name: x_var.clone(),
+                        value: shifted,
                     }),
                 ]);
                 ctlz_blocks.add_block(Block::ControlFlow(ControlFlow {
@@ -6303,10 +6607,20 @@ fn trans_intrinsic(
                     else_body: None,
                     var: None,
                 }));
+                shift /= 2;
             }
 
-            blocks.add(ctlz_blocks);
-            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::GetVar { name: count_var }))?);
+            // Final correction: n - x (x is 0 or 1 after the search)
+            let x_val = Value::GetVar { name: x_var };
+            let result = Value::Op(Op::Sub(
+                Box::new(Value::GetVar { name: n_var }),
+                Box::new(x_val),
+            ));
+            let result = Value::Op(Op::Sub(
+                Box::new(result),
+                Box::new(Value::Known(KnownVal::Num(excess as f64))),
+            ));
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(result))?);
         }
         Intrinsic::GetRounding => {
             let res_var = result_var.ok_or_else(|| CompException("get.rounding requires a result variable".to_string()))?;

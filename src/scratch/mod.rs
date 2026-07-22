@@ -11,6 +11,43 @@ use serde_json::Value as JsonValue;
 
 use uid::UidGenerator;
 
+/// The display name written into a VARIABLE/LIST field or a `[12,..]`/`[13,..]`
+/// variable/list reference. Python blanks this to `""` when minifying (the real
+/// name still lives once in the top-level `variables`/`lists` table), matching
+/// `name = self.var * (not ctx.cfg.minify)` in scratch.py.
+fn field_display_name<'a>(name: &'a str, minify: bool) -> &'a str {
+    if minify { "" } else { name }
+}
+
+/// Serialize a value like Python's `json.dumps` with default separators
+/// (", " after commas and ": " after colons). The outer project.json uses
+/// compact separators, but embedded strings inside block mutations are
+/// serialized by Python with spaces first, so we must match that.
+pub(crate) fn python_json_dumps<T: serde::Serialize>(val: &T) -> String {
+    let value = serde_json::to_value(val).unwrap_or_default();
+    format_python_json_value(&value)
+}
+
+fn format_python_json_value(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(format_python_json_value).collect();
+            format!("[{}]", items.join(", "))
+        }
+        JsonValue::Object(obj) => {
+            let items: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| format!("{}: {}", format_python_json_value(&JsonValue::String(k.clone())), format_python_json_value(v)))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        JsonValue::String(s) => serde_json::to_string(s).unwrap_or_default(),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Null => "null".to_string(),
+    }
+}
+
 pub const MAIN_SPRITE_NAME: &str = "DONT OPEN";
 pub const EMPTY_SPRITE_NAME: &str = "Empty";
 pub const DEFAULT_BROADCAST_MESSAGE: &str = "message1";
@@ -411,7 +448,8 @@ fn get_raw_block(
             if effective_op == ControlOp::ForEach
                 && let Some(var_name) = var {
                     let var_id = ctx.add_or_get_var(var_name, None);
-                    raw.insert("fields".to_string(), serde_json::json!({"VARIABLE": [var_name, var_id]}));
+                    let disp = field_display_name(var_name, ctx.cfg.minify);
+                    raw.insert("fields".to_string(), serde_json::json!({"VARIABLE": [disp, var_id]}));
                 }
         }
         Block::StopScript(opt) => {
@@ -470,7 +508,8 @@ fn get_raw_block(
             };
             let input = get_raw_value(&data.value, my_id, ctx, cast);
             raw.insert("inputs".to_string(), serde_json::json!({"VALUE": input}));
-            raw.insert("fields".to_string(), serde_json::json!({"VARIABLE": [data.name, var_id]}));
+            let disp = field_display_name(&data.name, ctx.cfg.minify);
+            raw.insert("fields".to_string(), serde_json::json!({"VARIABLE": [disp, var_id]}));
         }
         Block::EditList(data) => {
             let opcode = opcode_from_short_op(match data.op {
@@ -494,7 +533,7 @@ fn get_raw_block(
             if !inputs.is_empty() {
                 raw.insert("inputs".to_string(), JsonValue::Object(inputs));
             }
-            raw.insert("fields".to_string(), serde_json::json!({"LIST": [data.name, list_id]}));
+            raw.insert("fields".to_string(), serde_json::json!({"LIST": [field_display_name(&data.name, ctx.cfg.minify), list_id]}));
         }
         Block::ProcedureDef(data) => {
             raw.insert("opcode".to_string(), JsonValue::String("procedures_definition".to_string()));
@@ -530,10 +569,10 @@ fn get_raw_block(
                 "tagName": "mutation",
                 "children": [],
                 "proccode": proccode,
-                "argumentids": serde_json::to_string(&param_ids).unwrap_or_default(),
-                "argumentnames": serde_json::to_string(&data.params.iter().map(|p| sanitize_proc_name(p, true)).collect::<Vec<_>>()).unwrap_or_default(),
-                "argumentdefaults": serde_json::to_string(&vec![""; data.params.len()]).unwrap_or_default(),
-                "warp": serde_json::to_string(&data.warp).unwrap_or_default()
+                "argumentids": python_json_dumps(&param_ids),
+                "argumentnames": python_json_dumps(&data.params.iter().map(|p| sanitize_proc_name(p, true)).collect::<Vec<_>>()),
+                "argumentdefaults": python_json_dumps(&vec![""; data.params.len()]),
+                "warp": python_json_dumps(&data.warp)
             }));
 
             ctx.add_block(&proto_id, &Block::RawBlock(proto_data), &BlockMeta::new_shadow(Some(my_id.clone()), None));
@@ -619,11 +658,13 @@ fn get_raw_value(
         }
         Value::GetVar { name } => {
             let var_id = ctx.add_or_get_var(name, None);
-            vec![JsonValue::Number(3.into()), serde_json::json!([12, name, var_id])]
+            let disp = field_display_name(name, ctx.cfg.minify);
+            vec![JsonValue::Number(3.into()), serde_json::json!([12, disp, var_id])]
         }
         Value::GetList { name } => {
             let list_id = ctx.add_or_get_list(name, vec![]);
-            vec![JsonValue::Number(3.into()), serde_json::json!([13, name, list_id])]
+            let disp = field_display_name(name, ctx.cfg.minify);
+            vec![JsonValue::Number(3.into()), serde_json::json!([13, disp, list_id])]
         }
         Value::GetOfList(data) => {
             let id = ctx.gen_id();
@@ -649,7 +690,7 @@ fn get_raw_value(
                 let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String(opcode.to_string()));
                 r.insert("inputs".to_string(), serde_json::json!({input_name: raw_value}));
-                r.insert("fields".to_string(), serde_json::json!({"LIST": [data.name, list_id]}));
+                r.insert("fields".to_string(), serde_json::json!({"LIST": [field_display_name(&data.name, ctx.cfg.minify), list_id]}));
                 r
             }), &BlockMeta::new(Some(parent.clone()), None));
             vec![JsonValue::Number(3.into()), JsonValue::String(id)]
@@ -660,7 +701,7 @@ fn get_raw_value(
             ctx.add_block(&id, &Block::RawBlock({
                 let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String("data_lengthoflist".to_string()));
-                r.insert("fields".to_string(), serde_json::json!({"LIST": [name, list_id]}));
+                r.insert("fields".to_string(), serde_json::json!({"LIST": [field_display_name(name, ctx.cfg.minify), list_id]}));
                 r
             }), &BlockMeta::new(Some(parent.clone()), None));
             vec![JsonValue::Number(3.into()), JsonValue::String(id)]

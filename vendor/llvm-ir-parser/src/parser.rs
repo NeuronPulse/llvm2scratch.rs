@@ -1378,6 +1378,7 @@ impl<'src> Parser<'src> {
             }
             Token::Kw(Keyword::Load) => {
                 self.lex.next()?;
+                let is_atomic = self.lex.eat_kw(Keyword::Atomic);
                 let volatile = self.lex.eat_kw(Keyword::Volatile);
                 let ty = self.parse_type()?;
                 self.lex.expect(&Token::Comma)?;
@@ -1385,6 +1386,15 @@ impl<'src> Parser<'src> {
                     let ptype = self.parse_type()?;
                     (ptype, self.parse_value(ptype)?)
                 };
+                // Atomic load: optional syncscope + required ordering
+                if is_atomic {
+                    self.lex.eat_kw(Keyword::SyncScope);
+                    for kw in [Keyword::Acquire, Keyword::Release, Keyword::AcqRel, Keyword::SeqCst] {
+                        if self.lex.eat_kw(kw) {
+                            break;
+                        }
+                    }
+                }
                 let align = self.parse_optional_align()?;
                 Ok((
                     InstrKind::Load {
@@ -1398,11 +1408,21 @@ impl<'src> Parser<'src> {
             }
             Token::Kw(Keyword::Store) => {
                 self.lex.next()?;
+                let is_atomic = self.lex.eat_kw(Keyword::Atomic);
                 let volatile = self.lex.eat_kw(Keyword::Volatile);
                 let (val, _val_ty) = self.parse_typed_value()?;
                 self.lex.expect(&Token::Comma)?;
                 let ptr_ty2 = self.parse_type()?;
                 let ptr = self.parse_value(ptr_ty2)?;
+                // Atomic store: optional syncscope + required ordering
+                if is_atomic {
+                    self.lex.eat_kw(Keyword::SyncScope);
+                    for kw in [Keyword::Acquire, Keyword::Release, Keyword::AcqRel, Keyword::SeqCst] {
+                        if self.lex.eat_kw(kw) {
+                            break;
+                        }
+                    }
+                }
                 let align = self.parse_optional_align()?;
                 let void_ty = self.ctx.void_ty;
                 Ok((
@@ -1418,6 +1438,9 @@ impl<'src> Parser<'src> {
             Token::Kw(Keyword::Getelementptr) => {
                 self.lex.next()?;
                 let inbounds = self.lex.eat_kw(Keyword::Inbounds);
+                // LLVM 19+ may emit `nusw` (no-unsigned-signed-wrap) on GEP.
+                // Semantically it does not affect code generation; skip it.
+                let _ = self.lex.eat_kw(Keyword::Nusw);
                 while self.lex.eat_kw(Keyword::Nuw) {}
                 let base_ty = self.parse_type()?;
                 self.lex.expect(&Token::Comma)?;
@@ -2209,6 +2232,7 @@ impl<'src> Parser<'src> {
         Token::Kw(Keyword::Getelementptr) => {
             self.lex.next()?;
             let inbounds = self.lex.eat_kw(Keyword::Inbounds);
+            let _ = self.lex.eat_kw(Keyword::Nusw);
             // Constant GEP expressions use parenthesized operands:
             //   getelementptr inbounds (i8, ptr @g, i32 3)
             // whereas instruction GEP uses bare operands. Detect the form here.
@@ -2677,6 +2701,31 @@ impl<'src> Parser<'src> {
                 Token::Hash => {
                     self.lex.next()?;
                     self.lex.next()?; // skip number
+                }
+                // Any other keyword not recognized as a type start or
+                // attribute. Could be a function attribute keyword like
+                // `syncscope("agent")`. Skip it and any parenthesized args.
+                Token::Kw(_) => {
+                    self.lex.next()?;
+                    if matches!(self.lex.peek()?, Token::LParen) {
+                        self.lex.next()?;
+                        let mut depth = 1u32;
+                        loop {
+                            match self.lex.next()? {
+                                Token::LParen => depth += 1,
+                                Token::RParen => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                Token::Eof => {
+                                    return Err(self.err("unterminated function attribute"))
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 _ => break,
             }
@@ -3273,6 +3322,14 @@ impl<'src> Parser<'src> {
             Keyword::DsoLocal => "dso_local",
             Keyword::Fastcc => "fastcc",
             Keyword::Attributes => "attributes",
+            Keyword::Nusw => "nusw",
+            Keyword::Nontemporal => "nontemporal",
+            Keyword::Atomic => "atomic",
+            Keyword::Acquire => "acquire",
+            Keyword::Release => "release",
+            Keyword::AcqRel => "acq_rel",
+            Keyword::SeqCst => "seq_cst",
+            Keyword::SyncScope => "syncscope",
         }
     }
 
