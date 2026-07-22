@@ -5,8 +5,8 @@ pub mod uid;
 
 pub use ast::*;
 
-use std::collections::HashMap;
-
+use indexmap::IndexMap;
+use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 
 use uid::UidGenerator;
@@ -22,7 +22,7 @@ pub const EMPTY_SVG: &str = r#"<svg version="1.1" xmlns="http://www.w3.org/2000/
 pub struct Project {
     pub cfg: ScratchConfig,
     pub code: Vec<BlockList>,
-    pub lists: HashMap<String, Vec<KnownVal>>,
+    pub lists: IndexMap<String, Vec<KnownVal>>,
     pub costumes: Vec<String>,
 }
 
@@ -31,7 +31,7 @@ impl Project {
         Project {
             cfg,
             code: Vec::new(),
-            lists: HashMap::new(),
+            lists: IndexMap::new(),
             costumes: Vec::new(),
         }
     }
@@ -57,11 +57,11 @@ impl Project {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScratchContext {
     pub cfg: ScratchConfig,
-    pub vars: HashMap<String, (Id, KnownVal)>,
-    pub lists: HashMap<String, (Id, Vec<KnownVal>)>,
-    pub broadcasts: HashMap<String, Id>,
-    pub funcs: HashMap<String, (Vec<Id>, bool)>,
-    pub blocks: HashMap<Id, HashMap<String, JsonValue>>,
+    pub vars: IndexMap<String, (Id, KnownVal)>,
+    pub lists: IndexMap<String, (Id, Vec<KnownVal>)>,
+    pub broadcasts: IndexMap<String, Id>,
+    pub funcs: IndexMap<String, (Vec<Id>, bool)>,
+    pub blocks: IndexMap<Id, JsonMap<String, JsonValue>>,
     pub late_blocks: Vec<(Id, LateBlockData, BlockMeta)>,
     pub costumes: Vec<String>,
     uid_gen: UidGenerator,
@@ -80,11 +80,11 @@ impl ScratchContext {
         let minify = cfg.minify;
         ScratchContext {
             cfg,
-            vars: HashMap::new(),
-            lists: HashMap::new(),
-            broadcasts: HashMap::new(),
-            funcs: HashMap::new(),
-            blocks: HashMap::new(),
+            vars: IndexMap::new(),
+            lists: IndexMap::new(),
+            broadcasts: IndexMap::new(),
+            funcs: IndexMap::new(),
+            blocks: IndexMap::new(),
             late_blocks: Vec::new(),
             costumes: Vec::new(),
             uid_gen: UidGenerator::new(minify),
@@ -182,12 +182,12 @@ impl ScratchContext {
         let mut last_id: Option<Id> = None;
         let mut curr_id = self.gen_id();
         let first_id = curr_id.clone();
-        let mut next_id = self.gen_id();
+        let mut next_id: Option<Id> = Some(self.gen_id());
         let first_parent = parent.cloned();
 
         for (i, block) in expanded.blocks.iter().enumerate() {
             if i == expanded.blocks.len() - 1 {
-                next_id = self.gen_id();
+                next_id = None;
             }
 
             if let Some(ref _lid) = last_id
@@ -201,13 +201,13 @@ impl ScratchContext {
             } else {
                 last_id.clone()
             };
-            let meta = BlockMeta::new(meta_parent, if i < expanded.blocks.len() - 1 { Some(next_id.clone()) } else { None });
+            let meta = BlockMeta::new(meta_parent, next_id.clone());
 
             self.add_block(&curr_id, block, &meta);
 
             last_id = Some(curr_id);
-            curr_id = next_id.clone();
-            next_id = self.gen_id();
+            curr_id = next_id.unwrap_or_default();
+            next_id = Some(self.gen_id());
         }
 
         Some(first_id)
@@ -241,7 +241,7 @@ impl ScratchContext {
     }
 }
 
-fn meta_shadow(raw: &mut HashMap<String, JsonValue>) {
+fn meta_shadow(raw: &mut JsonMap<String, JsonValue>) {
     raw.insert("shadow".to_string(), JsonValue::Bool(true));
 }
 
@@ -249,12 +249,12 @@ fn get_raw_block(
     block: &Block,
     my_id: &Id,
     ctx: &mut ScratchContext,
-) -> HashMap<String, JsonValue> {
+) -> JsonMap<String, JsonValue> {
     if let Block::RawBlock(contents) = block {
         return contents.clone();
     }
 
-    let mut raw = HashMap::new();
+    let mut raw = JsonMap::new();
     match block {
         Block::Say { value } => {
             raw.insert("opcode".to_string(), JsonValue::String("looks_say".to_string()));
@@ -268,7 +268,7 @@ fn get_raw_block(
                     let name_str = scratch_cast_to_str(kv);
                     let proto_id = ctx.gen_id();
                     ctx.add_block(&proto_id, &Block::RawBlock({
-                        let mut r = HashMap::new();
+                        let mut r = JsonMap::new();
                         r.insert("opcode".to_string(), JsonValue::String("looks_costume".to_string()));
                         r.insert("fields".to_string(), serde_json::json!({"COSTUME": [name_str, null]}));
                         r
@@ -508,7 +508,7 @@ fn get_raw_block(
                 let param_block_id = ctx.gen_id();
                 param_block_ids.push(param_block_id.clone());
                 ctx.add_block(&param_block_id, &Block::RawBlock({
-                    let mut r = HashMap::new();
+                    let mut r = JsonMap::new();
                     r.insert("opcode".to_string(), JsonValue::String("argument_reporter_string_number".to_string()));
                     r.insert("fields".to_string(), serde_json::json!({"VALUE": [sanitize_proc_name(param, true), null]}));
                     r
@@ -520,7 +520,7 @@ fn get_raw_block(
                 proto_inputs.insert(param_id.clone(), serde_json::json!([1, block_id]));
             }
 
-            let mut proto_data = HashMap::new();
+            let mut proto_data = JsonMap::new();
             proto_data.insert("opcode".to_string(), JsonValue::String("procedures_prototype".to_string()));
             if !proto_inputs.is_empty() || !ctx.cfg.minify {
                 proto_data.insert("inputs".to_string(), JsonValue::Object(proto_inputs));
@@ -646,7 +646,7 @@ fn get_raw_value(
                 ListOp::Contains => "contains",
             }).unwrap_or("data_itemoflist");
             ctx.add_block(&id, &Block::RawBlock({
-                let mut r = HashMap::new();
+                let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String(opcode.to_string()));
                 r.insert("inputs".to_string(), serde_json::json!({input_name: raw_value}));
                 r.insert("fields".to_string(), serde_json::json!({"LIST": [data.name, list_id]}));
@@ -658,7 +658,7 @@ fn get_raw_value(
             let id = ctx.gen_id();
             let list_id = ctx.add_or_get_list(name, vec![]);
             ctx.add_block(&id, &Block::RawBlock({
-                let mut r = HashMap::new();
+                let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String("data_lengthoflist".to_string()));
                 r.insert("fields".to_string(), serde_json::json!({"LIST": [name, list_id]}));
                 r
@@ -668,7 +668,7 @@ fn get_raw_value(
         Value::GetParam { name } => {
             let id = ctx.gen_id();
             ctx.add_block(&id, &Block::RawBlock({
-                let mut r = HashMap::new();
+                let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String("argument_reporter_string_number".to_string()));
                 r.insert("fields".to_string(), serde_json::json!({"VALUE": [sanitize_proc_name(name, true), null]}));
                 r
@@ -799,7 +799,7 @@ fn get_raw_value(
             }
 
             ctx.add_block(&id, &Block::RawBlock({
-                let mut r = HashMap::new();
+                let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String(opcode.to_string()));
                 if !inputs.is_empty() {
                     r.insert("inputs".to_string(), JsonValue::Object(inputs));
@@ -816,7 +816,7 @@ fn get_raw_value(
                 CostumeInfoOp::Number => "number",
             };
             ctx.add_block(&id, &Block::RawBlock({
-                let mut r = HashMap::new();
+                let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String("looks_costumenumbername".to_string()));
                 r.insert("fields".to_string(), serde_json::json!({"NUMBER_NAME": [op_str, null]}));
                 r
@@ -829,7 +829,7 @@ fn get_raw_value(
             }
             let id = ctx.gen_id();
             ctx.add_block(&id, &Block::RawBlock({
-                let mut r = HashMap::new();
+                let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String("control_get_counter".to_string()));
                 r
             }), &BlockMeta::new(Some(parent.clone()), None));
@@ -838,7 +838,7 @@ fn get_raw_value(
         Value::GetAnswer => {
             let id = ctx.gen_id();
             ctx.add_block(&id, &Block::RawBlock({
-                let mut r = HashMap::new();
+                let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String("sensing_answer".to_string()));
                 r
             }), &BlockMeta::new(Some(parent.clone()), None));
@@ -847,7 +847,7 @@ fn get_raw_value(
         Value::DaysSince2000 => {
             let id = ctx.gen_id();
             ctx.add_block(&id, &Block::RawBlock({
-                let mut r = HashMap::new();
+                let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String("sensing_dayssince2000".to_string()));
                 r
             }), &BlockMeta::new(Some(parent.clone()), None));
@@ -871,7 +871,7 @@ fn finalize_op_block(
     }
 
     ctx.add_block(&id, &Block::RawBlock({
-        let mut r = HashMap::new();
+        let mut r = JsonMap::new();
         r.insert("opcode".to_string(), JsonValue::String(opcode.to_string()));
         if !inputs.is_empty() {
             r.insert("inputs".to_string(), JsonValue::Object(inputs));
@@ -997,8 +997,8 @@ pub fn scratch_compare(left: &KnownVal, right: &KnownVal) -> f64 {
     }
 }
 
-pub fn make_empty_costume(name: &str) -> HashMap<String, JsonValue> {
-    let mut costume = HashMap::new();
+pub fn make_empty_costume(name: &str) -> JsonMap<String, JsonValue> {
+    let mut costume = JsonMap::new();
     let hash = empty_svg_hash();
     costume.insert("name".to_string(), JsonValue::String(name.to_string()));
     costume.insert("bitmapResolution".to_string(), JsonValue::Number(1.into()));

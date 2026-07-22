@@ -1,15 +1,15 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 
 use super::ast::*;
 use super::*;
 
-pub fn export_empty_sprite(name: &str, is_stage: bool) -> HashMap<String, JsonValue> {
-    let mut res = HashMap::new();
+pub fn export_empty_sprite(name: &str, is_stage: bool) -> JsonMap<String, JsonValue> {
+    let mut res = JsonMap::new();
     res.insert("isStage".to_string(), JsonValue::Bool(is_stage));
     res.insert(
         "name".to_string(),
@@ -112,45 +112,42 @@ pub fn export_data(ctx: &mut ScratchContext, format: Format) -> String {
     }
 }
 
-fn ctx_get_raw(ctx: &mut ScratchContext) -> HashMap<String, JsonValue> {
-    while !ctx.late_blocks.is_empty() {
-        let late = ctx.late_blocks.drain(..).collect::<Vec<_>>();
-        for (id, block_data, meta) in late {
-            match block_data {
-                LateBlockData::ProcedureCall(data) => {
-                    let mut values = Vec::new();
-                    for arg in &data.args {
-                        let val = get_raw_value(arg, &id, ctx, ScratchCast::ToStr);
-                        values.push(val);
-                    }
-                    let (param_ids, run_without_refresh) = ctx.funcs.get(&data.name)
-                        .cloned()
-                        .unwrap_or_default();
-
-                    let mut inputs = serde_json::Map::new();
-                    for (param_id, val) in param_ids.iter().zip(values.iter()) {
-                        inputs.insert(param_id.clone(), serde_json::json!(val));
-                    }
-
-                    let proccode = format!("{}{}", sanitize_proc_name(&data.name, false), " %s".repeat(param_ids.len()));
-
-                    let raw_block = {
-                        let mut r = HashMap::new();
-                        r.insert("opcode".to_string(), JsonValue::String("procedures_call".to_string()));
-                        if !inputs.is_empty() {
-                            r.insert("inputs".to_string(), JsonValue::Object(inputs));
-                        }
-                        r.insert("mutation".to_string(), serde_json::json!({
-                            "tagName": "mutation",
-                            "children": [],
-                            "proccode": proccode,
-                            "argumentids": serde_json::to_string(&param_ids).unwrap_or_default(),
-                            "warp": serde_json::to_string(&run_without_refresh).unwrap_or_default()
-                        }));
-                        r
-                    };
-                    ctx.add_block(&id, &Block::RawBlock(raw_block), &meta);
+fn ctx_get_raw(ctx: &mut ScratchContext) -> JsonMap<String, JsonValue> {
+    while let Some((id, block_data, meta)) = ctx.late_blocks.pop() {
+        match block_data {
+            LateBlockData::ProcedureCall(data) => {
+                let mut values = Vec::new();
+                for arg in &data.args {
+                    let val = get_raw_value(arg, &id, ctx, ScratchCast::ToStr);
+                    values.push(val);
                 }
+                let (param_ids, run_without_refresh) = ctx.funcs.get(&data.name)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let mut inputs = serde_json::Map::new();
+                for (param_id, val) in param_ids.iter().zip(values.iter()) {
+                    inputs.insert(param_id.clone(), serde_json::json!(val));
+                }
+
+                let proccode = format!("{}{}", sanitize_proc_name(&data.name, false), " %s".repeat(param_ids.len()));
+
+                let raw_block = {
+                    let mut r = JsonMap::new();
+                    r.insert("opcode".to_string(), JsonValue::String("procedures_call".to_string()));
+                    if !inputs.is_empty() {
+                        r.insert("inputs".to_string(), JsonValue::Object(inputs));
+                    }
+                    r.insert("mutation".to_string(), serde_json::json!({
+                        "tagName": "mutation",
+                        "children": [],
+                        "proccode": proccode,
+                        "argumentids": serde_json::to_string(&param_ids).unwrap_or_default(),
+                        "warp": serde_json::to_string(&run_without_refresh).unwrap_or_default()
+                    }));
+                    r
+                };
+                ctx.add_block(&id, &Block::RawBlock(raw_block), &meta);
             }
         }
     }
@@ -168,11 +165,6 @@ fn ctx_get_raw(ctx: &mut ScratchContext) -> HashMap<String, JsonValue> {
         raw_lists.insert(id.clone(), serde_json::json!([name, raw_vals]));
     }
 
-    let mut raw_broadcasts = serde_json::Map::new();
-    for (name, id) in &ctx.broadcasts {
-        raw_broadcasts.insert(id.clone(), serde_json::Value::String(name.clone()));
-    }
-
     let mut raw_blocks = serde_json::Map::new();
     for (id, block) in &ctx.blocks {
         raw_blocks.insert(id.clone(), serde_json::Value::Object(block.iter().map(|(k, v)| (k.clone(), v.clone())).collect()));
@@ -188,10 +180,9 @@ fn ctx_get_raw(ctx: &mut ScratchContext) -> HashMap<String, JsonValue> {
         raw_costumes.push(serde_json::to_value(make_empty_costume(name)).unwrap());
     }
 
-    let mut result = HashMap::new();
+    let mut result = JsonMap::new();
     result.insert("variables".to_string(), JsonValue::Object(raw_vars));
     result.insert("lists".to_string(), JsonValue::Object(raw_lists));
-    result.insert("broadcasts".to_string(), JsonValue::Object(raw_broadcasts));
     result.insert("blocks".to_string(), JsonValue::Object(raw_blocks));
     result.insert("costumes".to_string(), JsonValue::Array(raw_costumes));
     result
@@ -341,15 +332,17 @@ mod tests {
 
     #[test]
     fn test_export_data_with_broadcasts() {
+        // Python's reference implementation stores broadcasts for block inputs but
+        // never includes them in the sprite's "broadcasts" dict, so Rust matches
+        // that behavior for byte-for-byte parity.
         let mut ctx = ScratchContext::new(ScratchConfig::default());
-        let broadcast_id = ctx.add_broadcast("my_event");
+        let _broadcast_id = ctx.add_broadcast("my_event");
         let data = export_data(&mut ctx, Format::Project3);
         let parsed: JsonValue = serde_json::from_str(&data).unwrap();
         let targets = parsed["targets"].as_array().unwrap();
         let sprite = &targets[2];
         let broadcasts = sprite["broadcasts"].as_object().unwrap();
-        assert!(!broadcasts.is_empty());
-        assert!(broadcasts.contains_key(&broadcast_id));
+        assert!(broadcasts.is_empty());
     }
 
     #[test]

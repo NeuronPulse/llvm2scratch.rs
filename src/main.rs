@@ -17,13 +17,17 @@ use llvm2scratch::target::{BranchMethod, DEFAULT_OPT_TARGET, DEFAULT_TARGETS};
 fn project_to_context(proj: &Project) -> ScratchContext {
     let mut ctx = ScratchContext::new(proj.cfg.clone());
 
+    // Match Python's get_ctx order: lists first, then blocks, then costumes.
+    // This keeps ID generation order identical between implementations.
+    for (name, vals) in &proj.lists {
+        ctx.add_or_get_list(name, vals.clone());
+    }
+
     for code in &proj.code {
         ctx.add_block_list(code, None);
     }
 
-    for (name, vals) in &proj.lists {
-        ctx.add_or_get_list(name, vals.clone());
-    }
+    ctx.costumes.extend(proj.costumes.iter().cloned());
 
     ctx
 }

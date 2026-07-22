@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 
 pub type Id = String;
@@ -67,7 +66,7 @@ impl BlockMeta {
         }
     }
 
-    pub fn add_raw_meta(&self, metaless: &mut HashMap<String, JsonValue>, cfg: &ScratchConfig) {
+    pub fn add_raw_meta(&self, metaless: &mut JsonMap<String, JsonValue>, cfg: &ScratchConfig) {
         if !cfg.minify_break_glow {
             if let Some(ref p) = self.parent {
                 metaless.insert("parent".to_string(), JsonValue::String(p.clone()));
@@ -338,7 +337,7 @@ pub enum Block {
     MotionGoto { x: Value, y: Value },
     ProcedureDef(ProcedureDefData),
     ProcedureCall(ProcedureCallData),
-    RawBlock(HashMap<String, JsonValue>),
+    RawBlock(JsonMap<String, JsonValue>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
