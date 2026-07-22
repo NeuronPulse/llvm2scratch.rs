@@ -1,0 +1,12 @@
+{
+  "compile_args": [
+    "--no-optimize"
+  ],
+  "timeout_ms": 10000,
+  "trace_sample_ms": 50,
+  "expected": {
+    "variables": {
+      "!return value": 18
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "compile_args": ["--no-accurate-byte-spacing", "--no-optimize", "--memory-size", "16"],
+  "timeout_ms": 5000,
+  "trace_sample_ms": 50,
+  "expected": {
+    "variables": {
+      "!return value": 66,
+      "%main:va": 11,
+      "%main:vb": 22,
+      "%main:vc": 33
+    },
+    "lists": {
+      "!mem": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 33, 22, 11]
+    },
+    "trace": [
+      {
+        "type": "eventually",
+        "variables": { "!return value": 66 },
+        "lists": {
+          "!mem": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 33, 22, 11]
+        }
+      }
+    ]
+  }
+}

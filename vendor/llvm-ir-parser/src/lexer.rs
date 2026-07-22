@@ -152,6 +152,8 @@ pub enum Keyword {
     Icmp,
     /// `Fcmp` variant.
     Fcmp,
+    /// `Samesign` variant (LLVM non-negative icmp flag).
+    Samesign,
     /// `Alloca` variant.
     Alloca,
     /// `Load` variant.
@@ -709,6 +711,12 @@ impl<'src> Lexer<'src> {
                     self.advance();
                     self.advance();
                     Ok(Token::Ellipsis)
+                } else if self.peek_ch().map_or(false, |c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$') {
+                    // Dot-prefixed identifier (e.g., .loopexit, .preheader) used
+                    // by LLVM opt passes for basic block labels.
+                    self.advance(); // consume the leading '.'
+                    let word = self.read_word_starting_with_dot();
+                    Ok(Token::LocalIdent(word))
                 } else {
                     Err(LexError {
                         line: start_line,
@@ -738,6 +746,22 @@ impl<'src> Lexer<'src> {
 
     fn read_word(&mut self) -> String {
         let mut s = String::new();
+        while let Some(c) = self.peek_ch() {
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$' {
+                self.advance();
+                s.push(c as char);
+            } else {
+                break;
+            }
+        }
+        s
+    }
+
+    /// Read a word starting with '.' (e.g., .loopexit, .preheader).
+    /// The leading '.' has already been consumed by the caller; this reads
+    /// the rest of the identifier.
+    fn read_word_starting_with_dot(&mut self) -> String {
+        let mut s = String::from(".");
         while let Some(c) = self.peek_ch() {
             if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$' {
                 self.advance();
@@ -998,6 +1022,7 @@ impl<'src> Lexer<'src> {
             "fneg" => Keyword::Fneg,
             "icmp" => Keyword::Icmp,
             "fcmp" => Keyword::Fcmp,
+            "samesign" => Keyword::Samesign,
             "alloca" => Keyword::Alloca,
             "load" => Keyword::Load,
             "store" => Keyword::Store,

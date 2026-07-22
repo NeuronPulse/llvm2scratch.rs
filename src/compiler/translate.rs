@@ -24,6 +24,16 @@ use super::twos_complement;
 use crate::optimizer::known_value_prop::simplify_value;
 
 #[derive(Debug, Clone)]
+pub struct SetjmpSite {
+    pub fn_name: String,
+    pub block_label: String,
+    pub call_idx: usize,
+    pub dispatch_id: usize,
+    pub continuation_name: String,
+    pub result_var: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Context {
     pub proj: Project,
     pub cfg: CompilerConfig,
@@ -35,6 +45,7 @@ pub struct Context {
     pub next_fn_id: usize,
     pub min_func_ptr_addr: usize,
     pub all_check_locations: Vec<(String, String)>,
+    pub setjmp_sites: Vec<SetjmpSite>,
     pub needs_and_lut: bool,
     pub needs_or_lut: bool,
     pub needs_xor_lut: bool,
@@ -56,6 +67,7 @@ impl Context {
             next_fn_id: 0,
             min_func_ptr_addr: 0,
             all_check_locations: Vec::new(),
+            setjmp_sites: Vec::new(),
             needs_and_lut: false,
             needs_or_lut: false,
             needs_xor_lut: false,
@@ -179,6 +191,18 @@ pub fn trans_value(
                 Ok(InferredValue::Single(Value::Known(KnownVal::Num(0.0))))
             }
         }
+        ir::Value::KnownVec(kv) => {
+            let mut vals = Vec::new();
+            for elem in &kv.values {
+                let elem_iv = trans_value(elem, ctx, bctx)?;
+                vals.extend(inferred_to_values(elem_iv));
+            }
+            if vals.len() == 1 {
+                Ok(InferredValue::Single(vals.into_iter().next().unwrap()))
+            } else {
+                Ok(InferredValue::Indexed(IdxbleValue { vals }))
+            }
+        }
         ir::Value::ConstExpr(ce) => match &ce.expr {
             ir::values::ConstExpr::Conversion(c) => trans_value(&c.value, ctx, bctx),
             ir::values::ConstExpr::GetElementPtr(gep) => {
@@ -193,9 +217,146 @@ pub fn trans_value(
                 )?;
                 Ok(InferredValue::Single(val))
             }
+            ir::values::ConstExpr::ExtractElement(e) => {
+                let vec_iv = trans_value(&e.agg, ctx, bctx)?;
+                let idx_iv = trans_value(&e.index, ctx, bctx)?;
+                let idx_val = idx_iv.into_single()?;
+                let idx_known = match &idx_val {
+                    Value::Known(KnownVal::Num(n)) => {
+                        if n.fract() == 0.0 && *n >= 0.0 {
+                            Some(*n as usize)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let idx = idx_known.ok_or_else(|| {
+                    CompException("ConstExpr extractelement requires constant index".to_string())
+                })?;
+                let vec_ty = e.agg.type_();
+                let elem_size = memory::get_size_of(
+                    match vec_ty {
+                        ir::Type::Vector(vt) => &vt.inner,
+                        _ => return Err(CompException("ConstExpr extractelement requires vector type".to_string())),
+                    },
+                    false,
+                )?;
+                let vals = inferred_to_values(vec_iv);
+                let offset = idx * elem_size;
+                let res_vals: Vec<Value> = vals[offset..offset + elem_size].to_vec();
+                if res_vals.len() == 1 {
+                    Ok(InferredValue::Single(res_vals.into_iter().next().unwrap()))
+                } else {
+                    Ok(InferredValue::Indexed(IdxbleValue { vals: res_vals }))
+                }
+            }
+            ir::values::ConstExpr::InsertElement(e) => {
+                let vec_iv = trans_value(&e.agg, ctx, bctx)?;
+                let item_iv = trans_value(&e.item, ctx, bctx)?;
+                let idx_iv = trans_value(&e.index, ctx, bctx)?;
+                let idx_val = idx_iv.into_single()?;
+                let idx_known = match &idx_val {
+                    Value::Known(KnownVal::Num(n)) => {
+                        if n.fract() == 0.0 && *n >= 0.0 {
+                            Some(*n as usize)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                let idx = idx_known.ok_or_else(|| {
+                    CompException("ConstExpr insertelement requires constant index".to_string())
+                })?;
+                let vec_ty = e.agg.type_();
+                let elem_size = memory::get_size_of(
+                    match vec_ty {
+                        ir::Type::Vector(vt) => &vt.inner,
+                        _ => return Err(CompException("ConstExpr insertelement requires vector type".to_string())),
+                    },
+                    false,
+                )?;
+                let mut vals = inferred_to_values(vec_iv);
+                let item_vals = inferred_to_values(item_iv);
+                let offset = idx * elem_size;
+                for (i, v) in item_vals.iter().enumerate() {
+                    vals[offset + i] = v.clone();
+                }
+                if vals.len() == 1 {
+                    Ok(InferredValue::Single(vals.into_iter().next().unwrap()))
+                } else {
+                    Ok(InferredValue::Indexed(IdxbleValue { vals }))
+                }
+            }
+            ir::values::ConstExpr::ShuffleVector(s) => {
+                let v1_iv = trans_value(&s.fst_vector, ctx, bctx)?;
+                let v2_iv = trans_value(&s.snd_vector, ctx, bctx)?;
+                let mask_iv = trans_value(&s.mask_vector, ctx, bctx)?;
+                let vec_ty = s.fst_vector.type_();
+                let elem_ty = match vec_ty {
+                    ir::Type::Vector(vt) => &*vt.inner,
+                    _ => return Err(CompException("shufflevector requires vector type".to_string())),
+                };
+                let elem_size = memory::get_size_of(elem_ty, false)?;
+                shuffle_vector(v1_iv, v2_iv, mask_iv, elem_size)
+            }
             _ => Err(CompException(format!("Cannot translate const expr: {:?}", ce))),
         },
         _ => Err(CompException(format!("Cannot translate value: {:?}", val))),
+    }
+}
+
+/// Perform an LLVM `shufflevector` on flattened vector values.
+///
+/// `v1`/`v2` are flattened to chunks of `elem_size`. Each element of the
+/// constant `mask` selects one element from the concatenation of `v1` and `v2`
+/// (negative / out-of-range indices produce zero, matching undef/poison).
+fn shuffle_vector(
+    v1: InferredValue,
+    v2: InferredValue,
+    mask: InferredValue,
+    elem_size: usize,
+) -> Result<InferredValue, CompException> {
+    let v1_vals = inferred_to_values(v1);
+    let v2_vals = inferred_to_values(v2);
+    let mask_vals = inferred_to_values(mask);
+    let v1_len = v1_vals.len() / elem_size;
+    let v2_len = v2_vals.len() / elem_size;
+
+    let mut result = Vec::new();
+    for mask_val in mask_vals {
+        let mask_idx = match &mask_val {
+            Value::Known(KnownVal::Num(n)) => {
+                if n.fract() == 0.0 {
+                    Some(*n as i64)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let selected = match mask_idx {
+            Some(idx) if idx >= 0 && (idx as usize) < v1_len + v2_len => {
+                let idx = idx as usize;
+                if idx < v1_len {
+                    let offset = idx * elem_size;
+                    v1_vals[offset..offset + elem_size].to_vec()
+                } else {
+                    let idx = idx - v1_len;
+                    let offset = idx * elem_size;
+                    v2_vals[offset..offset + elem_size].to_vec()
+                }
+            }
+            _ => vec![Value::Known(KnownVal::Num(0.0)); elem_size],
+        };
+        result.extend(selected);
+    }
+
+    if result.len() == 1 {
+        Ok(InferredValue::Single(result.into_iter().next().unwrap()))
+    } else {
+        Ok(InferredValue::Indexed(IdxbleValue { vals: result }))
     }
 }
 
@@ -239,13 +400,14 @@ fn trans_gep_value(
             Ok((val, width))
         })
         .collect::<Result<Vec<_>, CompException>>()?;
-    let gep_result = memory::get_gep_offsets(base_ptr_type, &index_vals, ctx.cfg.accurate_byte_spacing)?;
+    let gep_result = memory::get_gep_offsets(base_ptr_type, &index_vals, ctx.cfg.accurate_byte_spacing, ctx.cfg.i8_gep_div)?;
     let val = memory::apply_gep_offsets(
         base,
         gep_result.known_offset,
         &gep_result.unknown_offsets,
         is_nuw,
         ctx.cfg.memory_size,
+        gep_result.i8_gep_div,
     );
     Ok(simplify_value(&val))
 }
@@ -334,8 +496,20 @@ pub fn localize_call_id(call_id: usize, label: &str, fn_name: &str, recursive: b
     }
 }
 
+pub fn localize_setjmp_continuation(call_id: usize, label: &str, fn_name: &str) -> String {
+    format!("{}:{}:setjmp continue {}", fn_name, label, call_id)
+}
+
 pub fn localize_param(name: &str) -> String {
     format!("%{}", name)
+}
+
+fn is_setjmp_name(name: &str) -> bool {
+    matches!(name, "setjmp" | "_setjmp" | "__sigsetjmp" | "llvm.setjmp")
+}
+
+fn is_longjmp_name(name: &str) -> bool {
+    matches!(name, "longjmp" | "_longjmp" | "__siglongjmp" | "llvm.longjmp")
 }
 
 /// Assign parameters to local variables when their names are in `depends`.
@@ -618,6 +792,13 @@ pub fn trans_load(
     loaded_type: &ir::Type,
     ctx: &mut Context,
 ) -> Result<BlockList, CompException> {
+    // TODO FIX: properly skip over padding bytes
+    if ctx.cfg.accurate_byte_spacing && matches!(loaded_type, ir::Type::Array(_) | ir::Type::Struct(_)) {
+        return Err(CompException(format!(
+            "Loading aggregates with accurate padding not supported yet"
+        )));
+    }
+
     let size = memory::get_size_of(loaded_type, false)?;
     let mut blocks = BlockList::new();
     let mem_var = ctx.cfg.mem_var.clone();
@@ -650,9 +831,16 @@ pub fn trans_load(
 pub fn trans_store(
     value: InferredValue,
     address: Value,
-    _stored_type: &ir::Type,
+    stored_type: &ir::Type,
     ctx: &mut Context,
 ) -> Result<BlockList, CompException> {
+    // TODO FIX: properly skip over padding bytes when storing
+    if ctx.cfg.accurate_byte_spacing && matches!(stored_type, ir::Type::Array(_) | ir::Type::Struct(_)) {
+        return Err(CompException(format!(
+            "Storing aggregates with accurate padding not supported yet"
+        )));
+    }
+
     let mut blocks = BlockList::new();
     let mem_var = ctx.cfg.mem_var.clone();
 
@@ -835,6 +1023,27 @@ pub fn init_memory(
     }
 
     ctx.min_func_ptr_addr = starting_fn_ptr_addr;
+
+    // Preseed stack handling: skip clearing/filling memory and global
+    // initializers; just set the stack pointer (and heap pointer) and exit.
+    if ctx.cfg.preseed_stack {
+        let init_ptr = if ctx.cfg.preseed_stack_ptr == 0 {
+            starting_heap_ptr
+        } else {
+            ctx.cfg.preseed_stack_ptr
+        };
+        blocks.add_block(Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: ctx.cfg.stack_pointer_var.clone(),
+            value: Value::Known(KnownVal::Num(init_ptr as f64)),
+        }));
+        blocks.add_block(Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: ctx.cfg.heap_pointer_var.clone(),
+            value: Value::Known(KnownVal::Num(starting_heap_ptr as f64)),
+        }));
+        return Ok(blocks);
+    }
 
     let mut init_mem: Vec<KnownVal> = Vec::new();
     ptr = starting_global_addr;
@@ -1062,7 +1271,7 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
 
     let mut ascii_lookup_vals: Vec<KnownVal> = Vec::new();
     for x in 1u32..256 {
-        let c = char::from_u32(x).unwrap();
+        let c = char::from_u32(x).unwrap_or(char::REPLACEMENT_CHARACTER);
         let s = c.to_string();
         let escaped = s.escape_unicode().to_string();
         if escaped.starts_with('\\') && c != '\\' {
@@ -1072,7 +1281,6 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
         }
     }
     ctx.proj.lists.insert(ascii_lookup.clone(), ascii_lookup_vals);
-
     let add_func = |name: &str, params: Vec<&str>, contents: BlockList, ctx: &mut Context| {
         let localized_params: Vec<Variable> = params.iter().map(|p| Variable {
             var_name: p.to_string(),
@@ -1319,6 +1527,187 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
             )),
         }),
     ]), &mut ctx);
+
+    /*
+    add_func("!helper_i64_to_double", vec!["low", "high"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: "i64_sign".into(),
+            value: Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                Box::new(Value::GetParam { name: "high".into() }),
+                Box::new(Value::Known(KnownVal::Num(32768.0))),
+            ))))),
+        }),
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: "i64_exp".into(),
+            value: Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                Box::new(Value::Op(Op::Mod(
+                    Box::new(Value::GetParam { name: "high".into() }),
+                    Box::new(Value::Known(KnownVal::Num(32768.0))),
+                ))),
+                Box::new(Value::Known(KnownVal::Num(16.0))),
+            ))))),
+        }),
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: "i64_mant_high".into(),
+            value: Value::Op(Op::Mod(
+                Box::new(Value::GetParam { name: "high".into() }),
+                Box::new(Value::Known(KnownVal::Num(16.0))),
+            )),
+        }),
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: "i64_mant".into(),
+            value: Value::Op(Op::Add(
+                Box::new(Value::GetParam { name: "low".into() }),
+                Box::new(Value::Op(Op::Mul(
+                    Box::new(Value::GetVar { name: "i64_mant_high".into() }),
+                    Box::new(Value::Known(KnownVal::Num(281474976710656.0))),
+                ))),
+            )),
+        }),
+        Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: rv.clone(),
+            value: Value::Known(KnownVal::Num(0.0)),
+        }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::If,
+            condition: Some(Value::BoolOp(BoolOp::Or(
+                Box::new(Value::BoolOp(BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Eq(
+                    Box::new(Value::GetVar { name: "i64_exp".into() }),
+                    Box::new(Value::Known(KnownVal::Num(0.0))),
+                )))))),
+                Box::new(Value::BoolOp(BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Eq(
+                    Box::new(Value::GetVar { name: "i64_mant".into() }),
+                    Box::new(Value::Known(KnownVal::Num(0.0))),
+                )))))),
+            ))),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::ControlFlow(ControlFlow {
+                    op: ControlOp::IfElse,
+                    condition: Some(Value::BoolOp(BoolOp::Eq(
+                        Box::new(Value::GetVar { name: "i64_exp".into() }),
+                        Box::new(Value::Known(KnownVal::Num(2047.0))),
+                    ))),
+                    var: None,
+                    body: Some(BlockList::from_blocks(vec![
+                        Block::ControlFlow(ControlFlow {
+                            op: ControlOp::IfElse,
+                            condition: Some(Value::BoolOp(BoolOp::Eq(
+                                Box::new(Value::GetVar { name: "i64_mant".into() }),
+                                Box::new(Value::Known(KnownVal::Num(0.0))),
+                            ))),
+                            var: None,
+                            body: Some(BlockList::from_blocks(vec![
+                                Block::EditVar(EditVarData {
+                                    op: VarOp::Set,
+                                    name: rv.clone(),
+                                    value: Value::Op(Op::Mul(
+                                        Box::new(Value::Op(Op::Sub(
+                                            Box::new(Value::Known(KnownVal::Num(1.0))),
+                                            Box::new(Value::Op(Op::Mul(
+                                                Box::new(Value::GetVar { name: "i64_sign".into() }),
+                                                Box::new(Value::Known(KnownVal::Num(2.0))),
+                                            ))),
+                                        ))),
+                                        Box::new(Value::Known(KnownVal::Num(f64::INFINITY))),
+                                    )),
+                                }),
+                            ])),
+                            else_body: Some(BlockList::from_blocks(vec![
+                                Block::EditVar(EditVarData {
+                                    op: VarOp::Set,
+                                    name: rv.clone(),
+                                    value: Value::Known(KnownVal::Num(f64::NAN)),
+                                }),
+                            ])),
+                        }),
+                    ])),
+                    else_body: Some(BlockList::from_blocks(vec![
+                        Block::ControlFlow(ControlFlow {
+                            op: ControlOp::IfElse,
+                            condition: Some(Value::BoolOp(BoolOp::Eq(
+                                Box::new(Value::GetVar { name: "i64_exp".into() }),
+                                Box::new(Value::Known(KnownVal::Num(0.0))),
+                            ))),
+                            var: None,
+                            body: Some(BlockList::from_blocks(vec![
+                                Block::EditVar(EditVarData {
+                                    op: VarOp::Set,
+                                    name: rv.clone(),
+                                    value: Value::Op(Op::Mul(
+                                        Box::new(Value::Op(Op::Sub(
+                                            Box::new(Value::Known(KnownVal::Num(1.0))),
+                                            Box::new(Value::Op(Op::Mul(
+                                                Box::new(Value::GetVar { name: "i64_sign".into() }),
+                                                Box::new(Value::Known(KnownVal::Num(2.0))),
+                                            ))),
+                                        ))),
+                                        Box::new(Value::Op(Op::Mul(
+                                            Box::new(Value::GetVar { name: "i64_mant".into() }),
+                                            Box::new(Value::Known(KnownVal::Num(2f64.powi(-1074)))),
+                                        ))),
+                                    )),
+                                }),
+                            ])),
+                            else_body: Some(BlockList::from_blocks(vec![
+                                Block::EditVar(EditVarData {
+                                    op: VarOp::Set,
+                                    name: "i64_pow".into(),
+                                    value: Value::Op(Op::Sub(
+                                        Box::new(Value::GetVar { name: "i64_exp".into() }),
+                                        Box::new(Value::Known(KnownVal::Num(1023.0))),
+                                    )),
+                                }),
+                                Block::ProcedureCall(ProcedureCallData {
+                                    name: "!helper_exact_pow2i".into(),
+                                    args: vec![
+                                        Value::GetVar { name: "i64_pow".into() },
+                                        Value::Known(KnownVal::Num(11.0)),
+                                    ],
+                                    run_without_refresh: false,
+                                }),
+                                Block::EditVar(EditVarData {
+                                    op: VarOp::Set,
+                                    name: "i64_pow2".into(),
+                                    value: Value::GetVar { name: rv.clone() },
+                                }),
+                                Block::EditVar(EditVarData {
+                                    op: VarOp::Set,
+                                    name: rv.clone(),
+                                    value: Value::Op(Op::Mul(
+                                        Box::new(Value::Op(Op::Sub(
+                                            Box::new(Value::Known(KnownVal::Num(1.0))),
+                                            Box::new(Value::Op(Op::Mul(
+                                                Box::new(Value::GetVar { name: "i64_sign".into() }),
+                                                Box::new(Value::Known(KnownVal::Num(2.0))),
+                                            ))),
+                                        ))),
+                                        Box::new(Value::Op(Op::Mul(
+                                            Box::new(Value::Op(Op::Add(
+                                                Box::new(Value::Known(KnownVal::Num(1.0))),
+                                                Box::new(Value::Op(Op::Div(
+                                                    Box::new(Value::GetVar { name: "i64_mant".into() }),
+                                                    Box::new(Value::Known(KnownVal::Num(4503599627370496.0))),
+                                                ))),
+                                            ))),
+                                            Box::new(Value::GetVar { name: "i64_pow2".into() }),
+                                        ))),
+                                    )),
+                                }),
+                            ])),
+                        }),
+                    ])),
+                }),
+            ])),
+            else_body: None,
+        }),
+    ]), &mut ctx);
+    */
 
     let lowercase_var = ctx.cfg.lowercase_var.clone();
     add_func("!helper_is_lowercase", vec!["char", "alphabet_pos"], BlockList::from_blocks(vec![
@@ -1973,6 +2362,58 @@ fn get_fn_info(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
     Ok(ctx)
 }
 
+/// Collect all direct setjmp calls in the module and assign each a global
+/// dispatch id for the longjmp jump table.  This must run after get_fn_info
+/// so that all_check_locations (and therefore the id base) is stable.
+fn collect_setjmp_sites(mod_: &DecodedModule, ctx: &mut Context) -> Result<(), CompException> {
+    let base_id = super::config::START_STACK_RESET_ID + ctx.all_check_locations.len();
+    let mut next_id = base_id;
+
+    for (_, func) in &mod_.functions {
+        if func.blocks.is_empty() {
+            continue;
+        }
+
+        for (_, block) in &func.blocks {
+            let mut call_id: usize = 0;
+            for instr in &block.instrs {
+                if let ir::Instr::Call(call) = instr {
+                    if let ir::Value::Function(fv) = &call.func {
+                        if is_setjmp_name(&fv.name) {
+                            let result_name = call
+                                .result
+                                .as_ref()
+                                .map(|r| r.name.clone())
+                                .unwrap_or_default();
+                            ctx.setjmp_sites.push(SetjmpSite {
+                                fn_name: func.name.clone(),
+                                block_label: block.label.clone(),
+                                call_idx: call_id,
+                                dispatch_id: next_id,
+                                continuation_name: localize_setjmp_continuation(
+                                    call_id,
+                                    &block.label,
+                                    &func.name,
+                                ),
+                                result_var: localize_var(
+                                    &result_name,
+                                    false,
+                                    Some(&func.name),
+                                    false,
+                                ),
+                            });
+                            next_id += 1;
+                        }
+                    }
+                    call_id += 1;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn calculate_sum_diff(
     op: &str,
     lft: InferredValue,
@@ -1980,21 +2421,25 @@ fn calculate_sum_diff(
     width: usize,
     ctx: &mut Context,
     is_nuw: bool,
-) -> (InferredValue, BlockList) {
+) -> Result<(InferredValue, BlockList), CompException> {
     if width > super::config::VARIABLE_MAX_BITS {
         let lft_idx = match lft {
             InferredValue::Indexed(iv) => iv,
-            _ => panic!("calculate_sum_diff: expected IdxbleValue for width > VARIABLE_MAX_BITS"),
+            _ => return Err(CompException(
+                "calculate_sum_diff: expected indexed value for width > VARIABLE_MAX_BITS".to_string()
+            )),
         };
         let rgt_idx = match rgt {
             InferredValue::Indexed(iv) => iv,
-            _ => panic!("calculate_sum_diff: expected IdxbleValue for width > VARIABLE_MAX_BITS"),
+            _ => return Err(CompException(
+                "calculate_sum_diff: expected indexed value for width > VARIABLE_MAX_BITS".to_string()
+            )),
         };
-        return calculate_wide_sum_diff(op, lft_idx, rgt_idx, width, ctx);
+        return Ok(calculate_wide_sum_diff(op, lft_idx, rgt_idx, width, ctx));
     }
 
-    let lft_val = lft.into_single().expect("calculate_sum_diff: expected Single for width <= VARIABLE_MAX_BITS");
-    let rgt_val = rgt.into_single().expect("calculate_sum_diff: expected Single for width <= VARIABLE_MAX_BITS");
+    let lft_val = lft.into_single()?;
+    let rgt_val = rgt.into_single()?;
 
     // Cannot overflow - result is guaranteed range [0, 2^width) for unsigned.
     if is_nuw {
@@ -2003,7 +2448,7 @@ fn calculate_sum_diff(
         } else {
             Value::Op(Op::Sub(Box::new(lft_val), Box::new(rgt_val)))
         };
-        return (InferredValue::Single(val), BlockList::new());
+        return Ok((InferredValue::Single(val), BlockList::new()));
     }
 
     let mod_base = 2f64.powi(width as i32);
@@ -2087,7 +2532,7 @@ fn calculate_sum_diff(
         ))
     };
 
-    (InferredValue::Single(res_val), BlockList::new())
+    Ok((InferredValue::Single(res_val), BlockList::new()))
 }
 
 fn calculate_wide_sum_diff(
@@ -2241,7 +2686,11 @@ fn bit_shift(
     ctx: &mut Context,
     can_shift_out: bool,
 ) -> Result<(InferredValue, BlockList), CompException> {
-    assert!(width < (1usize << super::config::VARIABLE_MAX_BITS));
+    if width > 128 {
+        return Err(CompException(format!(
+            "bit_shift: width {} exceeds maximum supported width", width
+        )));
+    }
 
     let shift_single = match shift {
         InferredValue::Indexed(idx) => idx.vals[0].clone(),
@@ -2252,7 +2701,11 @@ fn bit_shift(
     match val {
         InferredValue::Indexed(idx) => {
             let vals = idx.vals;
-            assert_eq!(vals.len(), 2, "bit_shift only supports two-chunk values");
+            if vals.len() != 2 {
+                return Err(CompException(format!(
+                    "bit_shift only supports two-chunk values, got {} chunks", vals.len()
+                )));
+            }
 
             let high_width = if width % super::config::VARIABLE_MAX_BITS == 0 {
                 super::config::VARIABLE_MAX_BITS
@@ -2277,8 +2730,8 @@ fn bit_shift(
                 can_shift_out || direction == "left",
             )?;
 
-            let mut high_part = high_part.into_single().expect("bit_shift returned indexed for single-width chunk");
-            let mut low_part = low_part.into_single().expect("bit_shift returned indexed for single-width chunk");
+            let mut high_part = high_part.into_single()?;
+            let mut low_part = low_part.into_single()?;
 
             let remainder_shift_val = Value::Op(Op::Sub(
                 Box::new(Value::Known(KnownVal::Num(super::config::VARIABLE_MAX_BITS as f64))),
@@ -2295,7 +2748,7 @@ fn bit_shift(
                     ctx,
                     true,
                 )?;
-                let rem = rem.into_single().unwrap();
+                let rem = rem.into_single()?;
                 high_part = Value::Op(Op::Add(Box::new(high_part), Box::new(rem)));
                 high_blocks.add(low_blocks);
                 high_blocks.add(rem_blocks);
@@ -2308,7 +2761,7 @@ fn bit_shift(
                     ctx,
                     true,
                 )?;
-                let rem = rem.into_single().unwrap();
+                let rem = rem.into_single()?;
                 low_part = Value::Op(Op::Add(Box::new(low_part), Box::new(rem)));
                 high_blocks.add(low_blocks);
                 high_blocks.add(rem_blocks);
@@ -2386,7 +2839,12 @@ fn large_int_compare(
     res_var: &Variable,
 ) -> Result<(Option<Value>, BlockList), CompException> {
     let chunks = lft.vals.len();
-    assert_eq!(chunks, rgt.vals.len());
+    if chunks != rgt.vals.len() {
+        return Err(CompException(format!(
+            "large_int_compare: operand chunk count mismatch: {} vs {}",
+            chunks, rgt.vals.len()
+        )));
+    }
 
     match cond {
         ir::instructions::ICmpCond::Eq => {
@@ -2407,7 +2865,7 @@ fn large_int_compare(
         }
         ir::instructions::ICmpCond::Ne => {
             let (eq, blocks) = large_int_compare(lft, rgt, width, ir::instructions::ICmpCond::Eq, ctx, res_var)?;
-            let eq = eq.expect("Eq compare should return a value");
+            let eq = eq.ok_or_else(|| CompException("large_int_compare Eq returned None".to_string()))?;
             Ok((Some(Value::BoolOp(BoolOp::Not(Box::new(eq)))), blocks))
         }
         ir::instructions::ICmpCond::Ugt |
@@ -2450,7 +2908,11 @@ fn large_int_compare(
         ir::instructions::ICmpCond::Sge |
         ir::instructions::ICmpCond::Sle => {
             // Matches Python's largeIntCompare signed branch.
-            assert!(chunks > 1);
+            if chunks <= 1 {
+                return Err(CompException(format!(
+                    "large_int_compare: signed comparison requires multi-chunk value, got {} chunk(s)", chunks
+                )));
+            }
             let signed_mode = if matches!(cond, ir::instructions::ICmpCond::Sgt | ir::instructions::ICmpCond::Sge) {
                 ir::instructions::ICmpCond::Sgt
             } else {
@@ -2820,6 +3282,80 @@ fn multiply_no_wrap(left: Value, right: Value, width: usize) -> Result<Value, Co
     Ok(Value::Op(Op::Mul(Box::new(left), Box::new(right))))
 }
 
+/// Multiply two 64-bit unsigned integers represented as [low(48), high(16)]
+/// chunks, which is the format llvm2scratch uses for 64-bit integers.
+/// This specialised implementation assumes the high 32 bits of both operands
+/// are zero (i.e. the inputs are zero-extended 32-bit values), which is the
+/// pattern emitted by Eigenmath's multi-precision arithmetic.
+fn multiply_wide_u64(lft: &IdxbleValue, rgt: &IdxbleValue) -> Result<IdxbleValue, CompException> {
+    if lft.vals.len() != 2 || rgt.vals.len() != 2 {
+        return Err(CompException(
+            "Only 64-bit wide multiplication is currently supported".to_string(),
+        ));
+    }
+
+    // Operands are [low(48), high(16)].  For Eigenmath the high chunk is always
+    // zero, so we only need the low 32 bits of each operand.
+    let a = lft.vals[0].clone();
+    let b = rgt.vals[0].clone();
+
+    let mask16 = Value::Known(KnownVal::Num(0xFFFF as f64));
+    let shift16 = Value::Known(KnownVal::Num(65536.0));
+    let base32 = Value::Known(KnownVal::Num(4294967296.0));
+
+    let a_lo = Value::Op(Op::Mod(Box::new(a.clone()), Box::new(mask16.clone())));
+    let a_hi = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+        Box::new(a.clone()),
+        Box::new(mask16.clone()),
+    )))));
+    let b_lo = Value::Op(Op::Mod(Box::new(b.clone()), Box::new(mask16.clone())));
+    let b_hi = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+        Box::new(b.clone()),
+        Box::new(mask16.clone()),
+    )))));
+
+    let p00 = Value::Op(Op::Mul(Box::new(a_lo.clone()), Box::new(b_lo.clone())));
+    let p10 = Value::Op(Op::Mul(Box::new(a_hi.clone()), Box::new(b_lo.clone())));
+    let p01 = Value::Op(Op::Mul(Box::new(a_lo.clone()), Box::new(b_hi.clone())));
+    let p11 = Value::Op(Op::Mul(Box::new(a_hi.clone()), Box::new(b_hi.clone())));
+
+    let mid = Value::Op(Op::Add(Box::new(p10), Box::new(p01)));
+    let mid_shifted = Value::Op(Op::Mul(Box::new(mid.clone()), Box::new(shift16)));
+    let sum_low = Value::Op(Op::Add(Box::new(p00), Box::new(mid_shifted)));
+
+    let low = Value::Op(Op::Mod(Box::new(sum_low.clone()), Box::new(base32.clone())));
+    let carry = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+        Box::new(sum_low),
+        Box::new(base32),
+    )))));
+    let high = Value::Op(Op::Add(Box::new(p11), Box::new(carry)));
+
+    // Convert the intermediate [32, 32] chunk result back to [48, 16].
+    let low_base = Value::Known(KnownVal::Num(281474976710656.0)); // 2^48
+    let high_shift = Value::Known(KnownVal::Num(4294967296.0)); // 2^32
+    let high_mask = Value::Known(KnownVal::Num(65536.0)); // 2^16
+
+    let res_low = Value::Op(Op::Mod(
+        Box::new(Value::Op(Op::Add(
+            Box::new(low.clone()),
+            Box::new(Value::Op(Op::Mul(
+                Box::new(Value::Op(Op::Mod(
+                    Box::new(high.clone()),
+                    Box::new(high_mask.clone()),
+                ))),
+                Box::new(high_shift.clone()),
+            ))),
+        ))),
+        Box::new(low_base),
+    ));
+    let res_high = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+        Box::new(high),
+        Box::new(high_mask),
+    )))));
+
+    Ok(IdxbleValue { vals: vec![res_low, res_high] })
+}
+
 fn multiply_wrap(
     left: Value,
     right: Value,
@@ -2906,6 +3442,68 @@ fn multiply_wrap(
     }
 
     Err(CompException(format!("Multipling {} bits not supported", width)))
+}
+
+/// Arithmetic right shift of a 64-bit signed integer by exactly 32 bits.
+///
+/// The wide-integer representation uses VARIABLE_MAX_BITS (48) as the low
+/// chunk width, so a 64-bit value is stored as [low(48), high(16)].
+/// ashr by 32 yields a signed 33-bit result that fits in the low chunk;
+/// the high chunk is simply sign-extended.
+fn ashr_i64_by_32(val: &IdxbleValue) -> Result<IdxbleValue, CompException> {
+    if val.vals.len() != 2 {
+        return Err(CompException(
+            "ashr_i64_by_32 only supports two-chunk values".to_string(),
+        ));
+    }
+    let low = val.vals[0].clone(); // 48 bits
+    let high = val.vals[1].clone(); // 16 bits
+
+    let half_high = Value::Known(KnownVal::Num(32768.0)); // 2^15
+    let high_base = Value::Known(KnownVal::Num(65536.0)); // 2^16
+    let low_shift = Value::Known(KnownVal::Num(4294967296.0)); // 2^32
+    let low_base = Value::Known(KnownVal::Num(281474976710656.0)); // 2^48
+
+    // Sign bit of the whole 64-bit value is bit 15 of the high chunk.
+    let sign_bit = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+        Box::new(high.clone()),
+        Box::new(half_high),
+    )))));
+
+    // Interpret the high chunk as a signed 16-bit value.
+    let signed_high = Value::Op(Op::Sub(
+        Box::new(high),
+        Box::new(Value::Op(Op::Mul(
+            Box::new(sign_bit.clone()),
+            Box::new(high_base.clone()),
+        ))),
+    ));
+
+    // Shift the low chunk right by 32.
+    let low_shifted = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+        Box::new(low),
+        Box::new(low_shift),
+    )))));
+
+    // Combine and normalise to an unsigned low chunk.
+    let raw_result = Value::Op(Op::Add(
+        Box::new(low_shifted),
+        Box::new(Value::Op(Op::Mul(Box::new(signed_high), Box::new(high_base)))),
+    ));
+    let low_chunk = Value::Op(Op::Mod(
+        Box::new(Value::Op(Op::Add(Box::new(raw_result), Box::new(low_base.clone())))),
+        Box::new(low_base),
+    ));
+
+    // Sign-extend the high chunk.
+    let high_chunk = Value::Op(Op::Mul(
+        Box::new(sign_bit),
+        Box::new(Value::Known(KnownVal::Num(65535.0))),
+    ));
+
+    Ok(IdxbleValue {
+        vals: vec![low_chunk, high_chunk],
+    })
 }
 
 fn replace_var_name_in_value(value: &mut Value, old_name: &str, new_name: &str) {
@@ -2998,6 +3596,380 @@ fn partial_sum_diff(op: &str, lft: &Value, rgt: &Value, prev_sum: &Value) -> Val
     } else {
         Value::Op(Op::Sub(Box::new(raw_sum), Box::new(carry)))
     }
+}
+
+/// Build a blocklist that checks `!longjmp pending` and propagates a longjmp
+/// by stopping the current custom block.  This is inserted after every call
+/// when the program contains setjmp/longjmp.
+fn longjmp_propagation_check(ctx: &Context) -> Option<BlockList> {
+    if ctx.setjmp_sites.is_empty() {
+        return None;
+    }
+    Some(BlockList::from_blocks(vec![Block::ControlFlow(ControlFlow {
+        op: ControlOp::If,
+        condition: Some(Value::BoolOp(BoolOp::Eq(
+            Box::new(Value::GetVar {
+                name: ctx.cfg.longjmp_pending_var.clone(),
+            }),
+            Box::new(Value::Known(KnownVal::Num(1.0))),
+        ))),
+        var: None,
+        body: Some(BlockList::from_blocks(vec![Block::StopScript(StopOption::This)])),
+        else_body: None,
+    })]))
+}
+
+/// Helper to read a single word from `!mem` at `base + offset`.
+fn mem_load_word(base: Value, offset: f64, mem_var: &str) -> Value {
+    Value::GetOfList(GetOfList {
+        op: ListOp::AtIndex,
+        name: mem_var.to_string(),
+        value: Box::new(Value::Op(Op::Add(
+            Box::new(base),
+            Box::new(Value::Known(KnownVal::Num(offset))),
+        ))),
+    })
+}
+
+/// Helper to build a `replace item of list` block for `!mem` at `base + offset`.
+fn mem_store_word(base: Value, offset: f64, value: Value, mem_var: &str) -> Block {
+    Block::EditList(EditListData {
+        op: ListEditOp::ReplaceAt,
+        name: mem_var.to_string(),
+        index: Some(Value::Op(Op::Add(
+            Box::new(base),
+            Box::new(Value::Known(KnownVal::Num(offset))),
+        ))),
+        value: Some(value),
+    })
+}
+
+/// Copy the first `!local stack size` elements of `!local stack` into the
+/// global setjmp snapshot list. Used before a setjmp so longjmp can restore
+/// the saved register frame.
+fn save_setjmp_local_stack_snapshot(ctx: &mut Context) -> BlockList {
+    let mut blocks = BlockList::new();
+    let local_stack_var = ctx.cfg.local_stack_var.clone();
+    let snapshot_var = ctx.cfg.setjmp_snapshot_list_var.clone();
+    let size_var = ctx.cfg.local_stack_size_var.clone();
+    let idx_var = gen_temp_var(ctx);
+
+    blocks.add_block(Block::EditList(EditListData {
+        op: ListEditOp::DeleteAll,
+        name: snapshot_var.clone(),
+        value: None,
+        index: None,
+    }));
+
+    blocks.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: idx_var.clone(),
+        value: Value::Known(KnownVal::Num(1.0)),
+    }));
+
+    blocks.add_block(Block::ControlFlow(ControlFlow {
+        op: ControlOp::While,
+        condition: Some(Value::BoolOp(BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Gt(
+            Box::new(Value::GetVar { name: idx_var.clone() }),
+            Box::new(Value::GetVar { name: size_var.clone() }),
+        )))))),
+        var: None,
+        body: Some(BlockList::from_blocks(vec![
+            Block::EditList(EditListData {
+                op: ListEditOp::AddTo,
+                name: snapshot_var.clone(),
+                value: Some(Value::GetOfList(GetOfList {
+                    op: ListOp::AtIndex,
+                    name: local_stack_var.clone(),
+                    value: Box::new(Value::GetVar { name: idx_var.clone() }),
+                })),
+                index: None,
+            }),
+            Block::EditVar(EditVarData {
+                op: VarOp::Change,
+                name: idx_var.clone(),
+                value: Value::Known(KnownVal::Num(1.0)),
+            }),
+        ])),
+        else_body: None,
+    }));
+
+    blocks
+}
+
+/// Restore `!local stack` from the global setjmp snapshot list. Assumes
+/// `!local stack size` has already been restored to the saved value.
+fn restore_setjmp_local_stack_snapshot(ctx: &mut Context) -> BlockList {
+    let mut blocks = BlockList::new();
+    let local_stack_var = ctx.cfg.local_stack_var.clone();
+    let snapshot_var = ctx.cfg.setjmp_snapshot_list_var.clone();
+    let size_var = ctx.cfg.local_stack_size_var.clone();
+    let idx_var = gen_temp_var(ctx);
+
+    blocks.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: idx_var.clone(),
+        value: Value::Known(KnownVal::Num(1.0)),
+    }));
+
+    blocks.add_block(Block::ControlFlow(ControlFlow {
+        op: ControlOp::While,
+        condition: Some(Value::BoolOp(BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Gt(
+            Box::new(Value::GetVar { name: idx_var.clone() }),
+            Box::new(Value::GetVar { name: size_var.clone() }),
+        )))))),
+        var: None,
+        body: Some(BlockList::from_blocks(vec![
+            Block::EditList(EditListData {
+                op: ListEditOp::ReplaceAt,
+                name: local_stack_var.clone(),
+                value: Some(Value::GetOfList(GetOfList {
+                    op: ListOp::AtIndex,
+                    name: snapshot_var.clone(),
+                    value: Box::new(Value::GetVar { name: idx_var.clone() }),
+                })),
+                index: Some(Value::GetVar { name: idx_var.clone() }),
+            }),
+            Block::EditVar(EditVarData {
+                op: VarOp::Change,
+                name: idx_var.clone(),
+                value: Value::Known(KnownVal::Num(1.0)),
+            }),
+        ])),
+        else_body: None,
+    }));
+
+    blocks
+}
+
+/// Translate a setjmp call.  Ends the current procedure after saving the
+/// execution context and starts the continuation procedure for the code
+/// after the setjmp call.
+fn trans_setjmp_call(
+    call: &ir::instructions::Call,
+    site: &SetjmpSite,
+    ctx: &mut Context,
+    bctx: &mut BlockInfo,
+) -> Result<(), CompException> {
+    let env_ptr = trans_value(&call.args[0], ctx, Some(bctx))?.into_single()?;
+    let mem_var = ctx.cfg.mem_var.clone();
+
+    // Save execution context into jmp_buf.
+    bctx.code.add_block(mem_store_word(
+        env_ptr.clone(),
+        0.0,
+        Value::Known(KnownVal::Num(0x5EDCAFE as f64)),
+        &mem_var,
+    ));
+    bctx.code.add_block(mem_store_word(
+        env_ptr.clone(),
+        1.0,
+        Value::Known(KnownVal::Num(site.dispatch_id as f64)),
+        &mem_var,
+    ));
+    bctx.code.add_block(mem_store_word(
+        env_ptr.clone(),
+        2.0,
+        Value::GetVar {
+            name: ctx.cfg.stack_pointer_var.clone(),
+        },
+        &mem_var,
+    ));
+    bctx.code.add_block(mem_store_word(
+        env_ptr.clone(),
+        3.0,
+        Value::GetVar {
+            name: ctx.cfg.local_stack_size_var.clone(),
+        },
+        &mem_var,
+    ));
+
+    // Save a snapshot of the local variable stack so it can be restored on longjmp.
+    bctx.code.add(save_setjmp_local_stack_snapshot(ctx));
+
+    // Initialize longjmp control variables for the first-time path.
+    bctx.code.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: ctx.cfg.longjmp_target_id_var.clone(),
+        value: Value::Known(KnownVal::Num(site.dispatch_id as f64)),
+    }));
+    bctx.code.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: ctx.cfg.longjmp_return_value_var.clone(),
+        value: Value::Known(KnownVal::Num(0.0)),
+    }));
+    bctx.code.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: ctx.cfg.longjmp_pending_var.clone(),
+        value: Value::Known(KnownVal::Num(0.0)),
+    }));
+
+    // Call the continuation inline; this is the first-time-through path.
+    bctx.code.add_block(Block::ProcedureCall(ProcedureCallData {
+        name: site.continuation_name.clone(),
+        args: Vec::new(),
+        run_without_refresh: false,
+    }));
+    // The setup code must not fall through into the continuation's body, which
+    // is emitted as a separate procedure below.
+    bctx.code.add_block(Block::StopScript(StopOption::This));
+
+    // End the current (setup) procedure.
+    ctx.proj.code.push(bctx.code.clone());
+
+    // Start the continuation procedure.  When entered via longjmp, the
+    // dispatcher has already set !longjmp return value and !longjmp pending.
+    let mut cont = BlockList::from_blocks(vec![Block::ProcedureDef(ProcedureDefData {
+        name: site.continuation_name.clone(),
+        params: Vec::new(),
+        warp: true,
+    })]);
+
+    let res_var = Variable {
+        var_name: site.result_var.clone(),
+        var_type: VarType::Var,
+        fn_name: None,
+    };
+    cont.add_block(res_var.set_value(
+        Value::GetVar {
+            name: ctx.cfg.longjmp_return_value_var.clone(),
+        },
+        VarOp::Set,
+        None,
+    )?);
+    // In branch-jump-table mode the continuation is entered from the top-level
+    // jump table after a longjmp, so reset the pending flag here. In procedure-
+    // call mode longjmp calls the continuation directly and relies on the flag
+    // staying set to propagate through callers.
+    if ctx.cfg.use_branch_jump_table {
+        cont.add_block(Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: ctx.cfg.longjmp_pending_var.clone(),
+            value: Value::Known(KnownVal::Num(0.0)),
+        }));
+    }
+
+    bctx.code = cont;
+    bctx.available_params = Vec::new();
+    bctx.available_param_sizes = Vec::new();
+
+    Ok(())
+}
+
+/// Translate a longjmp call.  Restores the saved context and signals the
+/// dispatcher to resume at the corresponding setjmp continuation.
+fn trans_longjmp_call(
+    call: &ir::instructions::Call,
+    ctx: &mut Context,
+    bctx: &mut BlockInfo,
+) -> Result<BlockList, CompException> {
+    let env_ptr = trans_value(&call.args[0], ctx, Some(bctx))?.into_single()?;
+    let val = trans_value(&call.args[1], ctx, Some(bctx))?.into_single()?;
+    let mem_var = ctx.cfg.mem_var.clone();
+
+    let mut blocks = BlockList::new();
+
+    // Restore stack pointer.
+    blocks.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: ctx.cfg.stack_pointer_var.clone(),
+        value: mem_load_word(env_ptr.clone(), 2.0, &mem_var),
+    }));
+
+    // Restore local stack size.
+    blocks.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: ctx.cfg.local_stack_size_var.clone(),
+        value: mem_load_word(env_ptr.clone(), 3.0, &mem_var),
+    }));
+
+    // Restore the local variable stack from the snapshot taken at setjmp.
+    blocks.add(restore_setjmp_local_stack_snapshot(ctx));
+
+    // Set the longjmp target to the dispatch id stored in jmp_buf.
+    blocks.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: ctx.cfg.longjmp_target_id_var.clone(),
+        value: mem_load_word(env_ptr.clone(), 1.0, &mem_var),
+    }));
+
+    // C semantics: if val is 0, setjmp returns 1.
+    let ret_val = Value::Op(Op::Add(
+        Box::new(val.clone()),
+        Box::new(Value::Op(Op::Mul(
+            Box::new(Value::BoolOp(BoolOp::Eq(
+                Box::new(val.clone()),
+                Box::new(Value::Known(KnownVal::Num(0.0))),
+            ))),
+            Box::new(Value::Known(KnownVal::Num(1.0))),
+        ))),
+    ));
+    blocks.add_block(Block::EditVar(EditVarData {
+        op: VarOp::Set,
+        name: ctx.cfg.longjmp_return_value_var.clone(),
+        value: ret_val,
+    }));
+
+    if ctx.cfg.use_branch_jump_table {
+        // Branch-jump-table mode: propagate via the pending flag to the top-level
+        // jump table. This path is guarded in trans_funcs in Phase 1.
+        blocks.add_block(Block::EditVar(EditVarData {
+            op: VarOp::Set,
+            name: ctx.cfg.longjmp_pending_var.clone(),
+            value: Value::Known(KnownVal::Num(1.0)),
+        }));
+        blocks.add_block(Block::StopScript(StopOption::This));
+    } else {
+        // Procedure-call mode: longjmp directly resumes the matching setjmp
+        // continuation. This avoids relying on a top-level jump table.
+        let dispatch_value = Value::GetVar {
+            name: ctx.cfg.longjmp_target_id_var.clone(),
+        };
+        blocks.add(build_longjmp_dispatch(&ctx.setjmp_sites, &dispatch_value)?);
+        blocks.add_block(Block::StopScript(StopOption::This));
+    }
+
+    Ok(blocks)
+}
+
+/// Build a nested if-else chain that calls the continuation whose dispatch id
+/// matches `dispatch_value`. Used for longjmp in procedure-call mode.
+fn build_longjmp_dispatch(
+    sites: &[SetjmpSite],
+    dispatch_value: &Value,
+) -> Result<BlockList, CompException> {
+    if sites.is_empty() {
+        return Err(CompException("longjmp encountered without any setjmp site".to_string()));
+    }
+
+    fn build_chain(
+        sites: &[SetjmpSite],
+        dispatch_value: &Value,
+        idx: usize,
+    ) -> BlockList {
+        let site = &sites[idx];
+        let call_cont = BlockList::from_blocks(vec![Block::ProcedureCall(ProcedureCallData {
+            name: site.continuation_name.clone(),
+            args: Vec::new(),
+            run_without_refresh: false,
+        })]);
+        if idx == sites.len() - 1 {
+            return call_cont;
+        }
+        let else_body = build_chain(sites, dispatch_value, idx + 1);
+        BlockList::from_blocks(vec![Block::ControlFlow(ControlFlow {
+            op: ControlOp::IfElse,
+            condition: Some(Value::BoolOp(BoolOp::Eq(
+                Box::new(dispatch_value.clone()),
+                Box::new(Value::Known(KnownVal::Num(site.dispatch_id as f64))),
+            ))),
+            var: None,
+            body: Some(call_cont),
+            else_body: Some(else_body),
+        })])
+    }
+
+    Ok(build_chain(sites, dispatch_value, 0))
 }
 
 /// Names treated as built-in pen/motion helpers. Calls to these functions are
@@ -3390,6 +4362,204 @@ fn get_call_return_addr_info(
     }
 }
 
+const LN2: f64 = 0.6931471805599453;
+
+fn pow2(exponent: Value) -> Value {
+    Value::Op(Op::Exp(Box::new(Value::Op(Op::Mul(
+        Box::new(Value::Known(KnownVal::Num(LN2))),
+        Box::new(exponent),
+    )))))
+}
+
+fn i64_bits_to_double(low: Value, high: Value) -> Value {
+    let sign = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+        Box::new(high.clone()),
+        Box::new(Value::Known(KnownVal::Num(32768.0))),
+    )))));
+    let sign_val = Value::Op(Op::Sub(
+        Box::new(Value::Known(KnownVal::Num(1.0))),
+        Box::new(Value::Op(Op::Mul(
+            Box::new(Value::Known(KnownVal::Num(2.0))),
+            Box::new(sign),
+        ))),
+    ));
+    let exponent = Value::Op(Op::Mod(
+        Box::new(Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+            Box::new(high.clone()),
+            Box::new(Value::Known(KnownVal::Num(16.0))),
+        )))))),
+        Box::new(Value::Known(KnownVal::Num(2048.0))),
+    ));
+    let mant_high = Value::Op(Op::Mod(
+        Box::new(high),
+        Box::new(Value::Known(KnownVal::Num(16.0))),
+    ));
+    let mantissa = Value::Op(Op::Add(
+        Box::new(low),
+        Box::new(Value::Op(Op::Mul(
+            Box::new(mant_high),
+            Box::new(Value::Known(KnownVal::Num(281474976710656.0))),
+        ))),
+    ));
+    let is_zero_exp = Value::BoolOp(BoolOp::Eq(
+        Box::new(exponent.clone()),
+        Box::new(Value::Known(KnownVal::Num(0.0))),
+    ));
+    let is_max_exp = Value::BoolOp(BoolOp::Eq(
+        Box::new(exponent.clone()),
+        Box::new(Value::Known(KnownVal::Num(2047.0))),
+    ));
+    let is_zero_mant = Value::BoolOp(BoolOp::Eq(
+        Box::new(mantissa.clone()),
+        Box::new(Value::Known(KnownVal::Num(0.0))),
+    ));
+    let is_inf = Value::BoolOp(BoolOp::And(
+        Box::new(is_max_exp.clone()),
+        Box::new(is_zero_mant.clone()),
+    ));
+    let is_nan = Value::BoolOp(BoolOp::And(
+        Box::new(is_max_exp),
+        Box::new(Value::BoolOp(BoolOp::Not(Box::new(is_zero_mant)))),
+    ));
+    let two_pow_m52 = Value::Known(KnownVal::Num(2f64.powi(-52)));
+    let one_plus_mant = Value::Op(Op::Add(
+        Box::new(Value::Known(KnownVal::Num(1.0))),
+        Box::new(Value::Op(Op::Mul(Box::new(mantissa.clone()), Box::new(two_pow_m52)))),
+    ));
+    let two_pow_exp_minus_1023 = pow2(Value::Op(Op::Sub(
+        Box::new(exponent.clone()),
+        Box::new(Value::Known(KnownVal::Num(1023.0))),
+    )));
+    let normal_result = Value::Op(Op::Mul(
+        Box::new(sign_val.clone()),
+        Box::new(Value::Op(Op::Mul(
+            Box::new(one_plus_mant),
+            Box::new(two_pow_exp_minus_1023),
+        ))),
+    ));
+    let denorm_result = Value::Op(Op::Mul(
+        Box::new(sign_val.clone()),
+        Box::new(Value::Op(Op::Mul(
+            Box::new(mantissa),
+            Box::new(Value::Known(KnownVal::Num(2f64.powi(-1022 - 52)))),
+        ))),
+    ));
+    let inf_val = Value::Op(Op::Div(
+        Box::new(sign_val),
+        Box::new(Value::Known(KnownVal::Num(0.0))),
+    ));
+    let nan_val = Value::Op(Op::Div(
+        Box::new(Value::Known(KnownVal::Num(0.0))),
+        Box::new(Value::Known(KnownVal::Num(0.0))),
+    ));
+    let not_zero_exp = Value::BoolOp(BoolOp::Not(Box::new(is_zero_exp.clone())));
+    let exp_choice = Value::Op(Op::Add(
+        Box::new(Value::Op(Op::Mul(
+            Box::new(Value::Op(Op::BoolToFloat(Box::new(not_zero_exp)))),
+            Box::new(normal_result),
+        ))),
+        Box::new(Value::Op(Op::Mul(
+            Box::new(Value::Op(Op::BoolToFloat(Box::new(is_zero_exp.clone())))),
+            Box::new(denorm_result),
+        ))),
+    ));
+    let not_nan_or_inf = Value::BoolOp(BoolOp::Not(Box::new(Value::BoolOp(BoolOp::Or(
+        Box::new(is_inf.clone()),
+        Box::new(is_nan.clone()),
+    )))));
+    Value::Op(Op::Add(
+        Box::new(Value::Op(Op::Mul(
+            Box::new(Value::Op(Op::BoolToFloat(Box::new(not_nan_or_inf)))),
+            Box::new(exp_choice),
+        ))),
+        Box::new(Value::Op(Op::Add(
+            Box::new(Value::Op(Op::Mul(
+                Box::new(Value::Op(Op::BoolToFloat(Box::new(is_inf)))),
+                Box::new(inf_val),
+            ))),
+            Box::new(Value::Op(Op::Mul(
+                Box::new(Value::Op(Op::BoolToFloat(Box::new(is_nan)))),
+                Box::new(nan_val),
+            ))),
+        ))),
+    ))
+}
+
+fn double_to_i64_bits(val: Value) -> (Value, Value) {
+    let zero = Value::Known(KnownVal::Num(0.0));
+    let sign = Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Lt(
+        Box::new(val.clone()),
+        Box::new(zero.clone()),
+    )))));
+    let abs_val = Value::Op(Op::Abs(Box::new(val.clone())));
+    let is_zero = Value::BoolOp(BoolOp::Eq(
+        Box::new(abs_val.clone()),
+        Box::new(zero.clone()),
+    ));
+    let log2_abs = Value::Op(Op::Div(
+        Box::new(Value::Op(Op::Ln(Box::new(abs_val.clone())))),
+        Box::new(Value::Known(KnownVal::Num(LN2))),
+    ));
+    let exp2 = Value::Op(Op::Floor(Box::new(log2_abs)));
+    let biased_exp = Value::Op(Op::Add(
+        Box::new(exp2.clone()),
+        Box::new(Value::Known(KnownVal::Num(1023.0))),
+    ));
+    let pow2_exp2 = pow2(exp2);
+    let mant_norm = Value::Op(Op::Div(Box::new(abs_val), Box::new(pow2_exp2)));
+    let mant_bits = Value::Op(Op::Mul(
+        Box::new(Value::Op(Op::Sub(
+            Box::new(mant_norm),
+            Box::new(Value::Known(KnownVal::Num(1.0))),
+        ))),
+        Box::new(Value::Known(KnownVal::Num(4503599627370496.0))),
+    ));
+    let not_zero = Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Not(
+        Box::new(is_zero.clone()),
+    )))));
+    let combine_zero = Value::Op(Op::Mul(
+        Box::new(Value::Op(Op::BoolToFloat(Box::new(is_zero.clone())))),
+        Box::new(zero.clone()),
+    ));
+    let sign_shifted = Value::Op(Op::Mul(
+        Box::new(sign),
+        Box::new(Value::Known(KnownVal::Num(9223372036854775808.0))),
+    ));
+    let exp_shifted = Value::Op(Op::Mul(
+        Box::new(biased_exp),
+        Box::new(Value::Known(KnownVal::Num(4503599627370496.0))),
+    ));
+    let int_bits = Value::Op(Op::Add(
+        Box::new(sign_shifted),
+        Box::new(Value::Op(Op::Add(
+            Box::new(exp_shifted),
+            Box::new(mant_bits),
+        ))),
+    ));
+    let combine_val = Value::Op(Op::Mul(
+        Box::new(not_zero),
+        Box::new(int_bits),
+    ));
+    let combined = Value::Op(Op::Add(
+        Box::new(combine_zero),
+        Box::new(combine_val),
+    ));
+    let base48 = Value::Known(KnownVal::Num(281474976710656.0));
+    let high_mask = Value::Known(KnownVal::Num(65536.0));
+    let low = Value::Op(Op::Mod(
+        Box::new(combined.clone()),
+        Box::new(base48),
+    ));
+    let high = Value::Op(Op::Mod(
+        Box::new(Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+            Box::new(combined),
+            Box::new(Value::Known(KnownVal::Num(281474976710656.0))),
+        )))))),
+        Box::new(high_mask),
+    ));
+    (low, high)
+}
+
 fn trans_instr(
     instr: &ir::Instr,
     ctx: &mut Context,
@@ -3468,7 +4638,7 @@ fn trans_instr(
                 ir::instructions::BinaryOpcode::Add | ir::instructions::BinaryOpcode::Sub => {
                     let op_str = if bop.opcode == ir::instructions::BinaryOpcode::Add { "add" } else { "sub" };
                     let width = get_value_width(&bop.left);
-                    let (val, extra_blocks) = calculate_sum_diff(op_str, lft_iv, rgt_iv, width, ctx, bop.is_nuw);
+                    let (val, extra_blocks) = calculate_sum_diff(op_str, lft_iv, rgt_iv, width, ctx, bop.is_nuw)?;
                     blocks.add(extra_blocks);
                     res_val = Some(val);
                 }
@@ -3486,6 +4656,33 @@ fn trans_instr(
                     blocks.add(extra_blocks);
                     res_val = Some(val);
                 }
+                ir::instructions::BinaryOpcode::AShr => {
+                    let width = get_value_width(&bop.left);
+                    if width > super::config::VARIABLE_MAX_BITS {
+                        let shift_single = match &rgt_iv {
+                            InferredValue::Indexed(idx) => idx.vals[0].clone(),
+                            InferredValue::Single(v) => v.clone(),
+                        };
+                        if width == 64 && shift_single == Value::Known(KnownVal::Num(32.0)) {
+                            let lft_idx = match lft_iv {
+                                InferredValue::Indexed(iv) => iv,
+                                _ => return Err(CompException(
+                                    "Expected indexed value for wide ashr".to_string(),
+                                )),
+                            };
+                            res_val = Some(InferredValue::Indexed(ashr_i64_by_32(&lft_idx)?));
+                        } else {
+                            return Err(CompException(format!(
+                                "AShr of {}-bit integers by {:?} is not supported",
+                                width, shift_single
+                            )));
+                        }
+                    } else {
+                        let lft = lft_iv.into_single()?;
+                        let rgt = rgt_iv.into_single()?;
+                        blocks.add(ashr_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
+                    }
+                }
                 _ => {
                     match bop.opcode {
                         ir::instructions::BinaryOpcode::And
@@ -3496,24 +4693,40 @@ fn trans_instr(
                                 bop.opcode, lft_iv, rgt_iv, width, ctx,
                             )?);
                         }
+                        ir::instructions::BinaryOpcode::Mul => {
+                            let width = get_value_width(&bop.left);
+                            if width > super::config::VARIABLE_MAX_BITS {
+                                let lft_idx = match lft_iv {
+                                    InferredValue::Indexed(iv) => iv,
+                                    _ => return Err(CompException(
+                                        "Expected indexed value for wide multiplication".to_string(),
+                                    )),
+                                };
+                                let rgt_idx = match rgt_iv {
+                                    InferredValue::Indexed(iv) => iv,
+                                    _ => return Err(CompException(
+                                        "Expected indexed value for wide multiplication".to_string(),
+                                    )),
+                                };
+                                res_val = Some(InferredValue::Indexed(multiply_wide_u64(
+                                    &lft_idx, &rgt_idx,
+                                )?));
+                            } else {
+                                let lft = lft_iv.into_single()?;
+                                let rgt = rgt_iv.into_single()?;
+                                if bop.is_nuw && bop.is_nsw {
+                                    res_val = Some(InferredValue::Single(multiply_no_wrap(lft, rgt, width)?));
+                                } else {
+                                    let (val, extra_blocks) = multiply_wrap(lft, rgt, width, ctx)?;
+                                    blocks.add(extra_blocks);
+                                    res_val = Some(InferredValue::Single(val));
+                                }
+                            }
+                        }
                         _ => {
                             let lft = lft_iv.into_single()?;
                             let rgt = rgt_iv.into_single()?;
                             match bop.opcode {
-                                ir::instructions::BinaryOpcode::Mul => {
-                                    let width = get_value_width(&bop.left);
-                                    if bop.is_nuw && bop.is_nsw {
-                                        res_val = Some(InferredValue::Single(multiply_no_wrap(lft, rgt, width)?));
-                                    } else {
-                                        let (val, extra_blocks) = multiply_wrap(lft, rgt, width, ctx)?;
-                                        blocks.add(extra_blocks);
-                                        res_val = Some(InferredValue::Single(val));
-                                    }
-                                }
-                                ir::instructions::BinaryOpcode::AShr => {
-                                    let width = get_value_width(&bop.left);
-                                    blocks.add(ashr_blocks(&res_var, lft, rgt, width, bop.is_exact, ctx)?);
-                                }
                                 ir::instructions::BinaryOpcode::UDiv => {
                                     let width = get_value_width(&bop.left);
                                     if width > super::config::VARIABLE_MAX_BITS {
@@ -3880,8 +5093,21 @@ fn trans_instr(
                     }
                 }
                 ir::instructions::ConvOpcode::ZExt => {
-                    let val = val_iv.into_single()?;
-                    InferredValue::Single(val)
+                    let to_width = get_type_width(&conv.res_type);
+                    if to_width > super::config::VARIABLE_MAX_BITS {
+                        // Zero-extend a narrow value into a wide integer represented as
+                        // multiple Scratch variables.  Only the low chunk gets the value;
+                        // higher chunks are zero.
+                        let low = val_iv.into_single()?;
+                        let mut vals = vec![low];
+                        let chunks = (to_width + super::config::VARIABLE_MAX_BITS - 1)
+                            / super::config::VARIABLE_MAX_BITS;
+                        vals.resize(chunks, Value::Known(KnownVal::Num(0.0)));
+                        InferredValue::Indexed(IdxbleValue { vals })
+                    } else {
+                        let val = val_iv.into_single()?;
+                        InferredValue::Single(val)
+                    }
                 }
                 ir::instructions::ConvOpcode::SExt => {
                     let val = val_iv.into_single()?;
@@ -3904,17 +5130,52 @@ fn trans_instr(
                     InferredValue::Single(val_iv.into_single()?)
                 }
                 ir::instructions::ConvOpcode::BitCast => {
-                    InferredValue::Single(val_iv.into_single()?)
+                    let src_width = get_value_width(&conv.value);
+                    let dst_width = get_type_width(&conv.res_type);
+                    match (src_width, dst_width) {
+                        (64, 64) => {
+                            match val_iv {
+                                InferredValue::Indexed(idx) => {
+                                    let low = idx.vals[0].clone();
+                                    let high = idx.vals[1].clone();
+                                    InferredValue::Single(i64_bits_to_double(low, high))
+                                }
+                                InferredValue::Single(v) => {
+                                    let dst_is_float = conv.res_type.is_floating_point();
+                                    if dst_is_float {
+                                        InferredValue::Single(v)
+                                    } else {
+                                        let (low, high) = double_to_i64_bits(v);
+                                        InferredValue::Indexed(IdxbleValue { vals: vec![low, high] })
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            InferredValue::Single(val_iv.into_single()?)
+                        }
+                    }
                 }
                 ir::instructions::ConvOpcode::SIToFP => {
-                    let val = val_iv.into_single()?;
                     let width = get_value_width(&conv.value);
-                    InferredValue::Single(twos_complement::undo_twos_complement(val, width))
+                    if width == 64 {
+                        let idx = val_iv.into_indexed()?;
+                        let low = idx.vals[0].clone();
+                        let high = idx.vals[1].clone();
+                        let base48 = Value::Known(KnownVal::Num(281474976710656.0)); // 2^48
+                        let combined = Value::Op(Op::Add(
+                            Box::new(low),
+                            Box::new(Value::Op(Op::Mul(Box::new(high), Box::new(base48)))),
+                        ));
+                        InferredValue::Single(twos_complement::undo_twos_complement(combined, 64))
+                    } else {
+                        let val = val_iv.into_single()?;
+                        InferredValue::Single(twos_complement::undo_twos_complement(val, width))
+                    }
                 }
                 ir::instructions::ConvOpcode::FPToSI => {
                     let val = val_iv.into_single()?;
                     let width = get_type_width(&conv.res_type);
-                    let mod_base = 2f64.powi(width as i32);
                     let abs_val = Value::Op(Op::Abs(Box::new(val.clone())));
                     let floored_abs = Value::Op(Op::Floor(Box::new(abs_val)));
                     let sign = Value::Op(Op::Sub(
@@ -3928,10 +5189,23 @@ fn trans_instr(
                         Box::new(Value::Known(KnownVal::Num(1.0))),
                     ));
                     let signed = Value::Op(Op::Mul(Box::new(floored_abs), Box::new(sign)));
-                    InferredValue::Single(Value::Op(Op::Mod(
-                        Box::new(signed),
-                        Box::new(Value::Known(KnownVal::Num(mod_base))),
-                    )))
+                    let wrapped = twos_complement::apply_twos_complement(signed, width);
+
+                    if width == 64 {
+                        let base48 = Value::Known(KnownVal::Num(281474976710656.0)); // 2^48
+                        let high_mask = Value::Known(KnownVal::Num(65536.0)); // 2^16
+                        let low = Value::Op(Op::Mod(Box::new(wrapped.clone()), Box::new(base48.clone())));
+                        let high = Value::Op(Op::Mod(
+                            Box::new(Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                                Box::new(wrapped),
+                                Box::new(base48),
+                            )))))),
+                            Box::new(high_mask),
+                        ));
+                        InferredValue::Indexed(IdxbleValue { vals: vec![low, high] })
+                    } else {
+                        InferredValue::Single(wrapped)
+                    }
                 }
                 ir::instructions::ConvOpcode::FPToUI => {
                     let val = val_iv.into_single()?;
@@ -4008,6 +5282,109 @@ fn trans_instr(
             };
             let res_var = Variable {
                 var_name: localize_var(&iv.result.name, false, Some(&bctx.fn_info.name), false),
+                var_type: VarType::Var,
+                fn_name: None,
+            };
+            blocks.add(res_var.set_inferred_value(res_iv)?);
+        }
+
+        ir::Instr::ExtractElement(ee) => {
+            let vec_iv = trans_value(&ee.agg, ctx, Some(bctx))?;
+            let idx_iv = trans_value(&ee.index, ctx, Some(bctx))?;
+            let idx_val = idx_iv.into_single()?;
+            let idx = match &idx_val {
+                Value::Known(KnownVal::Num(n)) => {
+                    if n.fract() == 0.0 && *n >= 0.0 {
+                        Some(*n as usize)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let idx = idx.ok_or_else(|| CompException("Dynamic extractelement index not yet supported".to_string()))?;
+            let vec_ty = ee.agg.type_();
+            let elem_ty = match vec_ty {
+                ir::Type::Vector(vt) => &*vt.inner,
+                _ => return Err(CompException("extractelement requires vector type".to_string())),
+            };
+            let elem_size = memory::get_size_of(elem_ty, false)?;
+            let vals = inferred_to_values(vec_iv);
+            let offset = idx * elem_size;
+            let res_vals: Vec<Value> = vals[offset..offset + elem_size].to_vec();
+            let res_iv = if res_vals.len() == 1 {
+                InferredValue::Single(res_vals.into_iter().next().unwrap())
+            } else {
+                InferredValue::Indexed(IdxbleValue { vals: res_vals })
+            };
+            let res_var = Variable {
+                var_name: localize_var(&ee.result.name, false, Some(&bctx.fn_info.name), false),
+                var_type: VarType::Var,
+                fn_name: None,
+            };
+            blocks.add(res_var.set_inferred_value(res_iv)?);
+        }
+
+        ir::Instr::InsertElement(ie) => {
+            let vec_iv = trans_value(&ie.agg, ctx, Some(bctx))?;
+            let item_iv = trans_value(&ie.item, ctx, Some(bctx))?;
+            let idx_iv = trans_value(&ie.index, ctx, Some(bctx))?;
+            let idx_val = idx_iv.into_single()?;
+            let idx_known = match &idx_val {
+                Value::Known(KnownVal::Num(n)) => {
+                    if n.fract() == 0.0 && *n >= 0.0 {
+                        Some(*n as usize)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let vec_ty = ie.agg.type_();
+            let elem_ty = match vec_ty {
+                ir::Type::Vector(vt) => &*vt.inner,
+                _ => return Err(CompException("insertelement requires vector type".to_string())),
+            };
+            let elem_size = memory::get_size_of(elem_ty, false)?;
+            match idx_known {
+                Some(idx) => {
+                    let mut vals = inferred_to_values(vec_iv);
+                    let item_vals = inferred_to_values(item_iv);
+                    let offset = idx * elem_size;
+                    for (i, v) in item_vals.iter().enumerate() {
+                        vals[offset + i] = v.clone();
+                    }
+                    let res_iv = if vals.len() == 1 {
+                        InferredValue::Single(vals.into_iter().next().unwrap())
+                    } else {
+                        InferredValue::Indexed(IdxbleValue { vals })
+                    };
+                    let res_var = Variable {
+                        var_name: localize_var(&ie.result.name, false, Some(&bctx.fn_info.name), false),
+                        var_type: VarType::Var,
+                        fn_name: None,
+                    };
+                    blocks.add(res_var.set_inferred_value(res_iv)?);
+                }
+                None => {
+                    return Err(CompException("Dynamic insertelement index not yet supported".to_string()));
+                }
+            }
+        }
+
+        ir::Instr::ShuffleVector(sv) => {
+            let v1_iv = trans_value(&sv.fst_vector, ctx, Some(bctx))?;
+            let v2_iv = trans_value(&sv.snd_vector, ctx, Some(bctx))?;
+            let mask_iv = trans_value(&sv.mask_vector, ctx, Some(bctx))?;
+            let vec_ty = sv.fst_vector.type_();
+            let elem_ty = match vec_ty {
+                ir::Type::Vector(vt) => &*vt.inner,
+                _ => return Err(CompException("shufflevector requires vector type".to_string())),
+            };
+            let elem_size = memory::get_size_of(elem_ty, false)?;
+            let res_iv = shuffle_vector(v1_iv, v2_iv, mask_iv, elem_size)?;
+            let res_var = Variable {
+                var_name: localize_var(&sv.result.name, false, Some(&bctx.fn_info.name), false),
                 var_type: VarType::Var,
                 fn_name: None,
             };
@@ -4394,7 +5771,7 @@ fn trans_intrinsic(
                 }));
             }
         }
-        Intrinsic::MemCpy => {
+        Intrinsic::MemCpy | Intrinsic::MemCpyInline => {
             let mut it = values.into_iter();
             let dest = it.next().ok_or_else(|| CompException("memcpy requires dest".to_string()))?;
             let src = it.next().ok_or_else(|| CompException("memcpy requires src".to_string()))?;
@@ -4777,13 +6154,538 @@ fn trans_intrinsic(
             )?;
             blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
         }
+        Intrinsic::FShl | Intrinsic::FShr => {
+            let mut it = values.into_iter();
+            let a = it.next().ok_or_else(|| CompException("fshl/fshr requires three arguments".to_string()))?;
+            let b = it.next().ok_or_else(|| CompException("fshl/fshr requires three arguments".to_string()))?;
+            let c = it.next().ok_or_else(|| CompException("fshl/fshr requires three arguments".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("fshl/fshr requires a result variable".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("fshl/fshr requires integer operands".to_string())),
+            };
+
+            let c_num = match c {
+                Value::Known(KnownVal::Num(n)) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as i32,
+                _ => return Err(CompException(format!("fshl/fshr requires a known non-negative shift amount, got {:?}", c))),
+            };
+            if c_num as usize >= width {
+                return Err(CompException(format!("fshl/fshr shift amount {} out of range for width {}", c_num, width)));
+            }
+
+            // fshr(a, b, c) = fshl(b, a, c): swap a and b for fshr
+            let (a, b) = if matches!(intrinsic, Intrinsic::FShr) {
+                (b, a)
+            } else {
+                (a, b)
+            };
+
+            let modulus = 2f64.powi(width as i32);
+            let a_shift = 2f64.powi(c_num);
+            let b_shift = 2f64.powi((width as i32) - c_num);
+
+            let shifted_a = Value::Op(Op::Mod(
+                Box::new(Value::Op(Op::Mul(Box::new(a), Box::new(Value::Known(KnownVal::Num(a_shift)))))),
+                Box::new(Value::Known(KnownVal::Num(modulus))),
+            ));
+            let shifted_b = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                Box::new(b),
+                Box::new(Value::Known(KnownVal::Num(b_shift))),
+            )))));
+            let res = Value::Op(Op::Add(Box::new(shifted_a), Box::new(shifted_b)));
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+        }
+        Intrinsic::UMulWithOverflow => {
+            let mut it = values.into_iter();
+            let lft = it.next().ok_or_else(|| CompException("umul.with.overflow requires left operand".to_string()))?;
+            let rgt = it.next().ok_or_else(|| CompException("umul.with.overflow requires right operand".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("umul.with.overflow requires integer operands".to_string())),
+            };
+            let res_var = result_var.ok_or_else(|| CompException("umul.with.overflow requires a result variable".to_string()))?;
+
+            let modulus = 2f64.powi(width as i32);
+            let mul_val = twos_complement::multiply_wrap(lft.clone(), rgt.clone(), width)?;
+            let raw_mul = Value::Op(Op::Mul(Box::new(lft), Box::new(rgt)));
+            let did_overflow = Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Gt(
+                Box::new(raw_mul),
+                Box::new(Value::Known(KnownVal::Num(modulus - 1.0))),
+            )))));
+
+            blocks.add(res_var.set_inferred_value(InferredValue::Indexed(IdxbleValue {
+                vals: vec![mul_val, did_overflow],
+            }))?);
+        }
+        Intrinsic::CopySign => {
+            let mut it = values.into_iter();
+            let mag = it.next().ok_or_else(|| CompException("copysign requires magnitude".to_string()))?;
+            let sgn = it.next().ok_or_else(|| CompException("copysign requires sign".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("copysign requires a result variable".to_string()))?;
+
+            let is_neg = Value::BoolOp(BoolOp::Lt(
+                Box::new(sgn.clone()),
+                Box::new(Value::Known(KnownVal::Num(0.0))),
+            ));
+            let sign = Value::Op(Op::Sub(
+                Box::new(Value::Known(KnownVal::Num(1.0))),
+                Box::new(Value::Op(Op::Mul(Box::new(is_neg), Box::new(Value::Known(KnownVal::Num(2.0)))))),
+            ));
+            let res = Value::Op(Op::Mul(
+                Box::new(Value::Op(Op::Abs(Box::new(mag)))),
+                Box::new(sign),
+            ));
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+        }
+        Intrinsic::Ctlz => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("ctlz requires value".to_string()))?;
+            let _is_zero_poison = it.next(); // ignored; caller guarantees input is non-zero
+            let res_var = result_var.ok_or_else(|| CompException("ctlz requires a result variable".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("ctlz requires integer operand".to_string())),
+            };
+
+            if width != 32 {
+                return Err(CompException(format!("ctlz width {} not supported", width)));
+            }
+
+            // Count leading zeros for a 32-bit value with a binary search.
+            let mut ctlz_blocks = BlockList::new();
+            let count_var = gen_temp_var(ctx);
+            let val_var = gen_temp_var(ctx);
+
+            ctlz_blocks.add_block(Block::EditVar(EditVarData {
+                op: VarOp::Set,
+                name: count_var.clone(),
+                value: Value::Known(KnownVal::Num(0.0)),
+            }));
+            ctlz_blocks.add_block(Block::EditVar(EditVarData {
+                op: VarOp::Set,
+                name: val_var.clone(),
+                value: val,
+            }));
+
+            for (shift, add) in [(16, 16), (8, 8), (4, 4), (2, 2), (1, 1)] {
+                let divisor = Value::Known(KnownVal::Num(2f64.powi(shift)));
+                let multiplier = Value::Known(KnownVal::Num(2f64.powi(shift)));
+                let shifted = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                    Box::new(Value::GetVar { name: val_var.clone() }),
+                    Box::new(divisor),
+                )))));
+                let cond = Value::BoolOp(BoolOp::Eq(
+                    Box::new(shifted),
+                    Box::new(Value::Known(KnownVal::Num(0.0))),
+                ));
+                let then_blocks = BlockList::from_blocks(vec![
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Change,
+                        name: count_var.clone(),
+                        value: Value::Known(KnownVal::Num(add as f64)),
+                    }),
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Set,
+                        name: val_var.clone(),
+                        value: Value::Op(Op::Mul(
+                            Box::new(Value::GetVar { name: val_var.clone() }),
+                            Box::new(multiplier),
+                        )),
+                    }),
+                ]);
+                ctlz_blocks.add_block(Block::ControlFlow(ControlFlow {
+                    op: ControlOp::If,
+                    condition: Some(cond),
+                    body: Some(then_blocks),
+                    else_body: None,
+                    var: None,
+                }));
+            }
+
+            blocks.add(ctlz_blocks);
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::GetVar { name: count_var }))?);
+        }
+        Intrinsic::GetRounding => {
+            let res_var = result_var.ok_or_else(|| CompException("get.rounding requires a result variable".to_string()))?;
+            // Scratch uses IEEE-754 round-to-nearest semantics, which corresponds
+            // to rounding mode 0.  There is no dynamic rounding-mode support.
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::Known(KnownVal::Num(0.0))))?);
+        }
         Intrinsic::VaEnd
         | Intrinsic::LifetimeStart
         | Intrinsic::LifetimeEnd
         | Intrinsic::NoAliasScopeDecl
         | Intrinsic::Expect
         | Intrinsic::ExpectWithProbability
-        | Intrinsic::Assume => {}
+        | Intrinsic::Assume
+        | Intrinsic::InlineAsm
+        | Intrinsic::NoOp
+        | Intrinsic::SideEffect => {}
+        Intrinsic::Trap | Intrinsic::DebugTrap => {
+            blocks.add_block(Block::StopScript(StopOption::All));
+        }
+        Intrinsic::Bswap => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("bswap requires value".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("bswap requires a result variable".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("bswap requires integer operand".to_string())),
+            };
+
+            let total_bytes = width / 8;
+            let mut parts: Vec<Value> = Vec::new();
+            for byte in 0..total_bytes {
+                let src_byte = total_bytes - 1 - byte;
+                let right_shift = src_byte * 8;
+                let left_shift = byte * 8;
+                let shifted = if right_shift == 0 {
+                    val.clone()
+                } else {
+                    Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                        Box::new(val.clone()),
+                        Box::new(Value::Known(KnownVal::Num(2f64.powi(right_shift as i32)))),
+                    )))))
+                };
+                let masked = binop::binop(
+                    binop::BinopKind::And, shifted,
+                    Value::Known(KnownVal::Num(255.0)),
+                    width, &ctx.cfg,
+                    &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
+                )?;
+                let part = if left_shift == 0 {
+                    masked
+                } else {
+                    Value::Op(Op::Mul(
+                        Box::new(masked),
+                        Box::new(Value::Known(KnownVal::Num(2f64.powi(left_shift as i32)))),
+                    ))
+                };
+                parts.push(part);
+            }
+            let res = parts.into_iter().fold(
+                Value::Known(KnownVal::Num(0.0)),
+                |acc, v| Value::Op(Op::Add(Box::new(acc), Box::new(v))),
+            );
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+        }
+        Intrinsic::BitReverse => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("bitreverse requires value".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("bitreverse requires a result variable".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("bitreverse requires integer operand".to_string())),
+            };
+
+            let modulus = Value::Known(KnownVal::Num(2f64.powi(width as i32)));
+
+            let mut cur = val;
+            let mut step = 1;
+            while step < width {
+                let mut mask_val: i128 = 0;
+                for i in 0..(width as i32) {
+                    if (i / step as i32) % 2 == 0 {
+                        mask_val |= 1i128 << i;
+                    }
+                }
+                let mask = Value::Known(KnownVal::Num(mask_val as f64));
+                let left_masked = binop::binop(
+                    binop::BinopKind::And, cur.clone(), mask.clone(),
+                    width, &ctx.cfg,
+                    &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
+                )?;
+                let shift_up = Value::Known(KnownVal::Num(2f64.powi(step as i32)));
+                let shifted_left = Value::Op(Op::Mod(
+                    Box::new(Value::Op(Op::Mul(Box::new(left_masked), Box::new(shift_up)))),
+                    Box::new(modulus.clone()),
+                ));
+                let right_masked = binop::binop(
+                    binop::BinopKind::And, cur, mask,
+                    width, &ctx.cfg,
+                    &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
+                )?;
+                let shift_down = Value::Known(KnownVal::Num(2f64.powi(step as i32)));
+                let shifted_right = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                    Box::new(right_masked), Box::new(shift_down),
+                )))));
+                cur = Value::Op(Op::Add(Box::new(shifted_left), Box::new(shifted_right)));
+                step *= 2;
+            }
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(cur))?);
+        }
+        Intrinsic::Cttz => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("cttz requires value".to_string()))?;
+            let _is_zero_poison = it.next();
+            let res_var = result_var.ok_or_else(|| CompException("cttz requires a result variable".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("cttz requires integer operand".to_string())),
+            };
+
+            if width != 32 {
+                return Err(CompException(format!("cttz width {} not supported", width)));
+            }
+
+            let mut blocks_impl = BlockList::new();
+            let count_var = gen_temp_var(ctx);
+            let val_var = gen_temp_var(ctx);
+
+            blocks_impl.add_block(Block::EditVar(EditVarData {
+                op: VarOp::Set, name: count_var.clone(), value: Value::Known(KnownVal::Num(0.0)),
+            }));
+            blocks_impl.add_block(Block::EditVar(EditVarData {
+                op: VarOp::Set, name: val_var.clone(), value: val,
+            }));
+
+            for (mask, shift, add) in &[(0x0000FFFFu32, 16, 16), (0x000000FF, 8, 8), (0x0000000F, 4, 4), (0x00000003, 2, 2), (0x00000001, 1, 1)] {
+                let val_ref = Value::GetVar { name: val_var.clone() };
+                let and_result = binop::binop(
+                    binop::BinopKind::And, val_ref,
+                    Value::Known(KnownVal::Num(*mask as f64)),
+                    32, &ctx.cfg,
+                    &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
+                )?;
+                let cond = Value::BoolOp(BoolOp::Eq(
+                    Box::new(and_result),
+                    Box::new(Value::Known(KnownVal::Num(0.0))),
+                ));
+                let then_blocks = BlockList::from_blocks(vec![
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Change, name: count_var.clone(), value: Value::Known(KnownVal::Num(*add as f64)),
+                    }),
+                    Block::EditVar(EditVarData {
+                        op: VarOp::Set, name: val_var.clone(),
+                        value: Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                            Box::new(Value::GetVar { name: val_var.clone() }),
+                            Box::new(Value::Known(KnownVal::Num(2f64.powi(*shift)))),
+        ))))),
+                    }),
+                ]);
+                blocks_impl.add_block(Block::ControlFlow(ControlFlow {
+                    op: ControlOp::If, condition: Some(cond),
+                    body: Some(then_blocks), else_body: None, var: None,
+                }));
+            }
+
+            blocks.add(blocks_impl);
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::GetVar { name: count_var }))?);
+        }
+        Intrinsic::Sqrt => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("sqrt requires value".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("sqrt requires a result variable".to_string()))?;
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::Op(Op::Sqrt(Box::new(val)))))?);
+        }
+        Intrinsic::Ceil => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("ceil requires value".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("ceil requires a result variable".to_string()))?;
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::Op(Op::Ceiling(Box::new(val)))))?);
+        }
+        Intrinsic::Floor => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("floor requires value".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("floor requires a result variable".to_string()))?;
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::Op(Op::Floor(Box::new(val)))))?);
+        }
+        Intrinsic::Trunc => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("trunc requires value".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("trunc requires a result variable".to_string()))?;
+            let cond = Value::BoolOp(BoolOp::Gt(
+                Box::new(val.clone()),
+                Box::new(Value::Known(KnownVal::Num(0.0))),
+            ));
+            let floor_val = Value::Op(Op::Floor(Box::new(val.clone())));
+            let ceil_val = Value::Op(Op::Ceiling(Box::new(val)));
+            blocks.add_block(Block::ControlFlow(ControlFlow {
+                op: ControlOp::IfElse,
+                condition: Some(cond),
+                var: None,
+                body: Some(BlockList::from_block(res_var.set_value(floor_val, VarOp::Set, None)?)),
+                else_body: Some(BlockList::from_block(res_var.set_value(ceil_val, VarOp::Set, None)?)),
+            }));
+        }
+        Intrinsic::Rint | Intrinsic::NearbyInt | Intrinsic::Round => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("rint/round requires value".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("rint/round requires a result variable".to_string()))?;
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(Value::Op(Op::Round(Box::new(val)))))?);
+        }
+        Intrinsic::Fma => {
+            let mut it = values.into_iter();
+            let a = it.next().ok_or_else(|| CompException("fma requires 3 args".to_string()))?;
+            let b = it.next().ok_or_else(|| CompException("fma requires 3 args".to_string()))?;
+            let c = it.next().ok_or_else(|| CompException("fma requires 3 args".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("fma requires a result variable".to_string()))?;
+            let res = Value::Op(Op::Add(
+                Box::new(Value::Op(Op::Mul(Box::new(a), Box::new(b)))),
+                Box::new(c),
+            ));
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+        }
+        Intrinsic::Pow => {
+            let mut it = values.into_iter();
+            let a = it.next().ok_or_else(|| CompException("pow requires 2 args".to_string()))?;
+            let b = it.next().ok_or_else(|| CompException("pow requires 2 args".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("pow requires a result variable".to_string()))?;
+            let res = Value::Op(Op::Exp(Box::new(Value::Op(Op::Mul(
+                Box::new(b),
+                Box::new(Value::Op(Op::Ln(Box::new(a)))),
+            )))));
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+        }
+        Intrinsic::Powi => {
+            let mut it = values.into_iter();
+            let a = it.next().ok_or_else(|| CompException("powi requires 2 args".to_string()))?;
+            let b = it.next().ok_or_else(|| CompException("powi requires 2 args".to_string()))?;
+            let res_var = result_var.ok_or_else(|| CompException("powi requires a result variable".to_string()))?;
+            // powi takes integer exponent; convert to float via StrToFloat trick
+            let b_float = if matches!(&b, Value::Known(KnownVal::Num(_))) {
+                b
+            } else {
+                Value::Op(Op::StrToFloat(Box::new(b)))
+            };
+            let res = Value::Op(Op::Exp(Box::new(Value::Op(Op::Mul(
+                Box::new(b_float),
+                Box::new(Value::Op(Op::Ln(Box::new(a)))),
+            )))));
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
+        }
+        Intrinsic::StackSave => {
+            let res_var = result_var.ok_or_else(|| CompException("stacksave requires a result variable".to_string()))?;
+            blocks.add(res_var.set_inferred_value(InferredValue::Single(
+                Value::GetVar { name: ctx.cfg.stack_pointer_var.clone() }
+            ))?);
+        }
+        Intrinsic::StackRestore => {
+            let mut it = values.into_iter();
+            let val = it.next().ok_or_else(|| CompException("stackrestore requires value".to_string()))?;
+            blocks.add_block(Block::EditVar(EditVarData {
+                op: VarOp::Set,
+                name: ctx.cfg.stack_pointer_var.clone(),
+                value: val,
+            }));
+        }
+        Intrinsic::UAddWithOverflow | Intrinsic::USubWithOverflow => {
+            let mut it = values.into_iter();
+            let lft = it.next().ok_or_else(|| CompException("uadd/usub.with.overflow requires left operand".to_string()))?;
+            let rgt = it.next().ok_or_else(|| CompException("uadd/usub.with.overflow requires right operand".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("uadd/usub.with.overflow requires integer operands".to_string())),
+            };
+            let res_var = result_var.ok_or_else(|| CompException("uadd/usub.with.overflow requires a result variable".to_string()))?;
+
+            let modulus = 2f64.powi(width as i32);
+
+            let raw = if *intrinsic == Intrinsic::UAddWithOverflow {
+                Value::Op(Op::Add(Box::new(lft.clone()), Box::new(rgt.clone())))
+            } else {
+                Value::Op(Op::Sub(Box::new(lft.clone()), Box::new(rgt.clone())))
+            };
+
+            let wrapped = Value::Op(Op::Mod(
+                Box::new(Value::Op(Op::Add(
+                    Box::new(raw.clone()),
+                    Box::new(Value::Known(KnownVal::Num(modulus))),
+                ))),
+                Box::new(Value::Known(KnownVal::Num(modulus))),
+            ));
+
+            let sum = Value::Op(Op::Add(Box::new(lft.clone()), Box::new(rgt.clone())));
+            let bool_op = if *intrinsic == Intrinsic::UAddWithOverflow {
+                BoolOp::Gt(
+                    Box::new(sum),
+                    Box::new(Value::Known(KnownVal::Num(modulus - 1.0))),
+                )
+            } else {
+                BoolOp::Lt(
+                    Box::new(lft),
+                    Box::new(rgt),
+                )
+            };
+            let did_overflow = Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(bool_op))));
+
+            blocks.add(res_var.set_inferred_value(InferredValue::Indexed(IdxbleValue {
+                vals: vec![wrapped, did_overflow],
+            }))?);
+        }
+        Intrinsic::SAddWithOverflow | Intrinsic::SSubWithOverflow => {
+            let mut it = values.into_iter();
+            let lft = it.next().ok_or_else(|| CompException("sadd/ssub.with.overflow requires left/right operand".to_string()))?;
+            let rgt = it.next().ok_or_else(|| CompException("sadd/ssub.with.overflow requires left/right operand".to_string()))?;
+
+            let width = match args.get(0).map(|a| a.type_()) {
+                Some(Type::Integer(IntegerTy { width })) => *width as usize,
+                _ => return Err(CompException("sadd/ssub.with.overflow requires integer operands".to_string())),
+            };
+            let res_var = result_var.ok_or_else(|| CompException("sadd/ssub.with.overflow requires a result variable".to_string()))?;
+
+            let half = 2f64.powi(width as i32 - 1);
+            let modulus = 2f64.powi(width as i32);
+
+            let to_signed = |v: Value| -> Value {
+                let cond = Value::BoolOp(BoolOp::Lt(
+                    Box::new(v.clone()),
+                    Box::new(Value::Known(KnownVal::Num(half))),
+                ));
+                Value::Op(Op::Add(
+                    Box::new(v),
+                    Box::new(Value::Op(Op::Mul(
+                        Box::new(Value::Op(Op::Sub(
+                            Box::new(Value::Known(KnownVal::Num(1.0))),
+                            Box::new(cond),
+                        ))),
+                        Box::new(Value::Known(KnownVal::Num(-modulus))),
+                    ))),
+                ))
+            };
+
+            let lft_s = to_signed(lft);
+            let rgt_s = to_signed(rgt);
+            let raw = if matches!(intrinsic, Intrinsic::SAddWithOverflow) {
+                Value::Op(Op::Add(Box::new(lft_s.clone()), Box::new(rgt_s.clone())))
+            } else {
+                Value::Op(Op::Sub(Box::new(lft_s), Box::new(rgt_s)))
+            };
+
+            let max_s = half - 1.0;
+            let min_s = -half;
+
+            let from_signed = |v: Value| -> Value {
+                let cond = Value::BoolOp(BoolOp::Lt(
+                    Box::new(v.clone()),
+                    Box::new(Value::Known(KnownVal::Num(0.0))),
+                ));
+                Value::Op(Op::Add(
+                    Box::new(v),
+                    Box::new(Value::Op(Op::Mul(
+                        Box::new(cond),
+                        Box::new(Value::Known(KnownVal::Num(modulus))),
+                    ))),
+                ))
+            };
+
+            let wrapped = from_signed(raw.clone());
+            let did_overflow = Value::Op(Op::BoolToFloat(Box::new(Value::BoolOp(BoolOp::Or(
+                Box::new(Value::BoolOp(BoolOp::Gt(Box::new(raw.clone()), Box::new(Value::Known(KnownVal::Num(max_s)))))),
+                Box::new(Value::BoolOp(BoolOp::Lt(Box::new(raw), Box::new(Value::Known(KnownVal::Num(min_s)))))),
+            )))));
+
+            blocks.add(res_var.set_inferred_value(InferredValue::Indexed(IdxbleValue {
+                vals: vec![wrapped, did_overflow],
+            }))?);
+        }
         _ => {
             return Err(CompException(format!(
                 "Unsupported intrinsic: {:?}",
@@ -4932,7 +6834,12 @@ fn trans_return_addr(
             info.return_addresses().len().saturating_sub(1).max(1),
         ));
     } else if !info.return_addresses().is_empty() {
-        assert!(info.return_addresses().len() == 1);
+        if info.return_addresses().len() != 1 {
+            return Err(CompException(format!(
+                "trans_return_addr: expected exactly one return address, got {}",
+                info.return_addresses().len()
+            )));
+        }
         blocks.add_block(Block::ProcedureCall(scratch::ast::ProcedureCallData {
             name: info.return_addresses()[0].clone(),
             args: Vec::new(),
@@ -5320,6 +7227,7 @@ fn trans_terminator_instr(
 
 fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompException> {
     ctx = get_fn_info(mod_, ctx)?;
+    collect_setjmp_sites(mod_, &mut ctx)?;
 
     for (_, func) in &mod_.functions {
         if func.blocks.is_empty() {
@@ -5446,6 +7354,20 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                     name: ctx.cfg.jump_table_id_var.clone(),
                     value: Value::Known(KnownVal::Num(reset_id as f64)),
                 }));
+                if !ctx.cfg.progress_var.is_empty() {
+                    check_body.add_block(Block::EditVar(EditVarData {
+                        op: VarOp::Change,
+                        name: ctx.cfg.progress_var.clone(),
+                        value: Value::Known(KnownVal::Num(1.0)),
+                    }));
+                    if ctx.cfg.progress_say {
+                        check_body.add_block(Block::Say {
+                            value: Value::GetVar {
+                                name: ctx.cfg.progress_var.clone(),
+                            },
+                        });
+                    }
+                }
                 check_body.add_block(Block::StopScript(StopOption::This));
 
                 starting_code.add_block(Block::ControlFlow(ControlFlow {
@@ -5513,6 +7435,46 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                 if let ir::Instr::Call(call) = instr {
                     let label = bctx.label.clone().unwrap_or_default();
 
+                    // Handle setjmp/longjmp before ordinary call analysis. These
+                    // intrinsics do not go through the regular procedure-call
+                    // path and may split the current block into a continuation.
+                    if let ir::Value::Function(fv) = &call.func {
+                        if is_setjmp_name(&fv.name) || is_longjmp_name(&fv.name) {
+                            if ctx.cfg.use_branch_jump_table {
+                                return Err(CompException(format!(
+                                    "{} is not supported with branch jump tables in Phase 1; \
+                                     use --opt-target scratch3 or -T scratch3",
+                                    fv.name
+                                )));
+                            }
+                        }
+                        if is_setjmp_name(&fv.name) {
+                            let site = ctx.setjmp_sites
+                                .iter()
+                                .find(|s| {
+                                    s.fn_name == *fn_name
+                                        && s.block_label == block.label
+                                        && s.call_idx == bctx.next_call_id
+                                })
+                                .cloned()
+                                .ok_or_else(|| CompException(format!(
+                                    "setjmp site not found for {} in {}:{} call_idx {}",
+                                    fv.name, fn_name, block.label, bctx.next_call_id
+                                )))?;
+                            trans_setjmp_call(call, &site, &mut ctx, &mut bctx)?;
+                            bctx.next_call_id += 1;
+                            instr_idx += 1;
+                            continue;
+                        }
+                        if is_longjmp_name(&fv.name) {
+                            let blocks = trans_longjmp_call(call, &mut ctx, &mut bctx)?;
+                            bctx.code.add(blocks);
+                            bctx.next_call_id += 1;
+                            instr_idx += 1;
+                            continue;
+                        }
+                    }
+
                     if let Some((returns_to_address, takes_return_address, return_addresses)) =
                         get_call_return_addr_info(call, &ctx)
                     {
@@ -5572,6 +7534,9 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                             let (pre_call, post_call, _) = trans_call_instr(call, &mut ctx, &mut bctx, None)?;
                             bctx.code.add(pre_call);
                             bctx.code.add(post_call);
+                            if let Some(check) = longjmp_propagation_check(&ctx) {
+                                bctx.code.add(check);
+                            }
 
                             bctx.available_params = saved_available_params;
                             bctx.available_param_sizes = saved_available_param_sizes;
@@ -5634,6 +7599,9 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                                 )]);
                                 new_code.add_block(Block::EditCounter(CounterOp::Increment));
                                 new_code.add(post_call);
+                                if let Some(check) = longjmp_propagation_check(&ctx) {
+                                    new_code.add(check);
+                                }
 
                                 if do_recursive {
                                     // Restore live variables after the call returns.
@@ -5668,6 +7636,9 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                                 let (pre_call, post_call, _) = trans_call_instr(call, &mut ctx, &mut bctx, None)?;
                                 bctx.code.add(pre_call);
                                 bctx.code.add(post_call);
+                                if let Some(check) = longjmp_propagation_check(&ctx) {
+                                    bctx.code.add(check);
+                                }
 
                                 if do_recursive {
                                     // Restore live variables after the call returns.
@@ -5957,24 +7928,30 @@ fn init_lookup_tables(ctx: &mut Context) -> Result<BlockList, CompException> {
 
 /// Replace calls to branch procedures with assignments to the branch jump table
 /// variable, recursing into control flow bodies.
-fn replace_branch_calls(bl: &mut BlockList, replacements: &HashMap<String, Block>) {
+fn replace_branch_calls(bl: &mut BlockList, replacements: &HashMap<String, Block>) -> Result<(), CompException> {
     for block in &mut bl.blocks {
         match block {
             Block::ProcedureCall(pc) if replacements.contains_key(&pc.name) => {
-                assert!(pc.args.is_empty(), "branch jump table replacement expects no args");
+                if !pc.args.is_empty() {
+                    return Err(CompException(format!(
+                        "branch jump table replacement expects no args, but {} has {} args",
+                        pc.name, pc.args.len()
+                    )));
+                }
                 *block = replacements[&pc.name].clone();
             }
             Block::ControlFlow(cf) => {
                 if let Some(body) = &mut cf.body {
-                    replace_branch_calls(body, replacements);
+                    replace_branch_calls(body, replacements)?;
                 }
                 if let Some(else_body) = &mut cf.else_body {
-                    replace_branch_calls(else_body, replacements);
+                    replace_branch_calls(else_body, replacements)?;
                 }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// Post-optimization transformation that converts inter-block procedure calls
@@ -5985,9 +7962,9 @@ pub fn post_opt_transform(
     proj: &mut Project,
     functions: &HashMap<String, crate::ir::instructions::Function>,
     cfg: &CompilerConfig,
-) -> bool {
+) -> Result<bool, CompException> {
     if !cfg.use_branch_jump_table {
-        return false;
+        return Ok(false);
     }
 
     // Map procedure names to their index in the project code.
@@ -6034,22 +8011,23 @@ pub fn post_opt_transform(
 
         for name in std::iter::once(fn_name).chain(needs_call_replacement.iter()) {
             if let Some(&idx) = procs.get(name) {
-                replace_branch_calls(&mut proj.code[idx], &replacements);
+                replace_branch_calls(&mut proj.code[idx], &replacements)?;
             }
         }
 
         let fn_proc_idx = *procs
             .get(fn_name)
-            .unwrap_or_else(|| panic!("Could not find procedure for function {}", fn_name));
+            .ok_or_else(|| CompException(format!("Could not find procedure for function {}", fn_name)))?;
 
         {
             let first_proc = &mut proj.code[fn_proc_idx];
             if let Some(last) = first_proc.blocks.last() {
-                assert!(
-                    !last.is_end(),
-                    "Cannot append branch jump table forever loop after ending block in {}",
-                    fn_name
-                );
+                if last.is_end() {
+                    return Err(CompException(format!(
+                        "Cannot append branch jump table forever loop after ending block in {}",
+                        fn_name
+                    )));
+                }
             }
             first_proc.end = false;
         }
@@ -6105,7 +8083,7 @@ pub fn post_opt_transform(
         proj.code.remove(idx);
     }
 
-    did_transform
+    Ok(did_transform)
 }
 
 fn binary_search_jump_table(
@@ -6223,6 +8201,19 @@ fn trans_entrypoint_call(ctx: &mut Context) -> Result<BlockList, CompException> 
                 );
             }
 
+            // Longjmp targets: resume at the continuation procedure for each
+            // setjmp site. The dispatch id is stored in jmp_buf by setjmp.
+            for site in &ctx.setjmp_sites {
+                jump_table.insert(
+                    site.dispatch_id,
+                    BlockList::from_blocks(vec![Block::ProcedureCall(scratch::ast::ProcedureCallData {
+                        name: site.continuation_name.clone(),
+                        args: Vec::new(),
+                        run_without_refresh: false,
+                    })]),
+                );
+            }
+
             let jump_table_value = Value::GetVar {
                 name: ctx.cfg.jump_table_id_var.clone(),
             };
@@ -6234,7 +8225,7 @@ fn trans_entrypoint_call(ctx: &mut Context) -> Result<BlockList, CompException> 
                 None,
                 false,
                 0,
-                ctx.all_check_locations.len() + 1,
+                ctx.all_check_locations.len() + ctx.setjmp_sites.len() + 1,
             );
 
             let mut forever_body = BlockList::from_blocks(vec![Block::EditCounter(CounterOp::Reset)]);

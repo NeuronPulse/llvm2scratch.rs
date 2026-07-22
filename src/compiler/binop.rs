@@ -56,7 +56,7 @@ fn extract_bits(
 ) -> (Value, usize) {
     let end = start + bits;
     let shift = width - end;
-    assert!(start == 0 || end <= width);
+    assert!(start == 0 || end <= width, "extract_bits: start={} end={} width={}", start, end, width);
 
     let mut res = val;
     if shift != 0 {
@@ -113,7 +113,7 @@ fn bin_op_part_via_lookup_table(
     cfg: &CompilerConfig,
     bits: usize,
 ) -> Value {
-    assert!(bits <= BINOP_LOOKUP_BITS);
+    assert!(bits <= BINOP_LOOKUP_BITS, "bin_op_part_via_lookup_table: bits {} exceeds BINOP_LOOKUP_BITS {}", bits, BINOP_LOOKUP_BITS);
     let table_name = lookup_table_name(kind, cfg);
 
     let mut lft = lft;
@@ -294,7 +294,7 @@ fn and_with_known_mask_parts(
             let reg_len = reg_len.unwrap();
             let last_region_index = j - 1;
             let last_region_cut_off_by = reg_len as isize - (current_reg_bit_idx as isize - region_end as isize);
-            assert!(last_region_cut_off_by >= 0);
+            assert!(last_region_cut_off_by >= 0, "binop: last_region_cut_off_by is negative ({})", last_region_cut_off_by);
             needs_lut = true;
 
             let bits = (BINOP_LOOKUP_BITS).min(width - current_bit_idx);

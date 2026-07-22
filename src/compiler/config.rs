@@ -41,6 +41,11 @@ pub struct CompilerConfig {
     pub jump_table_id_var: String,
     pub debug_branch_log_var: String,
 
+    pub longjmp_pending_var: String,
+    pub longjmp_return_value_var: String,
+    pub longjmp_target_id_var: String,
+    pub setjmp_snapshot_list_var: String,
+
     pub ascii_lookup_var: String,
     pub pow2_lookup_var: String,
     pub lowercase_var: String,
@@ -55,6 +60,12 @@ pub struct CompilerConfig {
     pub tmp_prefix: String,
     pub zero_indexed_suffix: String,
     pub one_indexed_suffix: String,
+
+    pub preseed_stack: bool,
+    pub preseed_stack_ptr: usize,
+    pub i8_gep_div: usize,
+    pub progress_var: String,
+    pub progress_say: bool,
 }
 
 impl Default for CompilerConfig {
@@ -107,6 +118,11 @@ impl Default for CompilerConfig {
             jump_table_id_var: "!call stack reset id".to_string(),
             debug_branch_log_var: "!!debug_branch_log".to_string(),
 
+            longjmp_pending_var: "!longjmp pending".to_string(),
+            longjmp_return_value_var: "!longjmp return value".to_string(),
+            longjmp_target_id_var: "!longjmp target id".to_string(),
+            setjmp_snapshot_list_var: "!setjmp local stack snapshot".to_string(),
+
             ascii_lookup_var: "!ASCII lookup".to_string(),
             pow2_lookup_var: "!POW2 lookup".to_string(),
             lowercase_var: "!lowercase".to_string(),
@@ -121,6 +137,12 @@ impl Default for CompilerConfig {
             tmp_prefix: "%!tmp:".to_string(),
             zero_indexed_suffix: " (0 indexed)".to_string(),
             one_indexed_suffix: " (1 indexed)".to_string(),
+
+            preseed_stack: false,
+            preseed_stack_ptr: 0,
+            i8_gep_div: 1,
+            progress_var: "".into(),
+            progress_say: false,
         }
     }
 }

@@ -1,0 +1,10 @@
+{
+  "compile_args": ["--no-accurate-byte-spacing", "--no-optimize", "--memory-size", "32"],
+  "timeout_ms": 5000,
+  "trace_sample_ms": 50,
+  "expected": {
+    "variables": {
+      "!return value": 40
+    }
+  }
+}

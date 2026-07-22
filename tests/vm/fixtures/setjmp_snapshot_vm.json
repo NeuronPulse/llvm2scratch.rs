@@ -1,0 +1,24 @@
+{
+  "compile_args": ["--no-optimize"],
+  "timeout_ms": 5000,
+  "trace_sample_ms": 50,
+  "expected": {
+    "variables": {
+      "!return value": 42
+    },
+    "trace": [
+      {
+        "type": "contains",
+        "variables": {
+          "!return value": 0
+        }
+      },
+      {
+        "type": "eventually",
+        "variables": {
+          "!return value": 42
+        }
+      }
+    ]
+  }
+}

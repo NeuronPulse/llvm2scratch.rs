@@ -88,12 +88,62 @@ pub fn comptime_apply_twos_complement(val: f64, width: usize) -> f64 {
     result as f64
 }
 
+/// Compute `left * right mod 2^width` without losing precision for widths up to 50 bits.
+/// Matches Python's `multiplyWrap`.
+pub fn multiply_wrap(left: Value, right: Value, width: usize) -> Result<Value, CompException> {
+    if width > super::config::VARIABLE_MAX_BITS {
+        return Err(CompException(format!("Multiplying {} bits not supported", width)));
+    }
+
+    if width <= 26 {
+        // Safe: (2^26)^2 < 2^53.
+        let modulus = Value::Known(KnownVal::Num(2f64.powi(width as i32)));
+        Ok(Value::Op(Op::Mod(
+            Box::new(Value::Op(Op::Mul(Box::new(left), Box::new(right)))),
+            Box::new(modulus),
+        )))
+    } else if width <= 50 {
+        // Split each operand in half so all intermediate products fit in a double.
+        let half_width = width / 2;
+        let half_mod = Value::Known(KnownVal::Num(2f64.powi(half_width as i32)));
+        let full_mod = Value::Known(KnownVal::Num(2f64.powi(width as i32)));
+
+        let a0 = Value::Op(Op::Mod(Box::new(left.clone()), Box::new(half_mod.clone())));
+        let b0 = Value::Op(Op::Mod(Box::new(right.clone()), Box::new(half_mod.clone())));
+        let a1 = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+            Box::new(left.clone()),
+            Box::new(half_mod.clone()),
+        )))));
+        let b1 = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+            Box::new(right.clone()),
+            Box::new(half_mod.clone()),
+        )))));
+
+        let a0b1 = Value::Op(Op::Mul(Box::new(a0.clone()), Box::new(b1)));
+        let b0a1 = Value::Op(Op::Mul(Box::new(b0.clone()), Box::new(a1)));
+        let mut mid = Value::Op(Op::Add(Box::new(a0b1), Box::new(b0a1)));
+
+        if width > 34 {
+            let ceil_half = Value::Known(KnownVal::Num(2f64.powi((width as i32 + 1) / 2)));
+            mid = Value::Op(Op::Mod(Box::new(mid), Box::new(ceil_half)));
+        }
+
+        let term1 = Value::Op(Op::Mul(Box::new(mid), Box::new(half_mod)));
+        let term2 = Value::Op(Op::Mul(Box::new(a0), Box::new(b0)));
+        let sum = Value::Op(Op::Add(Box::new(term1), Box::new(term2)));
+        Ok(Value::Op(Op::Mod(Box::new(sum), Box::new(full_mod))))
+    } else {
+        Err(CompException(format!("Multiplying {} bits is not supported", width)))
+    }
+}
+
 pub fn int_pow2(val: &Value, manual_offset: i32) -> Result<Value, CompException> {
     match val {
         Value::Known(kv) => match kv {
             KnownVal::Num(n) => {
                 let exp = *n as i32 + manual_offset;
-                if !(0..=53).contains(&exp) {
+                // Scratch doubles can represent 2^n for the full IEEE 754 exponent range.
+                if !(-1022..=1023).contains(&exp) {
                     Err(CompException("Cannot calculate pow2 of a known non-integer".to_string()))
                 } else {
                     Ok(Value::Known(KnownVal::Num(2f64.powi(exp))))

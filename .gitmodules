@@ -1,0 +1,9 @@
+[submodule "examples/demos/chibicc"]
+	path = examples/demos/chibicc
+	url = https://github.com/rui314/chibicc.git
+[submodule "examples/demos/micropython"]
+	path = examples/demos/micropython
+	url = https://github.com/micropython/micropython.git
+[submodule "examples/demos/eigenmath-port/newlib-scratch"]
+	path = examples/demos/eigenmath-port/newlib-scratch
+	url = https://github.com/NeuronPulse/newlib-scratch.git

@@ -1,0 +1,20 @@
+{
+  "compile_args": ["--preseed-stack", "--preseed-stack-ptr", "100", "--no-optimize"],
+  "timeout_ms": 5000,
+  "trace_sample_ms": 50,
+  "expected": {
+    "variables": {
+      "!stack pointer": 100,
+      "!heap pointer": 1
+    },
+    "trace": [
+      {
+        "type": "eventually",
+        "variables": {
+          "!stack pointer": 100,
+          "!heap pointer": 1
+        }
+      }
+    ]
+  }
+}

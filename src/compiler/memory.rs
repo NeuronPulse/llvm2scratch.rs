@@ -42,6 +42,10 @@ pub fn get_size_of(ty: &ir::Type, include_padding: bool) -> Result<usize, CompEx
                 Ok(1)
             }
         }
+        ir::Type::Vector(vec_ty) => {
+            let elem_size = get_size_of(&vec_ty.inner, include_padding)?;
+            Ok(vec_ty.size as usize * elem_size)
+        }
         _ => Err(CompException(format!("Cannot get size of type: {:?}", ty))),
     }
 }
@@ -50,6 +54,7 @@ pub struct GepResult {
     pub known_offset: i64,
     pub unknown_offsets: Vec<GepUnknownOffset>,
     pub result_type: ir::Type,
+    pub i8_gep_div: usize,
 }
 
 pub struct GepUnknownOffset {
@@ -62,6 +67,7 @@ pub fn get_gep_offsets(
     base_ptr_type: &ir::Type,
     indices: &[(Value, usize)],
     include_padding: bool,
+    i8_gep_div: usize,
 ) -> Result<GepResult, CompException> {
     let mut known_offset: i64 = 0;
     let mut unknown_offsets: Vec<GepUnknownOffset> = Vec::new();
@@ -129,10 +135,16 @@ pub fn get_gep_offsets(
         is_arr_offset = matches!(inner_type, ir::Type::Array(_));
     }
 
+    let is_i8_gep = i8_gep_div > 1 && matches!(base_ptr_type, ir::Type::Integer(i) if i.width == 8);
+    if is_i8_gep {
+        known_offset /= i8_gep_div as i64;
+    }
+
     Ok(GepResult {
         known_offset,
         unknown_offsets,
         result_type: inner_type,
+        i8_gep_div,
     })
 }
 
@@ -142,6 +154,7 @@ pub fn apply_gep_offsets(
     unknown_offsets: &[GepUnknownOffset],
     is_nuw: bool,
     memory_size: usize,
+    i8_gep_div: usize,
 ) -> Value {
     let mut final_val = base;
 
@@ -153,7 +166,12 @@ pub fn apply_gep_offsets(
             ));
         }
         for item in unknown_offsets {
-            let offset = if item.multiplier != 1 {
+            let offset = if i8_gep_div > 1 && item.multiplier == 1 {
+                Value::Op(Op::Div(
+                    Box::new(item.index_val.clone()),
+                    Box::new(Value::Known(KnownVal::Num(i8_gep_div as f64))),
+                ))
+            } else if item.multiplier != 1 {
                 Value::Op(Op::Mul(
                     Box::new(Value::Known(KnownVal::Num(item.multiplier as f64))),
                     Box::new(item.index_val.clone()),
@@ -191,7 +209,12 @@ pub fn apply_gep_offsets(
                 item.index_val.clone(),
                 item.index_width,
             );
-            let this_offset = rev_offset * item.multiplier as i64;
+            let this_offset =
+                if i8_gep_div > 1 && item.multiplier == 1 {
+                    rev_offset / i8_gep_div as i64
+                } else {
+                    rev_offset * item.multiplier as i64
+                };
 
             let rev = if item.multiplier as f64 * 2f64.powi(item.index_width as i32) >= max_intermediate {
                 Value::Op(Op::Add(Box::new(rev), Box::new(Value::Known(KnownVal::Num(rev_offset as f64)))))
@@ -215,7 +238,12 @@ pub fn apply_gep_offsets(
 
             cuml_offset += actual_offset;
 
-            let offset_val = if item.multiplier != 1 {
+            let offset_val = if i8_gep_div > 1 && item.multiplier == 1 {
+                Value::Op(Op::Div(
+                    Box::new(rev),
+                    Box::new(Value::Known(KnownVal::Num(i8_gep_div as f64))),
+                ))
+            } else if item.multiplier != 1 {
                 Value::Op(Op::Mul(
                     Box::new(Value::Known(KnownVal::Num(item.multiplier as f64))),
                     Box::new(rev),
@@ -254,7 +282,12 @@ pub fn apply_gep_offsets(
 
             cuml_max_val += this_max_val;
 
-            let offset_val = if item.multiplier != 1 {
+            let offset_val = if i8_gep_div > 1 && item.multiplier == 1 {
+                Value::Op(Op::Div(
+                    Box::new(item.index_val.clone()),
+                    Box::new(Value::Known(KnownVal::Num(i8_gep_div as f64))),
+                ))
+            } else if item.multiplier != 1 {
                 Value::Op(Op::Mul(
                     Box::new(Value::Known(KnownVal::Num(item.multiplier as f64))),
                     Box::new(item.index_val.clone()),
@@ -313,7 +346,7 @@ pub fn get_agg_offset(
         .map(|idx| (Value::Known(KnownVal::Num(idx as f64)), 32))
         .collect();
 
-    let gep_result = get_gep_offsets(agg, &gep_indices, include_padding)?;
+    let gep_result = get_gep_offsets(agg, &gep_indices, include_padding, 1)?;
 
     if !gep_result.unknown_offsets.is_empty() {
         return Err(CompException(
@@ -390,7 +423,7 @@ mod tests {
         let indices: Vec<(Value, usize)> = vec![
             (Value::Known(KnownVal::Num(3.0)), 32),
         ];
-        let result = get_gep_offsets(&base_type, &indices, false).unwrap();
+        let result = get_gep_offsets(&base_type, &indices, false, 1).unwrap();
         assert_eq!(result.known_offset, 3);
     }
 
@@ -400,7 +433,7 @@ mod tests {
         let indices: Vec<(Value, usize)> = vec![
             (Value::GetVar { name: "idx".to_string() }, 32),
         ];
-        let result = get_gep_offsets(&base_type, &indices, false).unwrap();
+        let result = get_gep_offsets(&base_type, &indices, false, 1).unwrap();
         assert_eq!(result.known_offset, 0);
         assert_eq!(result.unknown_offsets.len(), 1);
     }
@@ -408,14 +441,14 @@ mod tests {
     #[test]
     fn test_apply_gep_offsets_nuw() {
         let base = Value::Known(KnownVal::Num(10.0));
-        let result = apply_gep_offsets(base, 5, &[], true, 4096);
+        let result = apply_gep_offsets(base, 5, &[], true, 4096, 1);
         assert!(matches!(result, Value::Op(..)));
     }
 
     #[test]
     fn test_apply_gep_offsets_zero_offset() {
         let base = Value::Known(KnownVal::Num(10.0));
-        let result = apply_gep_offsets(base, 0, &[], true, 4096);
+        let result = apply_gep_offsets(base, 0, &[], true, 4096, 1);
         assert_eq!(result, Value::Known(KnownVal::Num(10.0)));
     }
 
@@ -468,7 +501,7 @@ mod tests {
             index_width: 32,
             multiplier: 1,
         }];
-        let result = apply_gep_offsets(base, 0, &offsets, false, 4096);
+        let result = apply_gep_offsets(base, 0, &offsets, false, 4096, 1);
         assert!(matches!(result, Value::Op(Op::Mod(_, _))));
     }
 
@@ -480,7 +513,7 @@ mod tests {
             index_width: 32,
             multiplier: 1,
         }];
-        let result = apply_gep_offsets(base, 5, &offsets, false, 4096);
+        let result = apply_gep_offsets(base, 5, &offsets, false, 4096, 1);
         assert!(matches!(result, Value::Op(_)));
     }
 

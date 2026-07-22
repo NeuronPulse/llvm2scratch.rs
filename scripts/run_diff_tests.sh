@@ -9,10 +9,12 @@ set -uo pipefail
 #   3. Scratchblocks text diff on examples/input/ .ll files (tests/scratchblocks_diff_test.py)
 #   4. Scratchblocks text diff on generated stress programs (scripts/check_stress_parity.py)
 #   5. Parser fixtures compiler diff (scripts/check_fixture_parity.py)
+#   6. Headless VM execution tests (scripts/run_vm_tests.sh)
 #
 # Usage:
 #   bash scripts/run_diff_tests.sh
 #   bash scripts/run_diff_tests.sh --no-stress   # skip stress tests
+#   bash scripts/run_diff_tests.sh --no-vm       # skip VM execution tests
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -28,9 +30,11 @@ if [ ! -x "$RUST_BIN" ]; then
 fi
 
 RUN_STRESS=1
+RUN_VM=1
 for arg in "$@"; do
   case "$arg" in
     --no-stress) RUN_STRESS=0 ;;
+    --no-vm) RUN_VM=0 ;;
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -82,6 +86,12 @@ fi
 # 5. Parser fixtures compiler diff
 run_step "Parser fixtures diff" \
   bash scripts/compare_py_rs_fixtures.sh
+
+# 6. Headless VM execution tests
+if [ "$RUN_VM" -eq 1 ]; then
+  run_step "VM execution tests" \
+    bash scripts/run_vm_tests.sh
+fi
 
 echo ""
 echo "============================================"

@@ -641,7 +641,6 @@ impl<'src> Parser<'src> {
             Ok(Token::Eof)
                 | Ok(Token::Kw(Keyword::Define))
                 | Ok(Token::Kw(Keyword::Declare))
-                | Ok(Token::GlobalIdent(_))
                 | Ok(Token::LocalIdent(_))
                 | Ok(Token::Kw(Keyword::Target))
                 | Ok(Token::Kw(Keyword::Source))
@@ -736,6 +735,10 @@ impl<'src> Parser<'src> {
             Token::Kw(Keyword::Ptr) => {
                 self.lex.next()?;
                 self.ctx.ptr_ty
+            }
+            Token::Kw(Keyword::Metadata) => {
+                self.lex.next()?;
+                self.ctx.mk_metadata()
             }
             Token::IntType(bits) => {
                 let b = *bits;
@@ -1300,6 +1303,12 @@ impl<'src> Parser<'src> {
             // --- Comparisons ---
             Token::Kw(Keyword::Icmp) => {
                 self.lex.next()?;
+                // LLVM 18+ may emit optional `samesign` flag before the predicate
+                // to indicate operands are non-negative. Semantically it does not
+                // change the comparison result; we simply skip it.
+                if self.lex.eat_kw(Keyword::Samesign) {
+                    // consumed
+                }
                 let pred = self.parse_int_pred()?;
                 let (lhs, _ty) = self.parse_typed_value()?;
                 self.lex.expect(&Token::Comma)?;
@@ -1409,6 +1418,7 @@ impl<'src> Parser<'src> {
             Token::Kw(Keyword::Getelementptr) => {
                 self.lex.next()?;
                 let inbounds = self.lex.eat_kw(Keyword::Inbounds);
+                while self.lex.eat_kw(Keyword::Nuw) {}
                 let base_ty = self.parse_type()?;
                 self.lex.expect(&Token::Comma)?;
                 let ptr_ty2 = self.parse_type()?;
@@ -2286,6 +2296,19 @@ impl<'src> Parser<'src> {
                 Ok(ValueRef::Constant(c))
             }
         }
+        Token::Bang => {
+            self.lex.next()?;
+            match self.lex.peek()? {
+                Token::IntLit(_) | Token::UIntLit(_) => {
+                    self.lex.next()?;
+                }
+                Token::LocalIdent(_) => {
+                    self.lex.next()?;
+                }
+                _ => {}
+            }
+            Ok(ValueRef::Constant(self.ctx.const_undef(ty)))
+        }
         _ => {
                 let t = self.lex.next()?;
                 Err(self.err(format!("expected value, got {:?}", t)))
@@ -2783,6 +2806,7 @@ impl<'src> Parser<'src> {
             "preallocated",
             "dead_on_unwind",
             "writable",
+            "captures",
         ];
         loop {
             match self.lex.peek()? {
@@ -2816,6 +2840,7 @@ impl<'src> Parser<'src> {
                             || name == "byref"
                             || name == "preallocated"
                             || name == "sret"
+                            || name == "captures"
                         {
                             if self.lex.eat(&Token::LParen) {
                                 // Consume everything up to the matching ')'.
@@ -3173,6 +3198,7 @@ impl<'src> Parser<'src> {
             Keyword::Fneg => "fneg",
             Keyword::Icmp => "icmp",
             Keyword::Fcmp => "fcmp",
+            Keyword::Samesign => "samesign",
             Keyword::Alloca => "alloca",
             Keyword::Load => "load",
             Keyword::Store => "store",

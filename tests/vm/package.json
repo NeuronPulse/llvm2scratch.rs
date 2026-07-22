@@ -1,0 +1,12 @@
+{
+  "name": "llvm2scratch-vm-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless VM execution harness for llvm2scratch compiled Scratch projects",
+  "dependencies": {
+    "jszip": "^3.10.1",
+    "scratch-storage": "^2.3.1",
+    "scratch-vm": "file:./vendor/scratch-vm"
+  }
+}
+ 

@@ -26,6 +26,11 @@ build/
 **/.DS_Store
 Thumbs.db
 
+# VM test runtime artifacts (vendor is cloned by scripts/run_vm_tests.sh)
+tests/vm/node_modules/
+tests/vm/vendor/
+tests/vm/package-lock.json
+
 # Project-specific outputs
 examples/output/
 examples/profile.out

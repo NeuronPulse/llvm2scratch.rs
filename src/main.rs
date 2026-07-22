@@ -7,13 +7,12 @@ use clap::builder::PossibleValuesParser;
 
 use llvm2scratch::compiler::config::{CompilerConfig, BINOP_LOOKUP_BITS, VARIABLE_MAX_BITS};
 use llvm2scratch::compiler::translate;
-use llvm2scratch::target::BranchMethod;
 use llvm2scratch::optimizer::Optimization;
 use llvm2scratch::scratch::ast::{Format, KnownVal, ScratchConfig, Value};
 use llvm2scratch::scratch::export::export_scratch_file;
 use llvm2scratch::scratch::{Project, ScratchContext};
 use llvm2scratch::target::loader::get_target;
-use llvm2scratch::target::{DEFAULT_OPT_TARGET, DEFAULT_TARGETS};
+use llvm2scratch::target::{BranchMethod, DEFAULT_OPT_TARGET, DEFAULT_TARGETS};
 
 fn project_to_context(proj: &Project) -> ScratchContext {
     let mut ctx = ScratchContext::new(proj.cfg.clone());
@@ -237,6 +236,42 @@ fn main() {
                 .action(clap::ArgAction::SetTrue)
                 .help("Verify LLVM IR before compiling"),
         )
+        .arg(
+            clap::Arg::new("preseed-stack")
+                .long("preseed-stack")
+                .action(clap::ArgAction::SetTrue)
+                .help("Pre-fill the !stack list with initial data"),
+        )
+        .arg(
+            clap::Arg::new("preseed-stack-ptr")
+                .long("preseed-stack-ptr")
+                .value_name("PTR")
+                .help("Stack pointer position after preseed (default: 0)"),
+        )
+        .arg(
+            clap::Arg::new("i8-gep-div")
+                .long("i8-gep-div")
+                .value_name("DIV")
+                .help("Divisor for i8 GEP byte offsets (default: 1, e.g. 4 for 32-bit word addressing)"),
+        )
+        .arg(
+            clap::Arg::new("progress-var")
+                .long("progress-var")
+                .value_name("VAR")
+                .help("Scratch variable name for tracking compilation progress"),
+        )
+        .arg(
+            clap::Arg::new("progress-say")
+                .long("progress-say")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show compilation progress via say blocks"),
+        )
+        .arg(
+            clap::Arg::new("use-branch-jump-table")
+                .long("use-branch-jump-table")
+                .action(clap::ArgAction::SetTrue)
+                .help("Use branch jump tables for intra-function branching (default: false to match Python)"),
+        )
         .get_matches();
 
     let input_path: PathBuf = matches.get_one::<String>("input").unwrap().into();
@@ -392,8 +427,24 @@ fn main() {
     cfg.compiler_opt = compiler_opt;
     cfg.compiler_minify = compiler_minify;
     cfg.opt_passes = opt_passes;
-    cfg.use_branch_jump_table = opt_target.exec.preferred_branch_method == BranchMethod::JumpTable;
+    cfg.use_branch_jump_table = matches.get_flag("use-branch-jump-table")
+        || opt_target.exec.preferred_branch_method == BranchMethod::JumpTable;
     cfg.gen_lut_runtime = gen_lut_runtime;
+    cfg.preseed_stack = matches.get_flag("preseed-stack");
+    cfg.preseed_stack_ptr = matches
+        .get_one::<String>("preseed-stack-ptr")
+        .map(|s| s.parse().unwrap_or(0))
+        .unwrap_or(0);
+    cfg.i8_gep_div = matches
+        .get_one::<String>("i8-gep-div")
+        .map(|s| s.parse().unwrap_or(1))
+        .unwrap_or(1);
+    cfg.progress_var = matches
+        .get_one::<String>("progress-var")
+        .cloned()
+        .unwrap_or_default();
+    cfg.progress_say = matches.get_flag("progress-say");
+
     cfg.scratch_config = ScratchConfig {
         minify,
         minify_break_glow,
@@ -486,7 +537,11 @@ fn main() {
 
         // Post-optimization transform: merge basic block procedures into
         // branch jump table forever blocks. Matches Python: postOptTransform
-        let did_transform = translate::post_opt_transform(&mut proj, &functions, &compiler_cfg);
+        let did_transform = translate::post_opt_transform(&mut proj, &functions, &compiler_cfg)
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: post_opt_transform failed: {}", e);
+                false
+            });
 
         // Second optimization pass (after post_opt_transform), only if
         // transform did anything. Matches Python: if did_transform: optimize
@@ -504,7 +559,9 @@ fn main() {
     } else {
         // Even without optimization, still run post_opt_transform to create
         // the branch jump table forever blocks.
-        translate::post_opt_transform(&mut proj, &functions, &compiler_cfg);
+        if let Err(e) = translate::post_opt_transform(&mut proj, &functions, &compiler_cfg) {
+            eprintln!("Warning: post_opt_transform failed: {}", e);
+        }
     }
 
     if let Some(path) = matches.get_one::<String>("debug-scratch-text") {

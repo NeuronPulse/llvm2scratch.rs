@@ -14,7 +14,7 @@ impl Variable {
     }
 
     pub fn get_all_values(&self, value_len: usize) -> IdxbleValue {
-        assert!(value_len > 1);
+        assert!(value_len > 1, "get_all_values: value_len must be > 1, got {}", value_len);
         let vals: Vec<Value> = (0..value_len).map(|i| self.get_value(Some(i))).collect();
         IdxbleValue { vals }
     }
@@ -31,7 +31,11 @@ impl Variable {
     }
 
     pub fn set_all_values(&self, values: &IdxbleValue) -> Result<BlockList, CompException> {
-        assert!(values.vals.len() > 1);
+        if values.vals.len() <= 1 {
+            return Err(CompException(format!(
+                "set_all_values: expected at least 2 values, got {}", values.vals.len()
+            )));
+        }
         let mut blocks = BlockList::new();
         for (i, val) in values.vals.iter().enumerate() {
             blocks.add_block(self.set_value(val.clone(), VarOp::Set, Some(i))?);
@@ -60,9 +64,9 @@ impl InferredValue {
     pub fn into_single(self) -> Result<Value, super::config::CompException> {
         match self {
             InferredValue::Single(v) => Ok(v),
-            InferredValue::Indexed(_) => Err(super::config::CompException(
-                "Expected single value but got indexed value".to_string(),
-            )),
+                InferredValue::Indexed(_) => {
+                Err(super::config::CompException("Expected single value but got indexed value".to_string()))
+            }
         }
     }
 
