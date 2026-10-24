@@ -255,21 +255,21 @@ impl ScratchContext {
             return blocks.clone();
         }
 
+        // mirrors addBlockList (scratch.py): when hacked blocks are disabled,
+        // every for_each block is preceded by a "set var 0" block. Python does
+        // this by replacing the block with the set and re-processing it
+        // (i -= 1), which nets out to one set per for_each.
         let mut result = BlockList::new();
-        let mut for_each_var_set = false;
 
         for block in &blocks.blocks {
             if let Block::ControlFlow(cf) = block
-                && cf.op == ControlOp::ForEach {
-                    if let Some(ref var) = cf.var
-                        && !for_each_var_set {
-                            result.add_block(Block::EditVar(EditVarData {
-                                op: VarOp::Set,
-                                name: var.clone(),
-                                value: Value::Known(KnownVal::Num(0.0)),
-                            }));
-                        }
-                    for_each_var_set = !for_each_var_set;
+                && cf.op == ControlOp::ForEach
+                && let Some(var) = &cf.var {
+                    result.add_block(Block::EditVar(EditVarData {
+                        op: VarOp::Set,
+                        name: var.clone(),
+                        value: Value::Known(KnownVal::Num(0.0)),
+                    }));
                 }
             result.add_block(block.clone());
         }
@@ -363,8 +363,12 @@ fn get_raw_block(
             let (op, val, body, else_body, var) = (&cf.op, &cf.condition, &cf.body, &cf.else_body, &cf.var);
 
             let effective_op = if !ctx.cfg.allow_hacked_blocks {
+                // mirrors ControlFlow.getRaw (scratch.py): while becomes until,
+                // for_each becomes reptimes (its body gets a "change var by 1"
+                // prefix below, and the "set var 0" is added in add_block_list)
                 match op {
                     ControlOp::While => ControlOp::Until,
+                    ControlOp::ForEach => ControlOp::RepTimes,
                     other => *other,
                 }
             } else {
