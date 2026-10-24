@@ -135,9 +135,9 @@ fn ctx_get_raw(ctx: &mut ScratchContext) -> JsonMap<String, JsonValue> {
                 let raw_block = {
                     let mut r = JsonMap::new();
                     r.insert("opcode".to_string(), JsonValue::String("procedures_call".to_string()));
-                    if !inputs.is_empty() {
-                        r.insert("inputs".to_string(), JsonValue::Object(inputs));
-                    }
+                    // mirrors ProcedureCall.getRawLate (scratch.py): "inputs" is
+                    // always emitted, even for zero-argument calls
+                    r.insert("inputs".to_string(), JsonValue::Object(inputs));
                     r.insert("mutation".to_string(), serde_json::json!({
                         "tagName": "mutation",
                         "children": [],

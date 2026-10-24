@@ -441,9 +441,8 @@ fn get_raw_block(
                     }
                 }
 
-            if !inputs.is_empty() {
-                raw.insert("inputs".to_string(), JsonValue::Object(inputs));
-            }
+            // mirrors ControlFlow.getRaw (scratch.py): "inputs" is always emitted
+            raw.insert("inputs".to_string(), JsonValue::Object(inputs));
 
             if effective_op == ControlOp::ForEach
                 && let Some(var_name) = var {
@@ -530,9 +529,9 @@ fn get_raw_block(
                 let raw_item = get_raw_value(item, my_id, ctx, ScratchCast::ToStr);
                 inputs.insert("ITEM".to_string(), serde_json::json!(raw_item));
             }
-            if !inputs.is_empty() {
-                raw.insert("inputs".to_string(), JsonValue::Object(inputs));
-            }
+            // mirrors EditList.getRaw (scratch.py): "inputs" is always emitted,
+            // even for deleteall which has neither INDEX nor ITEM
+            raw.insert("inputs".to_string(), JsonValue::Object(inputs));
             raw.insert("fields".to_string(), serde_json::json!({"LIST": [field_display_name(&data.name, ctx.cfg.minify), list_id]}));
         }
         Block::ProcedureDef(data) => {
@@ -842,9 +841,9 @@ fn get_raw_value(
             ctx.add_block(&id, &Block::RawBlock({
                 let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String(opcode.to_string()));
-                if !inputs.is_empty() {
-                    r.insert("inputs".to_string(), JsonValue::Object(inputs));
-                }
+                // mirrors BoolOp.getRawValue (scratch.py): "inputs" is always
+                // emitted (no "fields" for boolean operators)
+                r.insert("inputs".to_string(), JsonValue::Object(inputs));
                 r
             }), &BlockMeta::new(Some(parent.clone()), None));
 
@@ -914,12 +913,10 @@ fn finalize_op_block(
     ctx.add_block(&id, &Block::RawBlock({
         let mut r = JsonMap::new();
         r.insert("opcode".to_string(), JsonValue::String(opcode.to_string()));
-        if !inputs.is_empty() {
-            r.insert("inputs".to_string(), JsonValue::Object(inputs));
-        }
-        if !fields.is_empty() {
-            r.insert("fields".to_string(), JsonValue::Object(fields));
-        }
+        // mirrors Op.getRawValue (scratch.py): Op blocks always emit both
+        // "inputs" and "fields", even when empty; only BoolOp omits "fields"
+        r.insert("inputs".to_string(), JsonValue::Object(inputs));
+        r.insert("fields".to_string(), JsonValue::Object(fields));
         r
     }), &BlockMeta::new(Some(parent.clone()), None));
 
@@ -1459,8 +1456,10 @@ mod tests {
         let raw = get_raw_block(&block, &my_id, &mut ctx);
         let fields = raw["fields"].as_object().unwrap();
         let var_field = fields["VARIABLE"].as_array().unwrap();
-        // Names are preserved to match the Python implementation's output.
-        assert_eq!(var_field[0], JsonValue::String("x".to_string()));
+        // Minify blanks the display name to match Python's EditVar.getRaw
+        // (scratch.py: name = var_name * (not minify)); the name itself lives
+        // in the top-level variable table.
+        assert_eq!(var_field[0], JsonValue::String(String::new()));
     }
 
     #[test]
