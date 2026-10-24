@@ -476,6 +476,7 @@ fn trans_bitwise_binop(
     rgt_iv: InferredValue,
     width: usize,
     ctx: &mut Context,
+    is_disjoint: bool,
 ) -> Result<InferredValue, CompException> {
     let kind = match opcode {
         ir::instructions::BinaryOpcode::And => BinopKind::And,
@@ -486,7 +487,7 @@ fn trans_bitwise_binop(
     match (lft_iv, rgt_iv) {
         (InferredValue::Single(lft), InferredValue::Single(rgt)) => {
             Ok(InferredValue::Single(binop::binop(
-                kind, lft, rgt, width, &ctx.cfg,
+                kind, lft, rgt, width, &ctx.cfg, is_disjoint,
                 &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
             )?))
         }
@@ -502,7 +503,7 @@ fn trans_bitwise_binop(
             // even though each part only holds up to VARIABLE_MAX_BITS bits.
             for (l, r) in lft_idx.vals.iter().zip(rgt_idx.vals.iter()) {
                 result_vals.push(binop::binop(
-                    kind, l.clone(), r.clone(), width, &ctx.cfg,
+                    kind, l.clone(), r.clone(), width, &ctx.cfg, is_disjoint,
                     &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
                 )?);
             }
@@ -4921,7 +4922,7 @@ fn trans_instr(
                         | ir::instructions::BinaryOpcode::Xor => {
                             let width = get_value_width(&bop.left);
                             res_val = Some(trans_bitwise_binop(
-                                bop.opcode, lft_iv, rgt_iv, width, ctx,
+                                bop.opcode, lft_iv, rgt_iv, width, ctx, bop.is_disjoint,
                             )?);
                         }
                         ir::instructions::BinaryOpcode::Mul => {
@@ -6346,7 +6347,7 @@ fn trans_intrinsic(
             let mask = it.next().ok_or_else(|| CompException("ptrmask requires mask".to_string()))?;
             let res_var = result_var.ok_or_else(|| CompException("ptrmask requires a result variable".to_string()))?;
             let res = binop::binop(
-                binop::BinopKind::And, ptr, mask, PTR_WIDTH_BITS, &ctx.cfg,
+                binop::BinopKind::And, ptr, mask, PTR_WIDTH_BITS, &ctx.cfg, false,
                 &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
             )?;
             blocks.add(res_var.set_inferred_value(InferredValue::Single(res))?);
@@ -6599,7 +6600,7 @@ fn trans_intrinsic(
                 let masked = binop::binop(
                     binop::BinopKind::And, shifted,
                     Value::Known(KnownVal::Num(255.0)),
-                    width, &ctx.cfg,
+                    width, &ctx.cfg, false,
                     &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
                 )?;
                 let part = if left_shift == 0 {
@@ -6642,7 +6643,7 @@ fn trans_intrinsic(
                 let mask = Value::Known(KnownVal::Num(mask_val as f64));
                 let left_masked = binop::binop(
                     binop::BinopKind::And, cur.clone(), mask.clone(),
-                    width, &ctx.cfg,
+                    width, &ctx.cfg, false,
                     &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
                 )?;
                 let shift_up = Value::Known(KnownVal::Num(2f64.powi(step as i32)));
@@ -6652,7 +6653,7 @@ fn trans_intrinsic(
                 ));
                 let right_masked = binop::binop(
                     binop::BinopKind::And, cur, mask,
-                    width, &ctx.cfg,
+                    width, &ctx.cfg, false,
                     &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
                 )?;
                 let shift_down = Value::Known(KnownVal::Num(2f64.powi(step as i32)));
@@ -6695,7 +6696,7 @@ fn trans_intrinsic(
                 let and_result = binop::binop(
                     binop::BinopKind::And, val_ref,
                     Value::Known(KnownVal::Num(*mask as f64)),
-                    32, &ctx.cfg,
+                    32, &ctx.cfg, false,
                     &mut ctx.needs_and_lut, &mut ctx.needs_or_lut, &mut ctx.needs_xor_lut,
                 )?;
                 let cond = Value::BoolOp(BoolOp::Eq(

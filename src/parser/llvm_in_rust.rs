@@ -489,13 +489,13 @@ fn convert_instr(instr: &llvm_ir::instruction::Instruction, ctx: &Context, func:
                 is_nuw: false, is_nsw: false, is_exact: false, is_disjoint: false,
             })
         }
-        InstrKind::Or { lhs, rhs } => {
+        InstrKind::Or { lhs, rhs, is_disjoint } => {
             Instr::BinaryOp(BinaryOp {
                 result: result.unwrap(),
                 opcode: BinaryOpcode::Or,
                 left: convert_value_ref(lhs, ctx, func, func_names, module),
                 right: convert_value_ref(rhs, ctx, func, func_names, module),
-                is_nuw: false, is_nsw: false, is_exact: false, is_disjoint: false,
+                is_nuw: false, is_nsw: false, is_exact: false, is_disjoint: *is_disjoint,
             })
         }
         InstrKind::Xor { lhs, rhs } => {

@@ -223,6 +223,8 @@ pub enum InstrKind {
     Or {
         lhs: ValueRef,
         rhs: ValueRef,
+        /// LLVM 15+ `disjoint` flag: the operands share no set bits.
+        is_disjoint: bool,
     },
     /// `Xor` variant.
     Xor {
@@ -567,7 +569,7 @@ impl InstrKind {
             | InstrKind::URem { lhs, rhs }
             | InstrKind::SRem { lhs, rhs }
             | InstrKind::And { lhs, rhs }
-            | InstrKind::Or { lhs, rhs }
+            | InstrKind::Or { lhs, rhs, .. }
             | InstrKind::Xor { lhs, rhs }
             | InstrKind::Shl { lhs, rhs, .. }
             | InstrKind::LShr { lhs, rhs, .. }
@@ -838,7 +840,7 @@ mod tests {
 
     #[test]
     fn operands_or() {
-        assert_eq!(InstrKind::Or { lhs: c0(), rhs: c1() }.operands(), vec![c0(), c1()]);
+        assert_eq!(InstrKind::Or { lhs: c0(), rhs: c1(), is_disjoint: false }.operands(), vec![c0(), c1()]);
     }
 
     #[test]
@@ -1246,7 +1248,7 @@ mod tests {
             InstrKind::URem { lhs: c0(), rhs: c1() },
             InstrKind::SRem { lhs: c0(), rhs: c1() },
             InstrKind::And { lhs: c0(), rhs: c1() },
-            InstrKind::Or  { lhs: c0(), rhs: c1() },
+            InstrKind::Or  { lhs: c0(), rhs: c1(), is_disjoint: false },
             InstrKind::Xor { lhs: c0(), rhs: c1() },
             InstrKind::Shl { flags: IntArithFlags::default(), lhs: c0(), rhs: c1() },
             InstrKind::LShr { exact: false, lhs: c0(), rhs: c1() },

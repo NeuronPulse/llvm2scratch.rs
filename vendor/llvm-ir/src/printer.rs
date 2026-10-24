@@ -569,8 +569,11 @@ impl<'a> Printer<'a> {
                 out.push_str(", ");
                 self.write_value(out, *rhs, func);
             }
-            InstrKind::Or { lhs, rhs } => {
+            InstrKind::Or { lhs, rhs, is_disjoint } => {
                 out.push_str("or ");
+                if *is_disjoint {
+                    out.push_str("disjoint ");
+                }
                 self.write_typed_value(out, *lhs, func);
                 out.push_str(", ");
                 self.write_value(out, *rhs, func);

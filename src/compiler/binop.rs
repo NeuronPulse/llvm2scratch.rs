@@ -447,12 +447,14 @@ pub fn binop(
     rgt: Value,
     width: usize,
     cfg: &CompilerConfig,
+    is_disjoint: bool,
     needs_and_lut: &mut bool,
     needs_or_lut: &mut bool,
     needs_xor_lut: &mut bool,
 ) -> Result<Value, CompException> {
-    if kind == BinopKind::Or && false {
-        // is_disjoint handling is done by the caller
+    // mirrors binOp (compiler.py): disjoint operands share no set bits,
+    // therefore a | b = a + b
+    if kind == BinopKind::Or && is_disjoint {
         return Ok(Value::Op(Op::Add(Box::new(lft), Box::new(rgt))));
     }
 

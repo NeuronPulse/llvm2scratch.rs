@@ -1215,12 +1215,13 @@ impl<'src> Parser<'src> {
             }
             Token::Kw(Keyword::Or) => {
                 self.lex.next()?;
-                // LLVM 15+ may annotate `or` with `disjoint`; ignore it.
-                let _ = self.lex.eat_kw(Keyword::Disjoint);
+                // LLVM 15+ may annotate `or` with `disjoint` (operands share no
+                // set bits); keep it so backends can specialize.
+                let is_disjoint = self.lex.eat_kw(Keyword::Disjoint);
                 let (lhs, ty) = self.parse_typed_value()?;
                 self.lex.expect(&Token::Comma)?;
                 let rhs = self.parse_value(ty)?;
-                Ok((InstrKind::Or { lhs, rhs }, ty))
+                Ok((InstrKind::Or { lhs, rhs, is_disjoint }, ty))
             }
             Token::Kw(Keyword::Xor) => {
                 self.lex.next()?;

@@ -370,7 +370,7 @@ impl<'a> Builder<'a> {
     /// Public API for `build_or`.
     pub fn build_or(&mut self, name: impl Into<String>, lhs: ValueRef, rhs: ValueRef) -> ValueRef {
         let ty = self.type_of(lhs);
-        self.append_instr(Some(name.into()), ty, InstrKind::Or { lhs, rhs })
+        self.append_instr(Some(name.into()), ty, InstrKind::Or { lhs, rhs, is_disjoint: false })
     }
 
     /// Public API for `build_xor`.
