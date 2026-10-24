@@ -2700,7 +2700,6 @@ fn calculate_wide_sum_diff(
     let mut best_cost = f64::INFINITY;
     let mut best_blocks = BlockList::new();
     let mut best_sum_nodes: Vec<Value> = Vec::new();
-    let mut best_temp_names: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
 
     for spacing in 1..=max_spacing {
         let start_index = spacing;
@@ -2754,11 +2753,15 @@ fn calculate_wide_sum_diff(
                 };
 
                 if checkpoint_indices.contains(&i) && i >= start_index {
-                    let temp_name = format!("!tmp:{}", i);
-                    stored_temp_names.insert(i, temp_name);
+                    // mirrors calculateWideSumDiff (compiler.py): every explored
+                    // (spacing, omit_last) combination allocates real temp
+                    // variables at its checkpoints via genTempVar, so discarded
+                    // combinations still advance the counter
+                    let temp_name = gen_temp_var(ctx);
+                    stored_temp_names.insert(i, temp_name.clone());
                     blocks.add_block(Block::EditVar(crate::scratch::ast::EditVarData {
                         op: VarOp::Set,
-                        name: format!("!tmp:{}", i),
+                        name: temp_name,
                         value: raw.clone(),
                     }));
                     cost += perf.set_var + get_value_cost(&raw, &perf);
@@ -2782,18 +2785,8 @@ fn calculate_wide_sum_diff(
                 best_cost = cost;
                 best_blocks = blocks;
                 best_sum_nodes = sum_nodes;
-                best_temp_names = stored_temp_names;
             }
         }
-    }
-
-    for (i, placeholder) in &best_temp_names {
-        let real_name = gen_temp_var(ctx);
-        replace_var_name_in_blocks(&mut best_blocks, placeholder, &real_name);
-        for node in &mut best_sum_nodes {
-            replace_var_name_in_value(node, placeholder, &real_name);
-        }
-        let _ = i;
     }
 
     (InferredValue::Indexed(IdxbleValue { vals: best_sum_nodes }), best_blocks)
@@ -3805,70 +3798,6 @@ fn wide_udiv_with_rem(lft: &IdxbleValue, rgt: &IdxbleValue, width: usize) -> Res
         _ => Err(CompException(format!(
             "Unsigned division/remainder of {}-bit wide integers is not supported for non-constant values", width
         ))),
-    }
-}
-
-fn replace_var_name_in_value(value: &mut Value, old_name: &str, new_name: &str) {
-    match value {
-        Value::GetVar { name } => {
-            if name == old_name {
-                *name = new_name.to_string();
-            }
-        }
-        Value::Op(op) => {
-            replace_var_name_in_value(op.left_mut(), old_name, new_name);
-            if let Some(r) = op.right_mut() {
-                replace_var_name_in_value(r, old_name, new_name);
-            }
-        }
-        Value::BoolOp(bop) => {
-            replace_var_name_in_value(bop.left_mut(), old_name, new_name);
-            if let Some(r) = bop.right_mut() {
-                replace_var_name_in_value(r, old_name, new_name);
-            }
-        }
-        Value::GetOfList(gol) => {
-            replace_var_name_in_value(&mut gol.value, old_name, new_name);
-        }
-        _ => {}
-    }
-}
-
-fn replace_var_name_in_blocks(blocks: &mut BlockList, old_name: &str, new_name: &str) {
-    for block in &mut blocks.blocks {
-        match block {
-            Block::EditVar(data) => {
-                if data.name == old_name {
-                    data.name = new_name.to_string();
-                }
-                replace_var_name_in_value(&mut data.value, old_name, new_name);
-            }
-            Block::EditList(data) => {
-                if let Some(ref mut idx) = data.index {
-                    replace_var_name_in_value(idx, old_name, new_name);
-                }
-                if let Some(ref mut val) = data.value {
-                    replace_var_name_in_value(val, old_name, new_name);
-                }
-            }
-            Block::ControlFlow(cf) => {
-                if let Some(ref mut cond) = cf.condition {
-                    replace_var_name_in_value(cond, old_name, new_name);
-                }
-                if let Some(ref mut body) = cf.body {
-                    replace_var_name_in_blocks(body, old_name, new_name);
-                }
-                if let Some(ref mut else_body) = cf.else_body {
-                    replace_var_name_in_blocks(else_body, old_name, new_name);
-                }
-            }
-            Block::ProcedureCall(data) => {
-                for arg in &mut data.args {
-                    replace_var_name_in_value(arg, old_name, new_name);
-                }
-            }
-            _ => {}
-        }
     }
 }
 
