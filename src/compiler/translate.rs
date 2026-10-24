@@ -8041,13 +8041,15 @@ fn trans_func_ptr_sigs(ctx: &mut Context) -> Result<(), CompException> {
         let vararg_ptr_name = localize_param(&ctx.cfg.vararg_ptr_local);
         let func_ptr_addr_name = localize_param(&ctx.cfg.func_ptr_parameter);
 
-        let mut params = vec![ctx.cfg.func_ptr_parameter.clone()];
+        // mirrors transFuncPtrSigs (compiler.py): params come from
+        // Variable(...).getUnidxedRawVarName(), i.e. '%'-localized names
+        let mut params = vec![func_ptr_addr_name.clone()];
         params.extend(arguments.clone());
         if info.is_variadic {
-            params.push(ctx.cfg.vararg_ptr_local.clone());
+            params.push(vararg_ptr_name.clone());
         }
         if info.takes_return_address {
-            params.push(ctx.cfg.return_address_local.clone());
+            params.push(return_address_name.clone());
         }
 
         let mut blocks = BlockList::from_blocks(vec![

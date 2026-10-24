@@ -771,7 +771,10 @@ fn get_raw_value(
             ctx.add_block(&id, &Block::RawBlock({
                 let mut r = JsonMap::new();
                 r.insert("opcode".to_string(), JsonValue::String("argument_reporter_string_number".to_string()));
-                r.insert("fields".to_string(), serde_json::json!({"VALUE": [sanitize_proc_name(name, true), null]}));
+                // mirrors Python's get_param (compiler.py): parameter names are
+                // localized with a '%' prefix at construction time, then
+                // sanitized — do both here since GetParam carries the raw name
+                r.insert("fields".to_string(), serde_json::json!({"VALUE": [sanitize_proc_name(&stringify::localize_param_name(name), true), null]}));
                 r
             }), &BlockMeta::new(Some(parent.clone()), None));
             vec![JsonValue::Number(3.into()), JsonValue::String(id)]

@@ -86,7 +86,10 @@ fn is_numeric_name(name: &str) -> bool {
     name.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '.')
 }
 
-fn localize_param_name(name: &str) -> String {
+/// Prefix a parameter name with '%' (idempotent), matching Python's
+/// `localizeParam`. Used both when rendering scratchblocks text and when
+/// emitting the JSON argument reporter / procedure parameter names.
+pub(crate) fn localize_param_name(name: &str) -> String {
     if name.starts_with('%') {
         name.to_string()
     } else {
