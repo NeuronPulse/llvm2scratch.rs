@@ -61,7 +61,9 @@ pub fn export_data(ctx: &mut ScratchContext, format: Format) -> String {
     }
 
     match format {
-        Format::Sprite3 => serde_json::to_string(&sprite).unwrap_or_default(),
+        // mirrors exportData (scratch.py): json.dumps with separators=(",", ":")
+        // and ensure_ascii=True for both output formats
+        Format::Sprite3 => python_json_dumps_compact(&JsonValue::Object(sprite)),
         Format::Project3 => {
             let buffer_sprite = export_empty_sprite(EMPTY_SPRITE_NAME, false);
 
@@ -107,7 +109,7 @@ pub fn export_data(ctx: &mut ScratchContext, format: Format) -> String {
                 }
             });
 
-            serde_json::to_string(&project).unwrap_or_default()
+            python_json_dumps_compact(&project)
         }
     }
 }

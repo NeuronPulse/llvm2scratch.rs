@@ -28,6 +28,63 @@ pub(crate) fn python_json_dumps<T: serde::Serialize>(val: &T) -> String {
     format_python_json_value(&value)
 }
 
+/// Serialize a value like Python's `json.dumps(val, separators=(",", ":"))`
+/// — the compact form Python uses for the outer project.json. Mirrors
+/// `exportData` in scratch.py.
+pub(crate) fn python_json_dumps_compact(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Array(arr) => {
+            let items: Vec<String> = arr.iter().map(python_json_dumps_compact).collect();
+            format!("[{}]", items.join(","))
+        }
+        JsonValue::Object(obj) => {
+            let items: Vec<String> = obj
+                .iter()
+                .map(|(k, v)| {
+                    format!("{}:{}", python_json_escape_string(k), python_json_dumps_compact(v))
+                })
+                .collect();
+            format!("{{{}}}", items.join(","))
+        }
+        JsonValue::String(s) => python_json_escape_string(s),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Null => "null".to_string(),
+    }
+}
+
+/// Escape a string exactly like Python's `json.dumps` with `ensure_ascii=True`
+/// (the default): ASCII printables stay literal, `"`/`\` and the short control
+/// escapes use backslash forms, and everything else — including DEL and every
+/// non-ASCII char — becomes `\uXXXX` (lowercase, surrogate pairs above BMP).
+pub(crate) fn python_json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || (c as u32) >= 0x7f => {
+                let cp = c as u32;
+                if cp > 0xFFFF {
+                    let v = cp - 0x10000;
+                    out.push_str(&format!("\\u{:04x}\\u{:04x}", 0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF)));
+                } else {
+                    out.push_str(&format!("\\u{:04x}", cp));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn format_python_json_value(value: &JsonValue) -> String {
     match value {
         JsonValue::Array(arr) => {
@@ -41,7 +98,7 @@ fn format_python_json_value(value: &JsonValue) -> String {
                 .collect();
             format!("{{{}}}", items.join(", "))
         }
-        JsonValue::String(s) => serde_json::to_string(s).unwrap_or_default(),
+        JsonValue::String(s) => python_json_escape_string(s),
         JsonValue::Number(n) => n.to_string(),
         JsonValue::Bool(b) => b.to_string(),
         JsonValue::Null => "null".to_string(),
