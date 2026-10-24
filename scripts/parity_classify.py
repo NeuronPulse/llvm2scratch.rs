@@ -296,7 +296,11 @@ def main() -> int:
                 cats = ", ".join(f"{k}={v}" for k, v in sorted(r["cats"].items()))
                 print(f"  [DIFF] {r['name']}: {cats}", flush=True)
                 if args.show_diff:
-                    for c, (path, a, b) in sorted(r.get("samples", {}).items()):
+                    for c, sample in sorted(r.get("samples", {}).items()):
+                        if isinstance(sample, tuple):
+                            path, a, b = sample
+                        else:
+                            path, a, b = sample[0]
                         print(f"      [{c}] {path}")
                         print(f"        py={json.dumps(a, ensure_ascii=False)[:120]}")
                         print(f"        rs={json.dumps(b, ensure_ascii=False)[:120]}")

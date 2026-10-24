@@ -19,6 +19,89 @@ fn field_display_name<'a>(name: &'a str, minify: bool) -> &'a str {
     if minify { "" } else { name }
 }
 
+/// Format an f64 exactly like Python's `repr`/`json.dumps` (CPython
+/// `format_float_short` 'r' mode): shortest round-trip digits, fixed notation
+/// while the decimal point position `decpt` satisfies -4 < decpt <= 16, and
+/// exponential notation otherwise with a signed, zero-padded-to-two exponent.
+///
+/// Digits come from `ryu` (shortest, closest-to-value, ties-to-even — the same
+/// rule CPython's dtoa uses); note that Rust's own `{:e}`/`Display` pick a
+/// different digit on exact ties (e.g. 2^-25: ryu gives ...312 like Python,
+/// `{:e}` gives ...313), so it cannot be used here.
+pub(crate) fn format_python_float(v: f64) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() };
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0.0".to_string() } else { "0.0".to_string() };
+    }
+
+    let mut buf = ryu::Buffer::new();
+    let s = buf.format_finite(v);
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => ("-", r),
+        None => ("", s),
+    };
+
+    // ryu emits either d[.ddd]e[-]dd (no '+', no padding) or fixed notation.
+    let (digits, decpt) = if let Some((mantissa, exp_str)) = rest.split_once('e') {
+        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+        let x: i32 = exp_str.parse().unwrap_or(0);
+        (digits, x + 1)
+    } else {
+        let (int_part, frac_part) = match rest.split_once('.') {
+            Some((a, b)) => (a, b),
+            None => (rest, ""),
+        };
+        let all = format!("{int_part}{frac_part}");
+        let lead = all.len() - all.trim_start_matches('0').len();
+        let mut digits: String = all.trim_start_matches('0').to_string();
+        while digits.ends_with('0') {
+            digits.pop();
+        }
+        if digits.is_empty() {
+            digits.push('0');
+        }
+        (digits, int_part.len() as i32 - lead as i32)
+    };
+
+    let body = if decpt <= -4 || decpt > 16 {
+        // Exponential: leading digit, optional fraction, 'e', sign, >=2 digits
+        let mut out = String::new();
+        out.push(digits.as_bytes()[0] as char);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        let exp = decpt - 1;
+        out.push(if exp < 0 { '-' } else { '+' });
+        out.push_str(&format!("{:02}", exp.unsigned_abs()));
+        out
+    } else if decpt <= 0 {
+        format!("0.{}{}", "0".repeat((-decpt) as usize), digits)
+    } else if decpt as usize >= digits.len() {
+        format!("{}{}.0", digits, "0".repeat(decpt as usize - digits.len()))
+    } else {
+        format!("{}.{}", &digits[..decpt as usize], &digits[decpt as usize..])
+    };
+
+    format!("{}{}", sign, body)
+}
+
+/// Format a JSON number like Python's `json.dumps`: integers as-is, floats
+/// through the Python repr rules (see `format_python_float`).
+fn format_python_number(n: &serde_json::Number) -> String {
+    if n.is_f64() {
+        format_python_float(n.as_f64().unwrap())
+    } else {
+        n.to_string()
+    }
+}
+
 /// Serialize a value like Python's `json.dumps` with default separators
 /// (", " after commas and ": " after colons). The outer project.json uses
 /// compact separators, but embedded strings inside block mutations are
@@ -47,7 +130,7 @@ pub(crate) fn python_json_dumps_compact(value: &JsonValue) -> String {
             format!("{{{}}}", items.join(","))
         }
         JsonValue::String(s) => python_json_escape_string(s),
-        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Number(n) => format_python_number(n),
         JsonValue::Bool(b) => b.to_string(),
         JsonValue::Null => "null".to_string(),
     }
@@ -99,7 +182,7 @@ fn format_python_json_value(value: &JsonValue) -> String {
             format!("{{{}}}", items.join(", "))
         }
         JsonValue::String(s) => python_json_escape_string(s),
-        JsonValue::Number(n) => n.to_string(),
+        JsonValue::Number(n) => format_python_number(n),
         JsonValue::Bool(b) => b.to_string(),
         JsonValue::Null => "null".to_string(),
     }
@@ -1146,6 +1229,53 @@ mod tests {
         assert!(!id.is_empty());
         let id2 = ctx.add_or_get_var("x", None);
         assert_eq!(id, id2);
+    }
+
+    #[test]
+    fn test_format_python_float_matches_python_repr() {
+        // Expected values are Python's json.dumps output (repr rules).
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (5.0, "5.0"),
+            (256.0, "256.0"),
+            (0.1, "0.1"),
+            (0.5, "0.5"),
+            (-1.5, "-1.5"),
+            (0.0001, "0.0001"),
+            (1e-5, "1e-05"),
+            (9.999e-5, "9.999e-05"),
+            (1e-6, "1e-06"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1.5e16, "1.5e+16"),
+            (1234567890123456.0, "1234567890123456.0"),
+            (12345678901234567.0, "1.2345678901234568e+16"),
+            (1.862645149230957e-9, "1.862645149230957e-09"),
+            (1e100, "1e+100"),
+            (1e-300, "1e-300"),
+        ];
+        for (v, expected) in cases {
+            assert_eq!(&format_python_float(*v), expected, "format_python_float({v:?})");
+        }
+    }
+
+    #[test]
+    fn test_python_json_escape_string_matches_python() {
+        // Expected values are Python's json.dumps output (ensure_ascii=True).
+        let cases: &[(&str, &str)] = &[
+            ("abc", "\"abc\""),
+            ("％b", "\"\\uff05b\""),
+            ("中", "\"\\u4e2d\""),
+            ("\u{1F600}", "\"\\ud83d\\ude00\""),
+            ("\u{7f}", "\"\\u007f\""),
+            ("\u{1f}", "\"\\u001f\""),
+            ("a\"b\\c", "\"a\\\"b\\\\c\""),
+            ("a\nb\tc\rd", "\"a\\nb\\tc\\rd\""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&python_json_escape_string(input), expected, "escape({input:?})");
+        }
     }
 
     #[test]

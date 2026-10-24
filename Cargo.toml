@@ -17,6 +17,7 @@ indexmap = "2"
 petgraph = "0.6"
 zip = "2"
 serde_json = { version = "1", features = ["preserve_order"] }
+ryu = "1"
 md-5 = "0.10"
 thiserror = "2"
 rand = "0.9"
