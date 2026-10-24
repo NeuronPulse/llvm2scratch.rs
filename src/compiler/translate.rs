@@ -7829,6 +7829,29 @@ fn trans_funcs(mod_: &DecodedModule, mut ctx: Context) -> Result<Context, CompEx
                                     None
                                 };
 
+                                // mirrors transComplexCall (compiler.py): on the
+                                // non-recursive path, assign the available
+                                // parameters to local variables before calling a
+                                // function that returns to an address, so they can
+                                // be accessed from the callback
+                                if !do_recursive {
+                                    let next_var_use = compute_next_var_use(
+                                        following_instrs,
+                                        bctx.label.as_deref().unwrap_or(""),
+                                        &bctx.fn_info.phi_info,
+                                        &bctx.fn_info.block_var_use,
+                                        call.result.as_ref().map(|r| r.name.as_str()),
+                                    )?;
+                                    let mut depends = next_var_use.depends.clone();
+                                    depends.extend(ctx.cfg.special_locals.iter().cloned());
+                                    bctx.code.add(assign_parameters(
+                                        &bctx.available_params,
+                                        &bctx.available_param_sizes,
+                                        &depends,
+                                        ctx.cfg.use_branch_jump_table,
+                                    )?);
+                                }
+
                                 let (pre_call, post_call, _) = trans_call_instr(call, &mut ctx, &mut bctx, return_addr_id)?;
                                 bctx.code.add(pre_call);
 
