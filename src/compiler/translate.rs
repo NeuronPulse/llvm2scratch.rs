@@ -2004,7 +2004,9 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
     add_func("SB3_ask_str_unsafe", vec!["output", "input"], BlockList::from_blocks(vec![
         Block::ProcedureCall(ProcedureCallData { name: "!helper_str2scratch".into(), args: vec![Value::GetParam { name: "input".into() }], run_without_refresh: false }),
         Block::Ask { value: Value::GetVar { name: rv.clone() }, var_name: None },
-        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::Known(KnownVal::Num(f64::INFINITY))], run_without_refresh: false }),
+        // mirrors compiler.py SB3_ask_str_unsafe: the third argument is the
+        // string literal "Infinity" (a Scratch string input), not a number
+        Block::ProcedureCall(ProcedureCallData { name: "!helper_scratch2str".into(), args: vec![Value::GetAnswer, Value::GetParam { name: "output".into() }, Value::Known(KnownVal::Str("Infinity".to_string()))], run_without_refresh: false }),
     ]), &mut ctx);
 
     add_func("SB3_ask_dbl", vec!["output", "input"], BlockList::from_blocks(vec![
