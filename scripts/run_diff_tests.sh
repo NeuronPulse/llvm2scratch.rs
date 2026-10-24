@@ -7,14 +7,19 @@ set -uo pipefail
 #   1. Python unit tests
 #   2. SB3 structural diff on examples/input/ .ll files (tests/diff_test.py)
 #   3. Scratchblocks text diff on examples/input/ .ll files (tests/scratchblocks_diff_test.py)
-#   4. Scratchblocks text diff on generated stress programs (scripts/check_stress_parity.py)
-#   5. Parser fixtures compiler diff (scripts/check_fixture_parity.py)
-#   6. Headless VM execution tests (scripts/run_vm_tests.sh)
+#   4. STRICT project.json byte parity + diff classification (scripts/parity_classify.py)
+#   5. Scratchblocks text diff on generated stress programs (scripts/check_stress_parity.py)
+#   6. Parser fixtures compiler diff (scripts/check_fixture_parity.py)
+#   7. Headless VM execution tests (scripts/run_vm_tests.sh)
+#
+# Step 4 is the parity gate: any non-exempt difference (uuid etc.) fails the run
+# and prints a per-root-cause-category tally to drive convergence to zero.
 #
 # Usage:
 #   bash scripts/run_diff_tests.sh
 #   bash scripts/run_diff_tests.sh --no-stress   # skip stress tests
 #   bash scripts/run_diff_tests.sh --no-vm       # skip VM execution tests
+#   bash scripts/run_diff_tests.sh --no-strict   # skip the strict byte-parity gate
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -31,10 +36,12 @@ fi
 
 RUN_STRESS=1
 RUN_VM=1
+RUN_STRICT=1
 for arg in "$@"; do
   case "$arg" in
     --no-stress) RUN_STRESS=0 ;;
     --no-vm) RUN_VM=0 ;;
+    --no-strict) RUN_STRICT=0 ;;
     *) echo "Unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -70,7 +77,13 @@ run_step "SB3 structural diff" \
 run_step "Scratchblocks diff" \
   python tests/scratchblocks_diff_test.py
 
-# 4. Stress tests (if requested and available)
+# 4. STRICT project.json byte parity + diff classification (parity gate)
+if [ "$RUN_STRICT" -eq 1 ]; then
+  run_step "Strict project.json byte parity (classified)" \
+    python3 "${SCRIPT_DIR}/parity_classify.py"
+fi
+
+# 5. Stress tests (if requested and available)
 if [ "$RUN_STRESS" -eq 1 ]; then
   if [ -d "/tmp/llvm_stress_main/ll" ]; then
     run_step "Stress scratchblocks diff" \
@@ -83,11 +96,11 @@ if [ "$RUN_STRESS" -eq 1 ]; then
   fi
 fi
 
-# 5. Parser fixtures compiler diff
+# 6. Parser fixtures compiler diff
 run_step "Parser fixtures diff" \
   bash scripts/compare_py_rs_fixtures.sh
 
-# 6. Headless VM execution tests
+# 7. Headless VM execution tests
 if [ "$RUN_VM" -eq 1 ]; then
   run_step "VM execution tests" \
     bash scripts/run_vm_tests.sh
