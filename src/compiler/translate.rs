@@ -1161,7 +1161,8 @@ pub fn init_memory(
     ctx.min_func_ptr_addr = starting_fn_ptr_addr;
 
     // Preseed stack handling: skip clearing/filling memory and global
-    // initializers; just set the stack pointer (and heap pointer) and exit.
+    // initializers; just set the stack pointer and exit. This mirrors the
+    // demo's patched Python (which only sets `stack_size_var` here).
     if ctx.cfg.preseed_stack {
         let init_ptr = if ctx.cfg.preseed_stack_ptr == 0 {
             starting_heap_ptr
@@ -1172,11 +1173,6 @@ pub fn init_memory(
             op: VarOp::Set,
             name: ctx.cfg.stack_pointer_var.clone(),
             value: Value::Known(KnownVal::Num(init_ptr as f64)),
-        }));
-        blocks.add_block(Block::EditVar(EditVarData {
-            op: VarOp::Set,
-            name: ctx.cfg.heap_pointer_var.clone(),
-            value: Value::Known(KnownVal::Num(starting_heap_ptr as f64)),
         }));
         return Ok(blocks);
     }
@@ -1398,6 +1394,12 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
     let mem_var = ctx.cfg.mem_var.clone();
     let heap_pointer_var = ctx.cfg.heap_pointer_var.clone();
     let ascii_lookup = format!("{}{}", ctx.cfg.ascii_lookup_var, ctx.cfg.zero_indexed_suffix);
+
+    // llm-from-scratch runtime lists (mirrors the demo's patched Python):
+    // `!!output` accumulates token IDs streamed by SB3_log_dbl / SB3_emit_token_dbl,
+    // `!!vocab` maps token IDs to characters for decoding.
+    ctx.proj.lists.insert("!!output".to_string(), Vec::new());
+    ctx.proj.lists.insert("!!vocab".to_string(), Vec::new());
 
     let uppercase_costume_name = "uppercase";
     let lowercase_str = "abcdefghijklmnopqrstuvwxyz";
@@ -1976,6 +1978,71 @@ fn add_foreign_functions(mut ctx: Context) -> Context {
 
     add_func("SB3_say_dbl", vec!["input"], BlockList::from_blocks(vec![
         Block::Say { value: Value::GetParam { name: "input".into() } },
+    ]), &mut ctx);
+
+    // --- llm-from-scratch runtime foreign functions (replicated from the demo's patched Python) ---
+    add_func("SB3_log_dbl", vec!["input"], BlockList::from_blocks(vec![
+        Block::EditList(EditListData {
+            op: ListEditOp::AddTo,
+            name: "!!output".into(),
+            index: None,
+            value: Some(Value::GetParam { name: "input".into() }),
+        }),
+    ]), &mut ctx);
+
+    add_func("SB3_clear_output", vec![], BlockList::from_blocks(vec![
+        Block::EditList(EditListData {
+            op: ListEditOp::DeleteAll,
+            name: "!!output".into(),
+            index: None,
+            value: None,
+        }),
+    ]), &mut ctx);
+
+    add_func("SB3_clear_text", vec![], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "!!text".into(), value: Value::Known(KnownVal::Str("".into())) }),
+        Block::Say { value: Value::Known(KnownVal::Str("".into())) },
+    ]), &mut ctx);
+
+    add_func("SB3_emit_token_dbl", vec!["input"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "ffi_tok".into(), value: Value::Op(Op::Round(Box::new(Value::GetParam { name: "input".into() }))) }),
+        Block::EditList(EditListData { op: ListEditOp::AddTo, name: "!!output".into(), index: None, value: Some(Value::GetVar { name: "ffi_tok".into() }) }),
+        Block::ControlFlow(ControlFlow {
+            op: ControlOp::IfElse,
+            condition: Some(Value::BoolOp(BoolOp::And(
+                Box::new(Value::BoolOp(BoolOp::Gt(Box::new(Value::GetVar { name: "ffi_tok".into() }), Box::new(Value::Known(KnownVal::Num(2.0)))))),
+                Box::new(Value::BoolOp(BoolOp::Lt(Box::new(Value::GetVar { name: "ffi_tok".into() }), Box::new(Value::Known(KnownVal::Num(259.0)))))),
+            ))),
+            var: None,
+            body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "ffi_byte".into(), value: Value::Op(Op::Sub(Box::new(Value::GetVar { name: "ffi_tok".into() }), Box::new(Value::Known(KnownVal::Num(3.0))))) }),
+                Block::ControlFlow(ControlFlow {
+                    op: ControlOp::IfElse,
+                    condition: Some(Value::BoolOp(BoolOp::Eq(Box::new(Value::GetVar { name: "ffi_byte".into() }), Box::new(Value::Known(KnownVal::Num(0.0)))))),
+                    var: None,
+                    body: Some(BlockList::from_blocks(vec![
+                        Block::EditVar(EditVarData { op: VarOp::Set, name: "ffi_piece".into(), value: Value::Known(KnownVal::Str("".into())) }),
+                    ])),
+                    else_body: Some(BlockList::from_blocks(vec![
+                        Block::EditVar(EditVarData { op: VarOp::Set, name: "ffi_piece".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: ascii_lookup.clone(), value: Box::new(Value::GetVar { name: "ffi_byte".into() }) }) }),
+                    ])),
+                }),
+            ])),
+            else_body: Some(BlockList::from_blocks(vec![
+                Block::EditVar(EditVarData { op: VarOp::Set, name: "ffi_piece".into(), value: Value::GetOfList(GetOfList { op: ListOp::AtIndex, name: "!!vocab".into(), value: Box::new(Value::Op(Op::Add(Box::new(Value::GetVar { name: "ffi_tok".into() }), Box::new(Value::Known(KnownVal::Num(1.0)))))) }) }),
+            ])),
+        }),
+        Block::EditVar(EditVarData { op: VarOp::Set, name: "!!text".into(), value: Value::Op(Op::Join(Box::new(Value::GetVar { name: "!!text".into() }), Box::new(Value::GetVar { name: "ffi_piece".into() }))) }),
+        Block::Say { value: Value::GetVar { name: "!!text".into() } },
+        Block::Wait { value: Value::Known(KnownVal::Num(0.0)) },
+    ]), &mut ctx);
+
+    add_func("SB3_sqrt", vec!["input"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: return_var.clone(), value: Value::Op(Op::Sqrt(Box::new(Value::GetParam { name: "input".into() }))) }),
+    ]), &mut ctx);
+
+    add_func("SB3_exp", vec!["input"], BlockList::from_blocks(vec![
+        Block::EditVar(EditVarData { op: VarOp::Set, name: return_var.clone(), value: Value::Op(Op::Exp(Box::new(Value::GetParam { name: "input".into() }))) }),
     ]), &mut ctx);
 
     add_func("SB3_wait", vec!["duration"], BlockList::from_blocks(vec![

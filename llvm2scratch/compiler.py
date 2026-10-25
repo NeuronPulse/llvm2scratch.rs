@@ -83,6 +83,19 @@ class Config:
   zero_indexed_suffix = " (0 indexed)"
   one_indexed_suffix = " (1 indexed)"
 
+  # --- llm-from-scratch patches (upstreamed so the canonical toolchain supports the demo) ---
+  # Divisor applied to i8 GEP byte offsets so 8-bit byte indexing maps onto 32-bit words
+  # (e.g. 4 for 32-bit word addressing). Default 1 keeps existing behavior unchanged.
+  i8_gep_div: int = 1
+  # Skip emitting the giant stack initializer and assume !stack is pre-populated externally.
+  preseed_stack: bool = False
+  # Initial stack pointer value when preseeding (None -> end of globals).
+  preseed_stack_ptr: int | None = None
+  # Variable (if any) incremented on each stack reset to track compilation progress.
+  progress_var: str | None = None
+  # Also `say` the progress variable on each reset.
+  progress_say: bool = False
+
 @dataclass
 class Context:
   """Global context access when translating instructions"""
@@ -343,6 +356,12 @@ def getGepOffsets(
 
     is_arr_offset = isinstance(inner_type, ir.ArrayTy)
 
+  # Map 8-bit byte offsets onto the compiler's native cell size when requested
+  # (e.g. clang emitting `getelementptr i8` byte offsets for 32-bit words).
+  is_i8_gep = ctx.cfg.i8_gep_div > 1 and isinstance(base_ptr_type, ir.IntegerTy) and base_ptr_type.width == 8
+  if is_i8_gep:
+    known_offset //= ctx.cfg.i8_gep_div
+
   return known_offset, unknown_offsets, inner_type
 
 def applyGepOffsets(base: sb3.Value, known_offset: int, unknown_offsets: list[tuple[sb3.Value, int, int]], is_nuw: bool, ctx: Context) -> sb3.Value:
@@ -354,8 +373,13 @@ def applyGepOffsets(base: sb3.Value, known_offset: int, unknown_offsets: list[tu
   final_val = base
 
   # Don't multiply by one
-  multiply_offset = lambda offset, multiplier: sb3.Op("mul", sb3.Known(multiplier), offset) \
-                                               if multiplier != 1 else offset
+  def multiply_offset(offset, multiplier):
+    if ctx.cfg.i8_gep_div > 1 and multiplier == 1:
+      # i8 byte indexing maps onto native cells: divide the index by i8_gep_div
+      return sb3.Op("div", offset, sb3.Known(ctx.cfg.i8_gep_div))
+    if multiplier != 1:
+      return sb3.Op("mul", sb3.Known(multiplier), offset)
+    return offset
 
   if is_nuw:
     # No unsigned wrap - we do not need to account for negative indices
@@ -394,7 +418,10 @@ def applyGepOffsets(base: sb3.Value, known_offset: int, unknown_offsets: list[tu
 
     for index_val, index_width, multiplier in rev_twos_comp:
       rev, rev_offset = undoTwosComplementWithOffset(index_val, index_width)
-      this_offset = rev_offset * multiplier
+      if ctx.cfg.i8_gep_div > 1 and multiplier == 1:
+        this_offset = rev_offset // ctx.cfg.i8_gep_div
+      else:
+        this_offset = rev_offset * multiplier
 
       # If the multiplier * min value due to reverse two's comp is too large,
       # we need to add before multipling
@@ -474,6 +501,29 @@ def padValue(val: sb3.Value | IdxbleValue, size: int) -> sb3.Value | IdxbleValue
     return IdxbleValue(values)
   else:
     return values[0]
+
+def constGepBaseInt(base_ptr: ir.Value, ctx: Context) -> int:
+  """Resolves a constant GEP base to an integer address.
+
+  Handles global variables, `inttoptr (i32 N to ptr)` constants, and nested
+  constant-expression GEPs (e.g. `getelementptr(..., inttoptr(...), ...)`),
+  which the llm-from-scratch demo emits for its preseeded weight tables.
+  """
+  if isinstance(base_ptr, ir.GlobalPtrVal):
+    return ctx.globvar_to_ptr[base_ptr.name]
+  if isinstance(base_ptr, ir.ConstExprVal):
+    expr = base_ptr.expr
+    if isinstance(expr, ir.GetElementPtr):
+      indices = []
+      for index_val in expr.indices:
+        assert isinstance(index_val, ir.KnownIntVal)
+        indices.append((sb3.Known(index_val.value), index_val.width))
+      known_offset, unknown_offsets, _ = getGepOffsets(expr.base_ptr_type, indices, ctx)
+      assert len(unknown_offsets) == 0
+      return constGepBaseInt(expr.base_ptr, ctx) + known_offset
+    if isinstance(expr, ir.Conversion) and expr.opcode == ir.ConvOpcode.IntToPtr:
+      return int(expr.value.value)
+  raise CompException(f"Unsupported constant GEP base: {type(base_ptr)}")
 
 def transValue(val: ir.Value,
                ctx: Context, bctx: BlockInfo | None,
@@ -560,8 +610,6 @@ def transValue(val: ir.Value,
       expr = val.expr
       match expr:
         case ir.GetElementPtr():
-          assert isinstance(expr.base_ptr, ir.GlobalPtrVal)
-
           indices: list[tuple[sb3.Value, int]] = []
           for index_val in expr.indices:
             assert isinstance(index_val, ir.KnownIntVal)
@@ -570,7 +618,10 @@ def transValue(val: ir.Value,
           known_offset, unknown_offsets, _ = getGepOffsets(expr.base_ptr_type, indices, ctx)
           assert len(unknown_offsets) == 0
 
-          base_ptr = ctx.globvar_to_ptr[expr.base_ptr.name]
+          # The base may be a global variable address or a constant expression
+          # such as `inttoptr (i32 N to ptr)` (possibly nested), which the
+          # llm-from-scratch demo emits for its preseeded weight tables.
+          base_ptr = constGepBaseInt(expr.base_ptr, ctx)
 
           # Pointer needs padding applied
           return padValue(
@@ -1837,15 +1888,21 @@ def getCheckedProcedureStart(proc_name: str, params: list[Variable], param_sizes
   # the stack is reset
   reset_id = START_STACK_RESET_ID + ctx.all_check_locations.index((fn.name, block_label))
 
-  blocks.add(sb3.ControlFlow("if",
-    sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), sb3.BlockList([
-      # This should never be called as it is not possible to branch to the first branch, but will be kept
-      # in case parameters are used between blocks in future
-      *assignParameters(params, param_sizes, next_var_use_depends, ctx).blocks,
+  on_reset = sb3.BlockList([
+    # This should never be called as it is not possible to branch to the first branch, but will be kept
+    # in case parameters are used between blocks in future
+    *assignParameters(params, param_sizes, next_var_use_depends, ctx).blocks,
 
-      sb3.EditVar("set", ctx.cfg.jump_table_id_var, sb3.Known(reset_id)),
-      sb3.StopScript("stopthis")
-    ])))
+    sb3.EditVar("set", ctx.cfg.jump_table_id_var, sb3.Known(reset_id)),
+  ])
+  if ctx.cfg.progress_var is not None:
+    # Bump a visible variable so the editor can show "still running" progress between yields.
+    on_reset.add(sb3.EditVar("change", ctx.cfg.progress_var, sb3.Known(1)))
+    if ctx.cfg.progress_say:
+      on_reset.add(sb3.Say(sb3.GetVar(ctx.cfg.progress_var)))
+  on_reset.add(sb3.StopScript("stopthis"))
+  blocks.add(sb3.ControlFlow("if",
+    sb3.BoolOp(">", sb3.GetCounter(), sb3.Known(ctx.cfg.max_branch_recursion)), on_reset))
 
   return blocks, ctx
 
@@ -4096,6 +4153,16 @@ def initMemory(mod: ir.Module, ctx: Context) -> tuple[sb3.BlockList, Context]:
   if ctx.cfg.memory_size > SCRATCH_LIST_LIMIT:
     raise CompException("Stack is too large to fit in one list, multiple lists/hacked length not implemented yet")
 
+  # Pre-seed the stack pointer without initializing memory/globals. The
+  # build script injects the model weights into the stack list afterwards, so
+  # the normal memory saturation and global reset must be skipped here.
+  if ctx.cfg.preseed_stack:
+    init_ptr = ctx.cfg.preseed_stack_ptr
+    if init_ptr is None:
+      init_ptr = starting_heap_ptr
+    blocks.add(sb3.EditVar("set", ctx.cfg.stack_pointer_var, sb3.Known(init_ptr)))
+    return blocks, ctx
+
   init_mem: list[sb3.Known] = []
   ptr = starting_global_addr
   for i, glob in enumerate(mod.global_vars.values()):
@@ -4455,6 +4522,9 @@ def addFunc(name: str, params: list[str], contents: sb3.BlockList, ctx: Context)
 def addForeignFunctions(ctx: Context) -> Context:
   uppercase_costume_name = "uppercase"
   lowercase = "abcdefghijklmnopqrstuvwxyz"
+  # llm-from-scratch runtime lists (kept before lowercase to mirror the Rust port's insertion order)
+  ctx.proj.lists["!!output"] = []
+  ctx.proj.lists["!!vocab"] = []
   ctx.proj.lists[ctx.cfg.lowercase_var] = [sb3.Known(char) for char in lowercase]
   ctx.proj.addCostume(uppercase_costume_name)
   lc_costume_num = ctx.proj.addCostume(lowercase)
@@ -4711,6 +4781,64 @@ def addForeignFunctions(ctx: Context) -> Context:
 
   ctx = addFunc("SB3_say_dbl", ["input"], sb3.BlockList([
     sb3.Say(get_param("input")),
+  ]), ctx)
+
+  # --- llm-from-scratch runtime foreign functions (replicated from the demo's patched Python) ---
+  ctx = addFunc("SB3_log_dbl", ["input"], sb3.BlockList([
+    sb3.EditList("addto", "!!output", None, get_param("input")),
+  ]), ctx)
+
+  ctx = addFunc("SB3_clear_output", [], sb3.BlockList([
+    sb3.EditList("deleteall", "!!output", None, None),
+  ]), ctx)
+
+  ctx = addFunc("SB3_clear_text", [], sb3.BlockList([
+    sb3.EditVar("set", "!!text", sb3.Known("")),
+    sb3.Say(sb3.Known("")),
+  ]), ctx)
+
+  ctx = addFunc("SB3_emit_token_dbl", ["input"], sb3.BlockList([
+    sb3.EditVar("set", "ffi_tok", sb3.Op("round", get_param("input"))),
+    # Keep a simple token trace for debugging (e.g. to verify decoding vs. model output).
+    sb3.EditList("addto", "!!output", None, sb3.GetVar("ffi_tok")),
+    sb3.ControlFlow("if_else",
+      sb3.BoolOp("and",
+        sb3.BoolOp(">", sb3.GetVar("ffi_tok"), sb3.Known(2)),
+        sb3.BoolOp("<", sb3.GetVar("ffi_tok"), sb3.Known(259))),
+      sb3.BlockList([
+        sb3.EditVar("set", "ffi_byte", sb3.Op("sub", sb3.GetVar("ffi_tok"), sb3.Known(3))),
+        sb3.ControlFlow("if_else",
+          sb3.BoolOp("=", sb3.GetVar("ffi_byte"), sb3.Known(0)),
+          sb3.BlockList([
+            sb3.EditVar("set", "ffi_piece", sb3.Known("")),
+          ]),
+          sb3.BlockList([
+            sb3.EditVar("set", "ffi_piece",
+              sb3.GetOfList("atindex",
+                ctx.cfg.ascii_lookup_var + ctx.cfg.zero_indexed_suffix,
+                sb3.GetVar("ffi_byte"))),
+          ]),
+        ),
+      ]),
+      sb3.BlockList([
+        sb3.EditVar("set", "ffi_piece",
+          sb3.GetOfList("atindex", "!!vocab", sb3.Op("add", sb3.GetVar("ffi_tok"), sb3.Known(1)))),
+      ]),
+    ),
+    sb3.EditVar("set", "!!text", sb3.Op("join", sb3.GetVar("!!text"), sb3.GetVar("ffi_piece"))),
+    sb3.Say(sb3.GetVar("!!text")),
+    # Yield so TurboWarp/Scratch can repaint between tokens.
+    sb3.Wait(sb3.Known(0)),
+  ]), ctx)
+
+  ctx = addFunc("SB3_sqrt", ["input"], sb3.BlockList([
+    sb3.EditVar("set", ctx.cfg.return_var,
+      sb3.Op("sqrt", get_param("input"))),
+  ]), ctx)
+
+  ctx = addFunc("SB3_exp", ["input"], sb3.BlockList([
+    sb3.EditVar("set", ctx.cfg.return_var,
+      sb3.Op("e ^", get_param("input"))),
   ]), ctx)
 
   # Wait at least duration seconds while rendering

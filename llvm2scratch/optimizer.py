@@ -616,7 +616,7 @@ def getValueCost(value: sb3.Value, perf: target.TargetPerf) -> float:
         "add": perf.add, "sub": perf.sub, "mul": perf.mul, "div": perf.div,
         "rand": perf.rand, "join": perf.join, "letter_of": perf.letter_of,
         "length_of": perf.length_of_str, "mod": perf.mod, "abs": perf.abs,
-        "floor": perf.floor, "ceil": perf.ceil, "sqrt": perf.sqrt,
+        "floor": perf.floor, "ceil": perf.ceil, "sqrt": perf.sqrt, "round": perf.round,
         "sin": perf.sin, "cos": perf.cos, "tan": perf.tan,
         "asin": perf.asin, "acos": perf.acos, "atan": perf.atan,
         "ln": perf.ln, "log": perf.log, "e ^": perf.exp, "10 ^": perf.pow10,
