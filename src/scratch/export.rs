@@ -206,7 +206,13 @@ fn known_val_to_json(val: &KnownVal) -> JsonValue {
                 // so the value round-trips correctly.
                 JsonValue::String("-0".to_string())
             } else if n.fract() == 0.0 {
-                JsonValue::Number((*n as i64).into())
+                // Mirror Python: `int(raw) == float(raw)` converts the value to an
+                // int, and Python ints are arbitrary precision. Casting to i64
+                // would saturate (e.g. -1e30 -> i64::MIN), so use i128, which
+                // represents every finite double exactly.
+                JsonValue::Number(serde_json::Number::from(
+                    *n as i128,
+                ))
             } else {
                 serde_json::json!(*n)
             }

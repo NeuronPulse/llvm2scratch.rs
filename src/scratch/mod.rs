@@ -775,7 +775,10 @@ fn get_raw_value(
                     } else if n.is_infinite() {
                         (4, JsonValue::String(if *n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }))
                     } else if n.fract() == 0.0 {
-                        let int_val = *n as i64;
+                        // Mirror Python's arbitrary-precision `int(raw)`. Casting
+                        // to i64 saturates (e.g. -1e30 -> i64::MIN); i128
+                        // represents every finite double exactly.
+                        let int_val = *n as i128;
                         if ctx.cfg.use_hex_if_smaller && cast == ScratchCast::ToNum && int_val > 0 {
                             let base10_digits = (int_val as f64).log10().ceil() as usize;
                             let hex_digits = 2 + ((int_val as f64 + 1.0).log2() / 4.0).ceil() as usize;
@@ -1124,7 +1127,8 @@ pub fn scratch_cast_to_str(val: &KnownVal) -> String {
             } else if n.is_nan() {
                 "NaN".to_string()
             } else if n.fract() == 0.0 {
-                (*n as i64).to_string()
+                // Mirror Python's arbitrary-precision int() (see above).
+                (*n as i128).to_string()
             } else {
                 n.to_string()
             }
