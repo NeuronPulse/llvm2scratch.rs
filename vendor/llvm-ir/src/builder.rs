@@ -670,6 +670,7 @@ impl<'a> Builder<'a> {
             ptr_ty,
             InstrKind::GetElementPtr {
                 inbounds: false,
+                is_nuw: false,
                 base_ty,
                 ptr,
                 indices,
@@ -691,6 +692,7 @@ impl<'a> Builder<'a> {
             ptr_ty,
             InstrKind::GetElementPtr {
                 inbounds: true,
+                is_nuw: false,
                 base_ty,
                 ptr,
                 indices,

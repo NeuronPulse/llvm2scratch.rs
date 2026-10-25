@@ -628,7 +628,7 @@ fn convert_instr(instr: &llvm_ir::instruction::Instruction, ctx: &Context, func:
                 address: convert_value_ref(ptr, ctx, func, func_names, module),
             })
         }
-        InstrKind::GetElementPtr { inbounds, base_ty, ptr, indices } => {
+        InstrKind::GetElementPtr { inbounds, is_nuw, base_ty, ptr, indices } => {
             Instr::GetElementPtr(GetElementPtr {
                 result: result.unwrap(),
                 base_ptr_type: convert_type_id(*base_ty, ctx),
@@ -636,7 +636,7 @@ fn convert_instr(instr: &llvm_ir::instruction::Instruction, ctx: &Context, func:
                 indices: indices.iter().map(|i| convert_value_ref(i, ctx, func, func_names, module)).collect(),
                 is_inbounds: *inbounds,
                 is_nusw: false,
-                is_nuw: false,
+                is_nuw: *is_nuw,
             })
         }
         InstrKind::Trunc { val, to } => {

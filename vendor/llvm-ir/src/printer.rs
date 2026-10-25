@@ -716,6 +716,7 @@ impl<'a> Printer<'a> {
             }
             InstrKind::GetElementPtr {
                 inbounds,
+                is_nuw,
                 base_ty,
                 ptr,
                 indices,
@@ -723,6 +724,9 @@ impl<'a> Printer<'a> {
                 out.push_str("getelementptr ");
                 if *inbounds {
                     out.push_str("inbounds ");
+                }
+                if *is_nuw {
+                    out.push_str("nuw ");
                 }
                 self.write_type(out, *base_ty);
                 out.push_str(", ");

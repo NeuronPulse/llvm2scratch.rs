@@ -1447,7 +1447,13 @@ impl<'src> Parser<'src> {
                 // LLVM 19+ may emit `nusw` (no-unsigned-signed-wrap) on GEP.
                 // Semantically it does not affect code generation; skip it.
                 let _ = self.lex.eat_kw(Keyword::Nusw);
-                while self.lex.eat_kw(Keyword::Nuw) {}
+                // `nuw` (no unsigned wrap) DOES affect code generation: it lets the
+                // compiler skip the two's-complement reversal / `mod 2^ptr_width`
+                // wrap when applying the offset. Capture it instead of discarding it.
+                let mut is_nuw = false;
+                while self.lex.eat_kw(Keyword::Nuw) {
+                    is_nuw = true;
+                }
                 let base_ty = self.parse_type()?;
                 self.lex.expect(&Token::Comma)?;
                 let ptr_ty2 = self.parse_type()?;
@@ -1461,6 +1467,7 @@ impl<'src> Parser<'src> {
                 Ok((
                     InstrKind::GetElementPtr {
                         inbounds,
+                        is_nuw,
                         base_ty,
                         ptr,
                         indices,

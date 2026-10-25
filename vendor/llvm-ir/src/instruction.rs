@@ -326,6 +326,8 @@ pub enum InstrKind {
     /// `GetElementPtr` variant.
     GetElementPtr {
         inbounds: bool,
+        /// Set when the GEP carries the `nuw` (no unsigned wrap) keyword.
+        is_nuw: bool,
         base_ty: TypeId,
         ptr: ValueRef,
         indices: Vec<ValueRef>,
