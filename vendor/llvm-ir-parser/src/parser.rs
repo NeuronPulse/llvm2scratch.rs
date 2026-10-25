@@ -990,7 +990,7 @@ impl<'src> Parser<'src> {
         // Block label: `name:` or bare (for entry).
         // A bare entry block uses the LLVM numeric name (argument count).
         let default_entry_name = self.entry_block_llvm_name.clone().unwrap_or_else(|| "0".to_string());
-        let bb_name = match self.lex.peek()? {
+        let mut bb_name = match self.lex.peek()? {
             Token::LocalIdent(name) => {
                 // Check if the local ident is followed by ':' (block label)
                 // or '=' (instruction result) to avoid consuming instruction
@@ -1028,10 +1028,15 @@ impl<'src> Parser<'src> {
             .ok_or_else(|| self.err("block outside function"))?;
         let func = &mut self.module.functions[fid];
 
-        // The first parsed block is the entry block. If it has an explicit label,
-        // update entry_block_name so that later references to the numeric LLVM
-        // name (equal to the argument count) are redirected here.
+        // The first parsed block is the entry block. If it has an explicit
+        // label, keep it. A bare entry block (no label) is printed by llvmlite
+        // without any label, so Python's parser falls back to "0"; reproduce
+        // that. `entry_block_llvm_name` (the numeric argument count) is still
+        // used by `get_or_create_block` to redirect references to this block.
         if func.blocks.is_empty() {
+            if bb_name == self.entry_block_llvm_name.clone().unwrap_or_else(|| "0".to_string()) {
+                bb_name = "0".to_string();
+            }
             self.entry_block_name = Some(bb_name.clone());
         }
 
