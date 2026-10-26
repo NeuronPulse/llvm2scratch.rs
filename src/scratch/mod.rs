@@ -334,8 +334,13 @@ impl ScratchContext {
             }
             _ => {
                 let mut raw = get_raw_block(block, id, self);
+                // Mirror Python (scratch.py): hide_blocks sets `meta.shadow = True`
+                // and addRawMeta then emits "shadow" in its normal position (last,
+                // after "next"). Inserting it here would place it before "parent",
+                // producing a JSON key-order difference.
+                let mut meta = meta.clone();
                 if self.cfg.hide_blocks && meta.parent.is_none() {
-                    meta_shadow(&mut raw);
+                    meta.shadow = true;
                 }
                 meta.add_raw_meta(&mut raw, &self.cfg);
                 self.blocks.insert(id.clone(), raw);
@@ -416,10 +421,6 @@ impl ScratchContext {
 
         result
     }
-}
-
-fn meta_shadow(raw: &mut JsonMap<String, JsonValue>) {
-    raw.insert("shadow".to_string(), JsonValue::Bool(true));
 }
 
 fn get_raw_block(
