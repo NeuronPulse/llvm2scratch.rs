@@ -2814,7 +2814,7 @@ fn calculate_wide_sum_diff(
                     };
 
                     for j in start..=i {
-                        prev = partial_sum_diff(op, &lft.vals[j], &rgt.vals[j], &prev);
+                        prev = partial_sum_diff(op, &lft.vals[j], &rgt.vals[j], &prev, ctx);
                     }
 
                     prev
@@ -3883,17 +3883,27 @@ fn should_carry(op: &str, prev_sum: &Value, width: usize) -> Value {
     }
 }
 
-fn partial_sum_diff(op: &str, lft: &Value, rgt: &Value, prev_sum: &Value) -> Value {
+fn partial_sum_diff(op: &str, lft: &Value, rgt: &Value, prev_sum: &Value, ctx: &Context) -> Value {
     let raw_sum = if op == "add" {
         Value::Op(Op::Add(Box::new(lft.clone()), Box::new(rgt.clone())))
     } else {
         Value::Op(Op::Sub(Box::new(lft.clone()), Box::new(rgt.clone())))
     };
     let carry = should_carry(op, prev_sum, super::config::VARIABLE_MAX_BITS);
-    if op == "add" {
+    let carried_sum = if op == "add" {
         Value::Op(Op::Add(Box::new(raw_sum), Box::new(carry)))
     } else {
         Value::Op(Op::Sub(Box::new(raw_sum), Box::new(carry)))
+    };
+    // Mirror Python's `paritialSumDiff`: when compiler_opt is enabled it runs
+    // `simplifyValue` here so the optimizer can subtract known values from both
+    // sides. Skipping it leaves the value unreduced, which inflates
+    // `get_value_cost` inside `calculate_wide_sum_diff` and can flip which
+    // checkpoint spacing is chosen as cheapest.
+    if ctx.cfg.compiler_opt {
+        simplify_value(&carried_sum)
+    } else {
+        carried_sum
     }
 }
 
