@@ -6450,20 +6450,27 @@ fn trans_intrinsic(
 
             let modulus = Value::Known(KnownVal::Num(2f64.powi(width as i32)));
 
-            // Compute fshl(a, b, shift) = (a*2^shift + b/2^(width-shift)) mod 2^width
+            // Compute fshl(a, b, shift) = mod(a*2^shift, 2^width) + floor(b*2^(shift-width))
+            //
+            // Canonical emits the right-hand term via `intPow2(shift, manual_offset=-width)`,
+            // i.e. a NEGATIVE power of two that it *multiplies* by. Writing
+            // `floor(b / 2^(width-shift))` is mathematically equivalent but emits an
+            // `operator_divide` block instead of `operator_multiply`, and wrapping the
+            // sum in an extra `mod` (which canonical does not do) adds a third block.
+            // Both change the block count, which shifts every generated id that follows
+            // and cascades into thousands of spurious differences.
             let compute_fshl = |shift_val: f64| -> Value {
                 let a_shift = 2f64.powi(shift_val as i32);
-                let b_shift = 2f64.powi((width as i32) - shift_val as i32);
+                let b_shift = 2f64.powi(shift_val as i32 - width as i32);
                 let shifted_a = Value::Op(Op::Mod(
                     Box::new(Value::Op(Op::Mul(Box::new(a.clone()), Box::new(Value::Known(KnownVal::Num(a_shift)))))),
                     Box::new(modulus.clone()),
                 ));
-                let shifted_b = Value::Op(Op::Floor(Box::new(Value::Op(Op::Div(
+                let shifted_b = Value::Op(Op::Floor(Box::new(Value::Op(Op::Mul(
                     Box::new(b.clone()),
                     Box::new(Value::Known(KnownVal::Num(b_shift))),
                 )))));
-                let raw = Value::Op(Op::Add(Box::new(shifted_a), Box::new(shifted_b)));
-                Value::Op(Op::Mod(Box::new(raw), Box::new(modulus.clone())))
+                Value::Op(Op::Add(Box::new(shifted_a), Box::new(shifted_b)))
             };
 
             match c {
