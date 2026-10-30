@@ -5,9 +5,9 @@ set -uo pipefail
 #
 # Runs, in order:
 #   1. Python unit tests
-#   2. SB3 structural diff on examples/input/ .ll files (tests/diff_test.py)
+#   2. SB3 structural diff on examples/input/ .ll files (tests/sb3_diff_test.py)
 #   3. Scratchblocks text diff on examples/input/ .ll files (tests/scratchblocks_diff_test.py)
-#   4. STRICT project.json byte parity + diff classification (scripts/parity_classify.py)
+#   4. STRICT project.json byte parity + diff classification (scripts/check_byte_parity.py)
 #   5. Scratchblocks text diff on generated stress programs (scripts/check_stress_parity.py)
 #   6. Parser fixtures compiler diff (scripts/check_fixture_parity.py)
 #   7. Headless VM execution tests (scripts/run_vm_tests.sh)
@@ -71,7 +71,7 @@ run_step "Python unit tests (parser)" \
 
 # 2. SB3 structural diff on examples/input/
 run_step "SB3 structural diff" \
-  python tests/diff_test.py
+  python tests/sb3_diff_test.py
 
 # 3. Scratchblocks diff on examples/input/
 run_step "Scratchblocks diff" \
@@ -80,7 +80,7 @@ run_step "Scratchblocks diff" \
 # 4. STRICT project.json byte parity + diff classification (parity gate)
 if [ "$RUN_STRICT" -eq 1 ]; then
   run_step "Strict project.json byte parity (classified)" \
-    python3 "${SCRIPT_DIR}/parity_classify.py"
+    python3 "${SCRIPT_DIR}/check_byte_parity.py"
 fi
 
 # 5. Stress tests (if requested and available)
@@ -92,13 +92,13 @@ if [ "$RUN_STRESS" -eq 1 ]; then
     echo ""
     echo "=== Stress tests ==="
     echo "SKIP: /tmp/llvm_stress_main/ll not found. Generate with:"
-    echo "  bash scripts/generate_complex_programs.sh"
+    echo "  bash scripts/gen_stress_programs.sh"
   fi
 fi
 
 # 6. Parser fixtures compiler diff
 run_step "Parser fixtures diff" \
-  bash scripts/compare_py_rs_fixtures.sh
+  python3 "${SCRIPT_DIR}/check_fixture_parity.py"
 
 # 7. Headless VM execution tests
 if [ "$RUN_VM" -eq 1 ]; then

@@ -1,0 +1,19 @@
+{
+  "compile_args": ["--no-optimize"],
+  "timeout_ms": 5000,
+  "trace_sample_ms": 50,
+  "notes": "Expected 1073741828 = zext(ult)+zext(ugt)+zext(slt) + udiv(-8,4) - srem(-7,2) - sdiv(-7,2) = 0 + 1 + 1 + 1073741822 - (-1) - (-3). The unsigned divide is the bulk of it: if it were computed signed the total would collapse to ~6 instead of ~1.07e9.",
+  "expected": {
+    "variables": {
+      "!return value": 1073741828
+    },
+    "trace": [
+      {
+        "type": "eventually",
+        "variables": {
+          "!return value": 1073741828
+        }
+      }
+    ]
+  }
+}

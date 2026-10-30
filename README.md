@@ -41,7 +41,7 @@ Testing:
 ```bash
 python3 -m pytest llvm2scratch/tests/   # Python unit tests
 cargo test --lib                         # Rust unit tests
-python3 tests/diff_test.py examples/input/  # Python vs Rust differential tests
+python3 tests/sb3_diff_test.py examples/input/  # Python vs Rust differential tests
 ```
 
 ## Progress

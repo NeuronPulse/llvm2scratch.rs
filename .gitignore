@@ -71,3 +71,5 @@ examples/demos/sha2scratch/
 
 # AI agent workspace files
 .trae/
+.codebuddy/
+.kiro/

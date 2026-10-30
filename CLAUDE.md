@@ -32,7 +32,7 @@ The canonical check is the differential suite (mirrors CI in `.github/workflows/
 cargo build --release
 cargo test --release                        # Rust unit tests
 python -m pytest llvm2scratch/tests/        # Python unit tests
-bash scripts/generate_complex_programs.sh   # generate /tmp/llvm_stress_main/ll/*.ll stress fixtures
+bash scripts/gen_stress_programs.sh         # generate /tmp/llvm_stress_main/ll/*.ll stress fixtures
 bash scripts/run_diff_tests.sh              # unified Python-vs-Rust diff: unit + sb3 + scratchblocks + stress + fixtures + VM
 ```
 
@@ -43,15 +43,15 @@ Targeted checks:
 ```bash
 cargo test --lib                                    # Rust unit tests only
 python -m pytest llvm2scratch/tests/test_compiler.py::TestName::test_case   # single Python test
-python tests/diff_test.py                           # .sb3 structural equivalence over examples/input/*.ll
+python tests/sb3_diff_test.py                       # .sb3 structural equivalence over examples/input/*.ll
 python tests/scratchblocks_diff_test.py             # readable scratchblocks text parity
-python3 scripts/parity_classify.py [files...]       # byte-exact project.json parity gate + diff auto-classification (C1–C8, docs/parity-analysis.md)
+python3 scripts/check_byte_parity.py [files...]     # byte-exact project.json parity gate + diff auto-classification (C1–C8, docs/parity-analysis.md)
 bash scripts/run_vm_tests.sh                        # headless execution via vendored TurboWarp scratch-vm (tests/vm/)
 ```
 
 Differential tests treat Python as ground truth: cases where Python fails to compile are **skipped** (marked `PY_FAIL`), not counted as Rust failures. `tests/README.md` and `scripts/README.md` document each script.
 
-**Parity gate**: `parity_classify.py` is the authoritative byte-level check (wired into `run_diff_tests.sh`). Any non-exempt difference (uuid etc.) fails it, and every difference is auto-classified into a root-cause category with a sample — use that tally, not the normalized structural tests, to judge parity progress. `docs/parity-analysis.md` explains the known categories and how to attribute new ones.
+**Parity gate**: `check_byte_parity.py` is the authoritative byte-level check (wired into `run_diff_tests.sh`). Any non-exempt difference (uuid etc.) fails it, and every difference is auto-classified into a root-cause category with a sample — use that tally, not the normalized structural tests, to judge parity progress. `docs/parity-analysis.md` explains the known categories and how to attribute new ones.
 
 ## Pipeline architecture
 

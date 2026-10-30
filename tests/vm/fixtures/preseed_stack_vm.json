@@ -2,17 +2,18 @@
   "compile_args": ["--preseed-stack", "--preseed-stack-ptr", "100", "--no-optimize"],
   "timeout_ms": 5000,
   "trace_sample_ms": 50,
+  "notes": "In --preseed-stack mode the init procedure returns early after setting !stack pointer, deliberately skipping the memory fill AND the !heap pointer initialisation (see compiler.py / translate.rs preseed branch). So !heap pointer stays 0 here, whereas non-preseed mode initialises it to 1. Verified 2026-10-29: the canonical Python reference produces exactly the same values (heap=0, stack=100), so this expectation follows Python, which is authoritative. If preseed semantics ever change to also seed the heap pointer, update BOTH this fixture and the Rust side together.",
   "expected": {
     "variables": {
       "!stack pointer": 100,
-      "!heap pointer": 1
+      "!heap pointer": 0
     },
     "trace": [
       {
         "type": "eventually",
         "variables": {
           "!stack pointer": 100,
-          "!heap pointer": 1
+          "!heap pointer": 0
         }
       }
     ]

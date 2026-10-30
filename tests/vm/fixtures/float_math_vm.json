@@ -1,0 +1,19 @@
+{
+  "compile_args": ["--no-optimize"],
+  "timeout_ms": 5000,
+  "trace_sample_ms": 50,
+  "notes": "Expected 8 = fptosi((1.5 + 2.25) * 4 / 2) + zext(fcmp ogt (0 - frem(7.5, 2) + 3), 1) = 7 + 1. Exercises fadd/fmul/fdiv/fsub/frem, fcmp, fptosi and zext from i1.",
+  "expected": {
+    "variables": {
+      "!return value": 8
+    },
+    "trace": [
+      {
+        "type": "eventually",
+        "variables": {
+          "!return value": 8
+        }
+      }
+    ]
+  }
+}

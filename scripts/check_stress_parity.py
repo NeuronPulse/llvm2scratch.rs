@@ -42,7 +42,7 @@ def run_mode(mode: str, optimize_arg: list[str]) -> bool:
     print(f"=== Python vs Rust complex main diff ({mode}) ===", flush=True)
     if not STRESS_DIR.exists():
         print(f"SKIP: stress directory not found: {STRESS_DIR}")
-        print("Generate with: bash scripts/generate_complex_programs.sh")
+        print("Generate with: bash scripts/gen_stress_programs.sh")
         return True
 
     total = 0

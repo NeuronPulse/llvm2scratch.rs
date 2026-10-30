@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""parity_classify.py — Python vs Rust 对拍 + 差异自动分类。
+"""check_byte_parity.py — Python vs Rust 对拍 + 差异自动分类。
 
 对每个 .ll 输入：
   1. 用完全相同的 flag 分别跑 Python（权威参考）与 Rust；
@@ -11,7 +11,7 @@
 （有未豁免差异即非零退出），也是收敛进度表（按类别计数）。
 
 用法:
-    python3 scripts/parity_classify.py [file_or_dir ...] [--json] [--show-diff]
+    python3 scripts/check_byte_parity.py [file_or_dir ...] [--json] [--show-diff]
 
 类别（与 docs/parity-analysis.md 的根因编号对应）:
     TMP_NUMBERING    C1  临时变量编号分歧 (calculate_wide_sum_diff 探索期分配)

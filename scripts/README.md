@@ -1,16 +1,39 @@
 # Automation and helper scripts
 
-This directory contains shell scripts and small Python helpers used for testing,
-comparison and inspection. They are intended to be run manually or from CI.
+Shell scripts and Python helpers used for testing, comparison and inspection.
+Run them manually or via CI. The single entry point is **`run_diff_tests.sh`**,
+which chains most of the checks below (and is what `.github/workflows/ci.yml` runs).
+
+## Naming convention
+
+| Prefix | Meaning |
+|---|---|
+| `run_*` | Entry point / orchestrator that runs several steps |
+| `check_*` | Verification gate — non-zero exit on failure |
+| `gen_*` | Generator that produces fixtures or inputs |
+| `inspect_*` | Read-only debugging/inspection helper (never used by gates) |
+
+## Scripts
 
 | Script | Purpose |
 |---|---|
-| `run_diff_tests.sh` | **Unified entry point** for all Python-vs-Rust differential tests. Runs unit tests, SB3/scratchblocks diffs, the strict byte-parity gate, stress tests, parser fixture comparisons and VM execution tests. |
-| `parity_classify.py` | **Parity gate**: byte-for-byte project.json comparison with automatic diff classification into root-cause categories (C1–C8, see `docs/parity-analysis.md`). Fails on any non-exempt difference (uuid etc.) and prints a per-category tally to drive convergence to zero. Supports `--json` for CI. |
-| `check_stress_parity.py` | Compare Python and Rust scratchblocks output for generated stress programs (`/tmp/llvm_stress_main/ll/*.ll`), in both optimized and unoptimized modes. |
-| `check_fixture_parity.py` | Compile the parser fixtures with both Python and Rust implementations and verify exact scratchblocks parity for fixtures that Python supports. |
-| `strict_parity.py` | Earlier byte-parity script (forced minify, opt off); superseded by `parity_classify.py` and kept for ad-hoc use. |
-| `compare_py_rs_fixtures.sh` | Thin wrapper around `check_fixture_parity.py`. |
-| `generate_complex_programs.sh` | Generate the `/tmp/llvm_stress_main/ll/*.ll` stress fixtures used by the tests above. |
-| `diff_compare.py` | Helper that compares the block/top-level structure of two `.sb3` files. Kept as a standalone inspection tool. |
-| `inspect_pen_demo_init.py` | Helper that prints the `!init` procedure and memory lists of `examples/output/pen_demo.sb3` for debugging. |
+| `run_diff_tests.sh` | **Entry point.** Unit tests → SB3/scratchblocks diffs → byte-parity gate → stress tests → parser fixtures → VM execution tests. Flags: `--no-stress`, `--no-vm`, `--no-strict`. |
+| `run_vm_tests.sh` | Run the headless VM execution suite (`tests/vm_execution_test.py`), auto-fetching the vendored scratch-vm deps first. |
+| `check_byte_parity.py` | **Parity gate.** Byte-for-byte `project.json` comparison with automatic diff classification into root-cause categories (C1–C8). Fails on any non-exempt difference (uuid etc.) and prints a per-category tally. Supports `--json` for CI. Accepts explicit inputs, else uses `examples/input/`. |
+| `check_stress_parity.py` | Scratchblocks parity for generated stress programs (`/tmp/llvm_stress_main/ll/*.ll`), both optimized and unoptimized. |
+| `check_fixture_parity.py` | Compile the parser fixtures with both implementations and assert exact scratchblocks parity for fixtures that Python supports. |
+| `gen_stress_programs.sh` | Compile the stress-program C sources with clang into `/tmp/llvm_stress_main/ll/*.ll`. Must be run before `check_stress_parity.py`. |
+| `inspect_sb3_diff.py` | Compare the block/top-level structure of two `.sb3` files. Standalone debugging tool. |
+| `inspect_pen_demo_init.py` | Print the `!init` procedure and memory lists of `examples/output/pen_demo.sb3`. Standalone debugging tool. |
+
+Removed for being redundant (history still in git): a stale duplicate of the byte-parity
+script, a thin `.sh` wrapper that only forwarded to `check_fixture_parity.py`, and their docs.
+
+## Typical local run
+
+```bash
+cargo build --release
+bash scripts/gen_stress_programs.sh   # optional, needed for step "Stress scratchblocks diff"
+bash scripts/run_diff_tests.sh        # everything else
+bash scripts/run_diff_tests.sh --no-stress --no-vm   # quick subset
+```

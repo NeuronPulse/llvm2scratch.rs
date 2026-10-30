@@ -1,0 +1,19 @@
+{
+  "compile_args": ["--no-optimize"],
+  "timeout_ms": 5000,
+  "trace_sample_ms": 50,
+  "notes": "Expected 128 = ((((1 << 40) >> 33) & 255) * 3 ^ 128) - 128 = 256 - 128. The intermediate 2^40 forces the wide (>32 bit) lowering; the result stays well below 2^53 so the Scratch double represents it exactly. IMPORTANT: this input cannot be byte-parity checked — the canonical Python reference fails with a bare AssertionError (transInstr's IdxbleValue assert in compiler.py) on this whole i64 path, including `trunc i64` to i32, so it is Rust-only coverage. Do NOT 'fix' the expectation by looking at Python here; verify it against the IR semantics instead.",
+  "expected": {
+    "variables": {
+      "!return value": 128
+    },
+    "trace": [
+      {
+        "type": "eventually",
+        "variables": {
+          "!return value": 128
+        }
+      }
+    ]
+  }
+}

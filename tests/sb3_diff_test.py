@@ -4,7 +4,7 @@ Differential testing: compile the same LLVM IR with both Python and Rust version
 then compare the output .sb3 files for structural equivalence.
 
 Usage:
-    python3 tests/diff_test.py [test_file_or_dir ...]
+    python3 tests/sb3_diff_test.py [test_file_or_dir ...]
 
 If no arguments given, tests all .ll files under examples/input/.
 """

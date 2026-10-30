@@ -45,8 +45,8 @@ jobs:
       - name: Run Rust unit tests
         run: cargo test --release
 
-      - name: Generate complex programs
-        run: bash scripts/generate_complex_programs.sh
+      - name: Generate stress programs
+        run: bash scripts/gen_stress_programs.sh
 
       - name: Run all differential tests
         run: bash scripts/run_diff_tests.sh
